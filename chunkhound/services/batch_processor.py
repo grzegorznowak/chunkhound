@@ -7,6 +7,7 @@
 
 import os
 from dataclasses import dataclass
+from typing import Any
 from pathlib import Path
 
 from chunkhound.core.types.common import FileId, Language
@@ -26,7 +27,11 @@ class ParsedFileResult:
     error: str | None = None
 
 
-def process_file_batch(file_paths: list[Path], config_dict: dict) -> list[ParsedFileResult]:
+def process_file_batch(
+    file_paths: list[Path],
+    config_dict: dict,
+    progress_queue: Any | None = None,
+) -> list[ParsedFileResult]:
     """Process a batch of files in a worker process.
 
     This function runs in a separate process via ProcessPoolExecutor.
@@ -43,6 +48,13 @@ def process_file_batch(file_paths: list[Path], config_dict: dict) -> list[Parsed
 
     for file_path in file_paths:
         try:
+            # Emit progress signal before heavy work begins (safe, best-effort)
+            if progress_queue is not None:
+                try:
+                    progress_queue.put(("start", str(file_path)))
+                except Exception:
+                    # Progress is best-effort; ignore cross-process issues
+                    pass
             # Get file metadata
             file_stat = os.stat(file_path)
 

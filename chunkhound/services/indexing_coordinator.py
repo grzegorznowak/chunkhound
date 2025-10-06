@@ -306,7 +306,10 @@ class IndexingCoordinator(BaseService):
             return return_dict
 
     async def _process_files_in_batches(
-        self, files: list[Path], config_file_size_threshold_kb: int = 20
+        self,
+        files: list[Path],
+        config_file_size_threshold_kb: int = 20,
+        file_task: TaskID | None = None,
     ) -> list[ParsedFileResult]:
         """Process files in parallel batches across CPU cores.
 
@@ -342,6 +345,52 @@ class IndexingCoordinator(BaseService):
             files[i : i + batch_size] for i in range(0, len(files), batch_size)
         ]
 
+        # Optional: stream per-file progress from workers via Manager Queue
+        progress_queue = None
+        progress_manager = None
+        listener_task = None
+        if self.progress is not None and file_task is not None:
+            try:
+                progress_manager = multiprocessing.Manager()
+                progress_queue = progress_manager.Queue()
+
+                async def _consume_worker_progress():
+                    loop = asyncio.get_running_loop()
+                    last_path = None
+                    last_ts = 0.0
+                    while True:
+                        # Blocking get in threadpool to avoid blocking event loop
+                        msg = await loop.run_in_executor(None, progress_queue.get)
+                        if msg is None:
+                            break
+                        try:
+                            kind, path_str = (
+                                msg if isinstance(msg, tuple) and len(msg) == 2 else ("start", str(msg))
+                            )
+                        except Exception:
+                            kind, path_str = "start", str(msg)
+
+                        if kind != "start":
+                            continue
+
+                        rel = self._format_current_file_for_progress(Path(path_str))
+
+                        # Throttle UI updates a bit
+                        now = loop.time()
+                        if rel != last_path or (now - last_ts) >= 0.05:
+                            try:
+                                self.progress.update(file_task, speed=rel)
+                            except Exception:
+                                pass
+                            last_path = rel
+                            last_ts = now
+
+                listener_task = asyncio.create_task(_consume_worker_progress())
+            except Exception:
+                progress_queue = None
+                progress_manager = None
+                listener_task = None
+
         # Process batches in parallel using ProcessPoolExecutor
         loop = asyncio.get_running_loop()
         with ProcessPoolExecutor(max_workers=num_workers) as executor:
@@ -350,13 +399,29 @@ class IndexingCoordinator(BaseService):
             config_dict = {"config_file_size_threshold_kb": config_file_size_threshold_kb}
             futures = [
                 loop.run_in_executor(
-                    executor, process_file_batch, batch, config_dict
+                    executor, process_file_batch, batch, config_dict, progress_queue
                 )
                 for batch in file_batches
             ]
 
             # Wait for all batches to complete
             batch_results = await asyncio.gather(*futures)
+
+        # Signal listener to stop and clean up Manager
+        if listener_task is not None and progress_queue is not None:
+            try:
+                progress_queue.put(None)
+            except Exception:
+                pass
+            try:
+                await listener_task
+            except Exception:
+                pass
+        if progress_manager is not None:
+            try:
+                progress_manager.shutdown()
+            except Exception:
+                pass
 
         # Flatten results from all batches
         all_results = []
@@ -565,7 +630,9 @@ class IndexingCoordinator(BaseService):
                 )
 
             # Parse files in parallel batches across CPU cores
-            parsed_results = await self._process_files_in_batches(files, config_file_size_threshold_kb)
+            parsed_results = await self._process_files_in_batches(
+                files, config_file_size_threshold_kb, file_task=file_task
+            )
 
             # Store results in database (single-threaded for safety)
             stats = await self._store_parsed_results(parsed_results, file_task)
@@ -640,6 +707,22 @@ class IndexingCoordinator(BaseService):
             language=language,
         )
         return self._db.insert_file(file_model)
+
+    def _format_current_file_for_progress(self, file_path: Path) -> str:
+        """Format a file path for concise progress display."""
+        try:
+            rel = self._get_relative_path(file_path).as_posix()
+        except Exception:
+            rel = str(file_path)
+
+        # Truncate middle if too long
+        max_len = 60
+        if len(rel) > max_len:
+            keep = max_len - 3
+            left = keep // 2
+            right = keep - left
+            rel = rel[:left] + "..." + rel[-right:]
+        return f"Reading: {rel}"
 
     def _store_chunks(
         self, file_id: int, chunk_models: list[Chunk], language: Language
