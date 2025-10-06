@@ -140,5 +140,11 @@ def process_file_batch(
                     error=str(e),
                 )
             )
+        finally:
+            if progress_queue is not None:
+                try:
+                    progress_queue.put(("done", str(file_path)))
+                except Exception:
+                    pass
 
     return results

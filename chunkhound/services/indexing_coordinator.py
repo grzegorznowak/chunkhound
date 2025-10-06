@@ -309,7 +309,7 @@ class IndexingCoordinator(BaseService):
         self,
         files: list[Path],
         config_file_size_threshold_kb: int = 20,
-        file_task: TaskID | None = None,
+        parse_task: TaskID | None = None,
     ) -> list[ParsedFileResult]:
         """Process files in parallel batches across CPU cores.
 
@@ -349,7 +349,7 @@ class IndexingCoordinator(BaseService):
         progress_queue = None
         progress_manager = None
         listener_task = None
-        if self.progress is not None and file_task is not None:
+        if self.progress is not None and parse_task is not None:
             try:
                 progress_manager = multiprocessing.Manager()
                 progress_queue = progress_manager.Queue()
@@ -370,20 +370,22 @@ class IndexingCoordinator(BaseService):
                         except Exception:
                             kind, path_str = "start", str(msg)
 
-                        if kind != "start":
-                            continue
-
-                        rel = self._format_current_file_for_progress(Path(path_str))
-
-                        # Throttle UI updates a bit
-                        now = loop.time()
-                        if rel != last_path or (now - last_ts) >= 0.05:
+                        if kind == "start":
+                            rel = self._format_current_file_for_progress(Path(path_str))
+                            # Throttle UI updates a bit
+                            now = loop.time()
+                            if rel != last_path or (now - last_ts) >= 0.05:
+                                try:
+                                    self.progress.update(parse_task, speed=rel)
+                                except Exception:
+                                    pass
+                                last_path = rel
+                                last_ts = now
+                        elif kind == "done":
                             try:
-                                self.progress.update(file_task, speed=rel)
+                                self.progress.advance(parse_task, 1)
                             except Exception:
                                 pass
-                            last_path = rel
-                            last_ts = now
 
                 listener_task = asyncio.create_task(_consume_worker_progress())
             except Exception:
@@ -623,19 +625,23 @@ class IndexingCoordinator(BaseService):
 
             # Phase 3: Update - Process files in parallel batches
             # Create progress task for file processing
-            file_task: TaskID | None = None
+            parse_task: TaskID | None = None
+            store_task: TaskID | None = None
             if self.progress:
-                file_task = self.progress.add_task(
+                parse_task = self.progress.add_task(
+                    "  └─ Parsing files", total=len(files), speed="", info=""
+                )
+                store_task = self.progress.add_task(
                     "  └─ Processing files", total=len(files), speed="", info=""
                 )
 
             # Parse files in parallel batches across CPU cores
             parsed_results = await self._process_files_in_batches(
-                files, config_file_size_threshold_kb, file_task=file_task
+                files, config_file_size_threshold_kb, parse_task=parse_task
             )
 
             # Store results in database (single-threaded for safety)
-            stats = await self._store_parsed_results(parsed_results, file_task)
+            stats = await self._store_parsed_results(parsed_results, store_task)
 
             total_files = stats["total_files"]
             total_chunks = stats["total_chunks"]
@@ -645,10 +651,14 @@ class IndexingCoordinator(BaseService):
                 logger.warning(f"Failed to process {error['file']}: {error['error']}")
 
             # Complete the file processing progress bar
-            if file_task is not None and self.progress:
-                task = self.progress.tasks[file_task]
+            if parse_task is not None and self.progress:
+                task = self.progress.tasks[parse_task]
                 if task.total:
-                    self.progress.update(file_task, completed=task.total)
+                    self.progress.update(parse_task, completed=task.total)
+            if store_task is not None and self.progress:
+                task = self.progress.tasks[store_task]
+                if task.total:
+                    self.progress.update(store_task, completed=task.total)
 
             # Note: Embedding generation is handled separately via generate_missing_embeddings()
             # to provide a unified progress experience
