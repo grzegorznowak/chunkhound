@@ -274,7 +274,7 @@ class IndexingCoordinator(BaseService):
                 return {"status": "skipped", "reason": result.error, "chunks": 0}
 
             # Store the single file result
-            store_result = await self._store_parsed_results([result], file_task=None)
+            store_result = await self._store_parsed_results([result], advance_task=None, info_task=None)
 
             # Handle tuple return for single-file case
             if isinstance(store_result, tuple):
@@ -309,7 +309,8 @@ class IndexingCoordinator(BaseService):
         self,
         files: list[Path],
         config_file_size_threshold_kb: int = 20,
-        file_task: TaskID | None = None,
+        read_task: TaskID | None = None,
+        parse_task: TaskID | None = None,
     ) -> list[ParsedFileResult]:
         """Process files in parallel batches across CPU cores.
 
@@ -352,7 +353,7 @@ class IndexingCoordinator(BaseService):
         # Kill switch for parse progress streaming (useful for giant repos)
         if (
             self.progress is not None
-            and file_task is not None
+            and (read_task is not None or parse_task is not None)
             and not os.environ.get("CHUNKHOUND_NO_PARSE_PROGRESS")
         ):
             try:
@@ -362,7 +363,8 @@ class IndexingCoordinator(BaseService):
 
                 async def _consume_worker_progress():
                     loop = asyncio.get_running_loop()
-                    last_path = None
+                    last_read_path = None
+                    last_parse_path = None
                     last_ts = 0.0
                     while True:
                         # Blocking get in threadpool to avoid blocking event loop
@@ -376,18 +378,39 @@ class IndexingCoordinator(BaseService):
                         except Exception:
                             kind, path_str = "start", str(msg)
 
-                        # Single-bar design: only update current filename on the existing file_task
-                        if kind == "start":
-                            rel = self._format_current_file_for_progress(Path(path_str))
-                            # Throttle UI updates a bit
-                            now = loop.time()
-                            if rel != last_path or (now - last_ts) >= 0.05:
+                        rel = self._format_current_file_for_progress(Path(path_str))
+                        now = loop.time()
+                        # Update reading bar on start
+                        if kind == "start" and read_task is not None:
+                            if rel != last_read_path or (now - last_ts) >= 0.05:
                                 try:
-                                    self.progress.update(file_task, speed=rel)
+                                    self.progress.update(read_task, speed=rel)
                                 except Exception:
                                     pass
-                                last_path = rel
+                                last_read_path = rel
                                 last_ts = now
+                        # Advance reading when done
+                        elif kind == "read_done":
+                            if read_task is not None:
+                                try:
+                                    self.progress.advance(read_task, 1)
+                                except Exception:
+                                    pass
+                        # Parsing started: update parse speed
+                        elif kind == "parse_start" and parse_task is not None:
+                            try:
+                                # Convert label to Parsing: …
+                                self.progress.update(parse_task, speed=rel.replace("Reading:", "Parsing:"))
+                            except Exception:
+                                pass
+                            last_parse_path = rel
+                            last_ts = now
+                        # Advance parsing when parsed
+                        elif kind == "parsed" and parse_task is not None:
+                            try:
+                                self.progress.advance(parse_task, 1)
+                            except Exception:
+                                pass
 
                 listener_task = asyncio.create_task(_consume_worker_progress())
             except Exception:
@@ -435,7 +458,11 @@ class IndexingCoordinator(BaseService):
         return all_results
 
     async def _store_parsed_results(
-        self, results: list[ParsedFileResult], file_task: TaskID | None = None
+        self,
+        results: list[ParsedFileResult],
+        advance_task: TaskID | None = None,
+        info_task: TaskID | None = None,
+        chunks_task: TaskID | None = None,
     ) -> dict[str, Any] | tuple[dict[str, Any], int]:
         """Store all parsed results in database (single-threaded).
 
@@ -463,8 +490,8 @@ class IndexingCoordinator(BaseService):
                 stats["errors"].append(
                     {"file": str(result.file_path), "error": result.error}
                 )
-                if file_task is not None and self.progress:
-                    self.progress.advance(file_task, 1)
+                if advance_task is not None and self.progress:
+                    self.progress.advance(advance_task, 1)
                 continue
 
             # Handle skipped files
@@ -472,8 +499,8 @@ class IndexingCoordinator(BaseService):
                 # Track skip reason in stats for single-file case
                 if "skip_reason" not in stats:
                     stats["skip_reason"] = result.error
-                if file_task is not None and self.progress:
-                    self.progress.advance(file_task, 1)
+                if advance_task is not None and self.progress:
+                    self.progress.advance(advance_task, 1)
                 continue
 
             # Detect language for storage
@@ -508,8 +535,8 @@ class IndexingCoordinator(BaseService):
                             "error": "Failed to store file record",
                         }
                     )
-                    if file_task is not None and self.progress:
-                        self.progress.advance(file_task, 1)
+                    if advance_task is not None and self.progress:
+                        self.progress.advance(advance_task, 1)
                     continue
 
                 # Check for existing chunks to enable smart diffing
@@ -546,7 +573,17 @@ class IndexingCoordinator(BaseService):
                         # Store new/modified chunks (pass models directly)
                         chunks_to_store = chunk_diff.added + chunk_diff.modified
 
-                        if chunks_to_store:
+                        # Update chunks progress total before storing
+                        to_store_count = len(chunks_to_store)
+                        if to_store_count and chunks_task is not None and self.progress:
+                            try:
+                                task_obj = self.progress.tasks[chunks_task]
+                                new_total = (task_obj.total or 0) + to_store_count
+                                self.progress.update(chunks_task, total=new_total)
+                            except Exception:
+                                pass
+
+                        if to_store_count:
                             chunk_ids_new = self._store_chunks(
                                 file_id, chunks_to_store, language
                             )
@@ -557,34 +594,75 @@ class IndexingCoordinator(BaseService):
                         stats["chunk_ids_needing_embeddings"].extend(chunk_ids_new)
 
                         stats["total_chunks"] += len(result.chunks)
+
+                        # Advance chunks progress after storing
+                        if to_store_count and chunks_task is not None and self.progress:
+                            try:
+                                self.progress.advance(chunks_task, to_store_count)
+                            except Exception:
+                                pass
                     else:
                         # No existing chunks - store all as new (pass models directly)
+                        # Update progress total before storing
+                        to_store_count = len(new_chunk_models)
+                        if to_store_count and chunks_task is not None and self.progress:
+                            try:
+                                task_obj = self.progress.tasks[chunks_task]
+                                new_total = (task_obj.total or 0) + to_store_count
+                                self.progress.update(chunks_task, total=new_total)
+                            except Exception:
+                                pass
+
                         chunk_ids = self._store_chunks(file_id, new_chunk_models, language)
                         stats["chunk_ids_needing_embeddings"].extend(chunk_ids)
                         stats["total_chunks"] += len(chunk_ids)
+
+                        if to_store_count and chunks_task is not None and self.progress:
+                            try:
+                                self.progress.advance(chunks_task, to_store_count)
+                            except Exception:
+                                pass
                 else:
                     # New file - convert dicts to models, then store
                     chunk_models = [
                         Chunk.from_dict({**chunk_data, "file_id": file_id})
                         for chunk_data in result.chunks
                     ]
+                    # Update progress total before storing
+                    to_store_count = len(chunk_models)
+                    if to_store_count and chunks_task is not None and self.progress:
+                        try:
+                            task_obj = self.progress.tasks[chunks_task]
+                            new_total = (task_obj.total or 0) + to_store_count
+                            self.progress.update(chunks_task, total=new_total)
+                        except Exception:
+                            pass
+
                     chunk_ids = self._store_chunks(file_id, chunk_models, language)
                     stats["chunk_ids_needing_embeddings"].extend(chunk_ids)
                     stats["total_chunks"] += len(chunk_ids)
+
+                    if to_store_count and chunks_task is not None and self.progress:
+                        try:
+                            self.progress.advance(chunks_task, to_store_count)
+                        except Exception:
+                            pass
 
                 self._db.commit_transaction()
                 stats["total_files"] += 1
 
                 # Update progress
-                if file_task is not None and self.progress:
-                    self.progress.advance(file_task, 1)
-                    self.progress.update(file_task, info=f"{stats['total_chunks']} chunks")
+                if self.progress and info_task is not None:
+                    try:
+                        self.progress.update(info_task, info=f"{stats['total_chunks']} chunks")
+                    except Exception:
+                        pass
 
             except Exception as e:
                 self._db.rollback_transaction()
                 stats["errors"].append({"file": str(result.file_path), "error": str(e)})
-                if file_task is not None and self.progress:
-                    self.progress.advance(file_task, 1)
+                if advance_task is not None and self.progress:
+                    self.progress.advance(advance_task, 1)
 
         # Return file_id for single-file case
         if len(results) == 1 and file_ids and file_ids[0] is not None:
@@ -626,20 +704,31 @@ class IndexingCoordinator(BaseService):
             )
 
             # Phase 3: Update - Process files in parallel batches
-            # Create progress task for file processing
-            file_task: TaskID | None = None
+            # Create progress tasks for multi-phase UI
+            read_task: TaskID | None = None
+            parse_task: TaskID | None = None
             if self.progress:
-                file_task = self.progress.add_task(
-                    "  └─ Processing files", total=len(files), speed="", info=""
+                read_task = self.progress.add_task(
+                    "  └─ Reading files", total=len(files), speed="", info=""
+                )
+                # Chunk calculation: file-based progress (parsing completed per file)
+                parse_task = self.progress.add_task(
+                    "  └─ Calculating chunks", total=len(files), speed="", info=""
                 )
 
             # Parse files in parallel batches across CPU cores
             parsed_results = await self._process_files_in_batches(
-                files, config_file_size_threshold_kb, file_task=file_task
+                files,
+                config_file_size_threshold_kb,
+                read_task=read_task,
+                parse_task=parse_task,
             )
 
             # Store results in database (single-threaded for safety)
-            stats = await self._store_parsed_results(parsed_results, file_task)
+            # Store results; update info on parse task with chunk totals, but don't advance
+            stats = await self._store_parsed_results(
+                parsed_results, advance_task=None, info_task=None, chunks_task=None
+            )
 
             total_files = stats["total_files"]
             total_chunks = stats["total_chunks"]
@@ -649,10 +738,16 @@ class IndexingCoordinator(BaseService):
                 logger.warning(f"Failed to process {error['file']}: {error['error']}")
 
             # Complete the file processing progress bar
-            if file_task is not None and self.progress:
-                task = self.progress.tasks[file_task]
-                if task.total:
-                    self.progress.update(file_task, completed=task.total)
+            # Complete the reading/parsing bars
+            if self.progress:
+                if read_task is not None:
+                    task = self.progress.tasks[read_task]
+                    if task.total:
+                        self.progress.update(read_task, completed=task.total)
+                if parse_task is not None:
+                    task = self.progress.tasks[parse_task]
+                    if task.total:
+                        self.progress.update(parse_task, completed=task.total)
 
             # Note: Embedding generation is handled separately via generate_missing_embeddings()
             # to provide a unified progress experience

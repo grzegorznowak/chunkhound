@@ -65,6 +65,17 @@ def process_file_batch(
             # Detect language from file extension
             language = Language.from_file_extension(file_path)
             if language == Language.UNKNOWN:
+                # Progress accounting for phases even if we skip
+                if progress_queue is not None:
+                    try:
+                        if hasattr(progress_queue, "put_nowait"):
+                            progress_queue.put_nowait(("read_done", str(file_path)))
+                            progress_queue.put_nowait(("parsed", str(file_path)))
+                        else:
+                            progress_queue.put(("read_done", str(file_path)), block=False)
+                            progress_queue.put(("parsed", str(file_path)), block=False)
+                    except Exception:
+                        pass
                 results.append(
                     ParsedFileResult(
                         file_path=file_path,
@@ -83,6 +94,17 @@ def process_file_batch(
                 file_size_kb = file_stat.st_size / 1024
                 threshold_kb = config_dict.get("config_file_size_threshold_kb", 20)
                 if file_size_kb > threshold_kb:
+                    # Account for progress without parsing
+                    if progress_queue is not None:
+                        try:
+                            if hasattr(progress_queue, "put_nowait"):
+                                progress_queue.put_nowait(("read_done", str(file_path)))
+                                progress_queue.put_nowait(("parsed", str(file_path)))
+                            else:
+                                progress_queue.put(("read_done", str(file_path)), block=False)
+                                progress_queue.put(("parsed", str(file_path)), block=False)
+                        except Exception:
+                            pass
                     results.append(
                         ParsedFileResult(
                             file_path=file_path,
@@ -99,6 +121,16 @@ def process_file_batch(
             # Create parser for this language
             parser = create_parser_for_language(language)
             if not parser:
+                if progress_queue is not None:
+                    try:
+                        if hasattr(progress_queue, "put_nowait"):
+                            progress_queue.put_nowait(("read_done", str(file_path)))
+                            progress_queue.put_nowait(("parsed", str(file_path)))
+                        else:
+                            progress_queue.put(("read_done", str(file_path)), block=False)
+                            progress_queue.put(("parsed", str(file_path)), block=False)
+                    except Exception:
+                        pass
                 results.append(
                     ParsedFileResult(
                         file_path=file_path,
@@ -112,13 +144,51 @@ def process_file_batch(
                 )
                 continue
 
-            # Parse file and generate chunks
+            # Read content and emit read completion
+            try:
+                content = file_path.read_text(encoding="utf-8", errors="ignore")
+            except Exception:
+                try:
+                    content = file_path.read_bytes().decode("utf-8", errors="ignore")
+                except Exception:
+                    content = ""
+
+            if progress_queue is not None:
+                try:
+                    if hasattr(progress_queue, "put_nowait"):
+                        progress_queue.put_nowait(("read_done", str(file_path)))
+                    else:
+                        progress_queue.put(("read_done", str(file_path)), block=False)
+                except Exception:
+                    pass
+
+            # Signal parse start for UI separation
+            if progress_queue is not None:
+                try:
+                    if hasattr(progress_queue, "put_nowait"):
+                        progress_queue.put_nowait(("parse_start", str(file_path)))
+                    else:
+                        progress_queue.put(("parse_start", str(file_path)), block=False)
+                except Exception:
+                    pass
+
+            # Parse content and generate chunks
             # Note: FileId(0) is placeholder - actual ID assigned during storage
-            chunks = parser.parse_file(file_path, FileId(0))
+            chunks = parser.parse_content(content, file_path, FileId(0))
 
             # Convert chunks to dictionaries for ProcessPoolExecutor serialization
             # Using standard Chunk.to_dict() method for consistent serialization
             chunks_data = [chunk.to_dict() for chunk in chunks]
+
+            # Signal parse completion
+            if progress_queue is not None:
+                try:
+                    if hasattr(progress_queue, "put_nowait"):
+                        progress_queue.put_nowait(("parsed", str(file_path)))
+                    else:
+                        progress_queue.put(("parsed", str(file_path)), block=False)
+                except Exception:
+                    pass
 
             results.append(
                 ParsedFileResult(
