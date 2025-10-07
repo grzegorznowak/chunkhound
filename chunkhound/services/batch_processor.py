@@ -51,7 +51,11 @@ def process_file_batch(
             # Emit progress signal before heavy work begins (safe, best-effort)
             if progress_queue is not None:
                 try:
-                    progress_queue.put(("start", str(file_path)))
+                    # Prefer put_nowait; fallback to put(block=False) for Manager proxies
+                    if hasattr(progress_queue, "put_nowait"):
+                        progress_queue.put_nowait(("start", str(file_path)))
+                    else:
+                        progress_queue.put(("start", str(file_path)), block=False)
                 except Exception:
                     # Progress is best-effort; ignore cross-process issues
                     pass
@@ -143,8 +147,12 @@ def process_file_batch(
         finally:
             if progress_queue is not None:
                 try:
-                    progress_queue.put(("done", str(file_path)))
+                    if hasattr(progress_queue, "put_nowait"):
+                        progress_queue.put_nowait(("done", str(file_path)))
+                    else:
+                        progress_queue.put(("done", str(file_path)), block=False)
                 except Exception:
+                    # Drop on full/closed
                     pass
 
     return results
