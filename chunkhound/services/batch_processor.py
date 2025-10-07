@@ -31,6 +31,7 @@ def process_file_batch(
     file_paths: list[Path],
     config_dict: dict,
     progress_queue: Any | None = None,
+    worker_index: int | None = None,
 ) -> list[ParsedFileResult]:
     """Process a batch of files in a worker process.
 
@@ -53,9 +54,9 @@ def process_file_batch(
                 try:
                     # Prefer put_nowait; fallback to put(block=False) for Manager proxies
                     if hasattr(progress_queue, "put_nowait"):
-                        progress_queue.put_nowait(("start", str(file_path)))
+                        progress_queue.put_nowait(("start", worker_index, str(file_path)))
                     else:
-                        progress_queue.put(("start", str(file_path)), block=False)
+                        progress_queue.put(("start", worker_index, str(file_path)), block=False)
                 except Exception:
                     # Progress is best-effort; ignore cross-process issues
                     pass
@@ -69,11 +70,11 @@ def process_file_batch(
                 if progress_queue is not None:
                     try:
                         if hasattr(progress_queue, "put_nowait"):
-                            progress_queue.put_nowait(("read_done", str(file_path)))
-                            progress_queue.put_nowait(("parsed", str(file_path)))
+                            progress_queue.put_nowait(("read_done", worker_index, str(file_path)))
+                            progress_queue.put_nowait(("parsed", worker_index, str(file_path)))
                         else:
-                            progress_queue.put(("read_done", str(file_path)), block=False)
-                            progress_queue.put(("parsed", str(file_path)), block=False)
+                            progress_queue.put(("read_done", worker_index, str(file_path)), block=False)
+                            progress_queue.put(("parsed", worker_index, str(file_path)), block=False)
                     except Exception:
                         pass
                 results.append(
@@ -98,11 +99,11 @@ def process_file_batch(
                     if progress_queue is not None:
                         try:
                             if hasattr(progress_queue, "put_nowait"):
-                                progress_queue.put_nowait(("read_done", str(file_path)))
-                                progress_queue.put_nowait(("parsed", str(file_path)))
+                                progress_queue.put_nowait(("read_done", worker_index, str(file_path)))
+                                progress_queue.put_nowait(("parsed", worker_index, str(file_path)))
                             else:
-                                progress_queue.put(("read_done", str(file_path)), block=False)
-                                progress_queue.put(("parsed", str(file_path)), block=False)
+                                progress_queue.put(("read_done", worker_index, str(file_path)), block=False)
+                                progress_queue.put(("parsed", worker_index, str(file_path)), block=False)
                         except Exception:
                             pass
                     results.append(
@@ -124,11 +125,11 @@ def process_file_batch(
                 if progress_queue is not None:
                     try:
                         if hasattr(progress_queue, "put_nowait"):
-                            progress_queue.put_nowait(("read_done", str(file_path)))
-                            progress_queue.put_nowait(("parsed", str(file_path)))
+                            progress_queue.put_nowait(("read_done", worker_index, str(file_path)))
+                            progress_queue.put_nowait(("parsed", worker_index, str(file_path)))
                         else:
-                            progress_queue.put(("read_done", str(file_path)), block=False)
-                            progress_queue.put(("parsed", str(file_path)), block=False)
+                            progress_queue.put(("read_done", worker_index, str(file_path)), block=False)
+                            progress_queue.put(("parsed", worker_index, str(file_path)), block=False)
                     except Exception:
                         pass
                 results.append(
@@ -156,9 +157,9 @@ def process_file_batch(
             if progress_queue is not None:
                 try:
                     if hasattr(progress_queue, "put_nowait"):
-                        progress_queue.put_nowait(("read_done", str(file_path)))
+                        progress_queue.put_nowait(("read_done", worker_index, str(file_path)))
                     else:
-                        progress_queue.put(("read_done", str(file_path)), block=False)
+                        progress_queue.put(("read_done", worker_index, str(file_path)), block=False)
                 except Exception:
                     pass
 
@@ -166,9 +167,9 @@ def process_file_batch(
             if progress_queue is not None:
                 try:
                     if hasattr(progress_queue, "put_nowait"):
-                        progress_queue.put_nowait(("parse_start", str(file_path)))
+                        progress_queue.put_nowait(("parse_start", worker_index, str(file_path)))
                     else:
-                        progress_queue.put(("parse_start", str(file_path)), block=False)
+                        progress_queue.put(("parse_start", worker_index, str(file_path)), block=False)
                 except Exception:
                     pass
 
@@ -184,9 +185,9 @@ def process_file_batch(
             if progress_queue is not None:
                 try:
                     if hasattr(progress_queue, "put_nowait"):
-                        progress_queue.put_nowait(("parsed", str(file_path)))
+                        progress_queue.put_nowait(("parsed", worker_index, str(file_path)))
                     else:
-                        progress_queue.put(("parsed", str(file_path)), block=False)
+                        progress_queue.put(("parsed", worker_index, str(file_path)), block=False)
                 except Exception:
                     pass
 
@@ -218,9 +219,9 @@ def process_file_batch(
             if progress_queue is not None:
                 try:
                     if hasattr(progress_queue, "put_nowait"):
-                        progress_queue.put_nowait(("done", str(file_path)))
+                        progress_queue.put_nowait(("done", worker_index, str(file_path)))
                     else:
-                        progress_queue.put(("done", str(file_path)), block=False)
+                        progress_queue.put(("done", worker_index, str(file_path)), block=False)
                 except Exception:
                     # Drop on full/closed
                     pass

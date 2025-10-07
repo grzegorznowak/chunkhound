@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
+import os
 from tree_sitter import Language, Node, Parser, Query, Tree
 
 
@@ -89,6 +90,19 @@ class TreeSitterEngine:
         self._language = tree_sitter_language
         self._parser = Parser()
         self._parser.language = self._language
+        # Apply a global parse timeout to prevent pathological hangs
+        # Env override: CHUNKHOUND_PARSE_TIMEOUT_MS (0 disables timeout)
+        try:
+            timeout_ms = int(os.getenv("CHUNKHOUND_PARSE_TIMEOUT_MS", "3000"))
+        except Exception:
+            timeout_ms = 3000
+        try:
+            if timeout_ms and hasattr(self._parser, "timeout_micros"):
+                # Deprecation warnings are acceptable; property still supported
+                self._parser.timeout_micros = int(timeout_ms) * 1000
+        except Exception:
+            # If setting fails, continue without timeout
+            pass
 
     def parse_to_ast(self, content: str) -> Tree:
         """Parse content to AST - universal across all languages."""
