@@ -389,50 +389,42 @@ class IndexingCoordinator(BaseService):
 
                         rel = self._format_current_file_for_progress(Path(path_str))
                         now = loop.time()
-                        if worker_mode and worker_tasks:
-                            task_id = worker_tasks.get(worker_idx)
-                            if task_id is not None:
-                                if kind in ("start", "parse_start"):
-                                    label = rel.replace("Reading:", "Working:") if kind == "start" else rel.replace("Reading:", "Parsing:")
-                                    try:
-                                        self.progress.update(task_id, speed=label)
-                                    except Exception:
-                                        pass
-                                elif kind in ("parsed", "done"):
-                                    try:
-                                        self.progress.advance(task_id, 1)
-                                    except Exception:
-                                        pass
-                        else:
-                            # Update reading bar on start
-                            if kind == "start" and read_task is not None:
-                                prev = last_read.get(worker_idx)
-                                if rel != prev or (now - last_ts) >= 0.05:
-                                    try:
-                                        self.progress.update(read_task, speed=rel)
-                                    except Exception:
-                                        pass
-                                    last_read[worker_idx] = rel
-                                    last_ts = now
-                            # Advance reading when done
-                            elif kind == "read_done":
-                                if read_task is not None:
-                                    try:
-                                        self.progress.advance(read_task, 1)
-                                    except Exception:
-                                        pass
-                            # Parsing started: update parse speed
-                            elif kind == "parse_start" and parse_task is not None:
+                        # Always update aggregate bars
+                        if kind == "start" and read_task is not None:
+                            prev = last_read.get(worker_idx)
+                            if rel != prev or (now - last_ts) >= 0.05:
                                 try:
-                                    self.progress.update(parse_task, speed=rel.replace("Reading:", "Parsing:"))
+                                    self.progress.update(read_task, speed=rel)
                                 except Exception:
                                     pass
-                                last_parse[worker_idx] = rel
+                                last_read[worker_idx] = rel
                                 last_ts = now
-                            # Advance parsing when parsed
-                            elif kind == "parsed" and parse_task is not None:
+                        elif kind == "read_done":
+                            if read_task is not None:
                                 try:
-                                    self.progress.advance(parse_task, 1)
+                                    self.progress.advance(read_task, 1)
+                                except Exception:
+                                    pass
+                        elif kind == "parse_start" and parse_task is not None:
+                            try:
+                                self.progress.update(parse_task, speed=rel.replace("Reading:", "Parsing:"))
+                            except Exception:
+                                pass
+                            last_parse[worker_idx] = rel
+                            last_ts = now
+                        elif kind == "parsed" and parse_task is not None:
+                            try:
+                                self.progress.advance(parse_task, 1)
+                            except Exception:
+                                pass
+
+                        # Update per-worker label (no per-worker counters)
+                        if worker_mode and worker_tasks:
+                            task_id = worker_tasks.get(worker_idx)
+                            if task_id is not None and kind in ("start", "parse_start"):
+                                label = rel.replace("Reading:", "Working:") if kind == "start" else rel.replace("Reading:", "Parsing:")
+                                try:
+                                    self.progress.update(task_id, speed=label)
                                 except Exception:
                                     pass
 
@@ -452,8 +444,9 @@ class IndexingCoordinator(BaseService):
             if worker_mode and self.progress is not None:
                 for idx, batch in enumerate(file_batches):
                     try:
+                        # Indeterminate total so only filename shows (no M/N counters)
                         worker_tasks[idx] = self.progress.add_task(
-                            f"  └─ Worker {idx+1}", total=len(batch), speed="", info=""
+                            f"  └─ Worker {idx+1}", total=None, speed="", info=""
                         )
                     except Exception:
                         pass
