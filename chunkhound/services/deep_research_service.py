@@ -273,7 +273,7 @@ class DeepResearchService:
         # Step 1: Combine query with BFS ancestors for semantic search
         search_query = self._build_search_query(node.query, context)
 
-        # Step 2-7: Run unified search (semantic + symbol extraction + regex + reranking)
+        # Step 2-6: Run unified search (semantic + symbol extraction + regex)
         chunks = await self._unified_search(search_query, context)
         node.chunks = chunks
 
@@ -445,22 +445,25 @@ Output:
     async def _unified_search(
         self, query: str, context: ResearchContext
     ) -> list[dict[str, Any]]:
-        """Perform unified semantic + symbol-based regex search with reranking (Steps 2-7).
+        """Perform unified semantic + symbol-based regex search (Steps 2-6).
 
         Algorithm steps:
-        1. Multi-hop semantic search with reranking (Step 2)
+        1. Multi-hop semantic search with internal reranking (Step 2)
         2. Extract symbols from semantic results (Step 3)
-        3. Rerank symbols by relevance (Step 4)
+        3. Select top N symbols (Step 4) - already in relevance order from reranked results
         4. Regex search for top symbols (Step 5)
         5. Unify results at chunk level (Step 6)
-        6. Final reranking of unified results (Step 7)
+
+        Note: Multi-hop semantic search already performs reranking internally,
+        so symbols are extracted from already-reranked results and no additional
+        reranking is needed.
 
         Args:
             query: Search query
             context: Research context with root query and ancestors
 
         Returns:
-            List of unified and reranked chunks
+            List of unified chunks
         """
         search_service = self._db_services.search_service
 
@@ -515,9 +518,9 @@ Output:
             symbols = await self._extract_symbols_from_chunks(semantic_results)
 
             if symbols:
-                # Step 4: Rerank symbols by relevance
-                logger.debug(f"Step 4: Reranking {len(symbols)} symbols")
-                top_symbols = await self._rerank_symbols(symbols, query, context)
+                # Step 4: Select top symbols (already in relevance order from reranked semantic results)
+                logger.debug(f"Step 4: Selecting top {MAX_SYMBOLS_TO_SEARCH} symbols from {len(symbols)} extracted symbols")
+                top_symbols = symbols[:MAX_SYMBOLS_TO_SEARCH]
 
                 if top_symbols:
                     # Step 5: Regex search for top symbols
@@ -547,11 +550,7 @@ Output:
         unified_chunks = list(unified_map.values())
         logger.debug(f"Unified to {len(unified_chunks)} unique chunks")
 
-        # Step 7: Final reranking of unified results
-        if len(unified_chunks) > 1:
-            logger.debug("Step 7: Final reranking of unified results")
-            unified_chunks = await self._rerank_unified_chunks(unified_chunks, query, context)
-
+        # Note: Multi-hop semantic search already reranked results, no need to rerank again
         return unified_chunks
 
     async def _extract_symbols_from_chunks(
@@ -606,70 +605,6 @@ Output:
         )
         return filtered_symbols
 
-    async def _rerank_symbols(
-        self, symbols: list[str], query: str, context: ResearchContext
-    ) -> list[str]:
-        """Rerank symbols by relevance to query + BFS context (Step 4).
-
-        Args:
-            symbols: List of extracted symbol names
-            query: Current query
-            context: Research context with root query and ancestors
-
-        Returns:
-            Top N most relevant symbols (up to MAX_SYMBOLS_TO_SEARCH)
-        """
-        if not symbols:
-            return []
-
-        # If we have few symbols, return all
-        if len(symbols) <= MAX_SYMBOLS_TO_SEARCH:
-            return symbols[:MAX_SYMBOLS_TO_SEARCH]
-
-        # Check if embedding provider supports reranking
-        embedding_provider = self._embedding_manager.get_provider()
-        if not (
-            hasattr(embedding_provider, "supports_reranking")
-            and embedding_provider.supports_reranking()
-            and hasattr(embedding_provider, "rerank")
-        ):
-            logger.warning(
-                "Embedding provider doesn't support reranking, returning first N symbols"
-            )
-            return symbols[:MAX_SYMBOLS_TO_SEARCH]
-
-        try:
-            # Combine query with BFS context for reranking (include full BFS path per algorithm)
-            ancestors_path = " -> ".join(context.ancestors) if context.ancestors else ""
-            search_context = f"{context.root_query} {ancestors_path} {query}".strip()
-
-            # Rerank symbols against query context
-            rerank_results = await embedding_provider.rerank(
-                query=search_context, documents=symbols, top_k=min(10, len(symbols))
-            )
-
-            # Filter by RELEVANCE_THRESHOLD and return top MAX_SYMBOLS_TO_SEARCH
-            top_symbols = [
-                symbols[r.index]
-                for r in rerank_results
-                if r.score >= RELEVANCE_THRESHOLD
-            ][:MAX_SYMBOLS_TO_SEARCH]
-
-            if not top_symbols:
-                # If filtering removed everything, take top N by score regardless
-                top_symbols = [
-                    symbols[r.index] for r in rerank_results[:MAX_SYMBOLS_TO_SEARCH]
-                ]
-
-            logger.debug(
-                f"Reranked {len(symbols)} symbols -> {len(top_symbols)} top symbols"
-            )
-            return top_symbols
-
-        except Exception as e:
-            logger.warning(f"Symbol reranking failed: {e}, returning first N symbols")
-            return symbols[:MAX_SYMBOLS_TO_SEARCH]
-
     async def _search_by_symbols(self, symbols: list[str]) -> list[dict[str, Any]]:
         """Search codebase for top-ranked symbols using parallel async regex (Step 5).
 
@@ -723,70 +658,6 @@ Output:
             f"Parallel symbol regex search complete: {len(all_results)} total chunks from {len(symbols)} symbols"
         )
         return all_results
-
-    async def _rerank_unified_chunks(
-        self, chunks: list[dict[str, Any]], query: str, context: ResearchContext
-    ) -> list[dict[str, Any]]:
-        """Final reranking pass on unified semantic + regex results (Step 7).
-
-        Args:
-            chunks: Unified list of chunks from semantic and regex search
-            query: Current query to rank against
-            context: Research context with root query and BFS path
-
-        Returns:
-            Chunks sorted by relevance score (highest first)
-        """
-        if not chunks or len(chunks) <= 1:
-            return chunks
-
-        # Check if embedding provider supports reranking
-        embedding_provider = self._embedding_manager.get_provider()
-        if not (
-            hasattr(embedding_provider, "supports_reranking")
-            and embedding_provider.supports_reranking()
-            and hasattr(embedding_provider, "rerank")
-        ):
-            logger.warning(
-                "Embedding provider doesn't support reranking, skipping final rerank"
-            )
-            return chunks
-
-        try:
-            # Prepare documents for reranking (use content field)
-            documents = [
-                chunk.get("content", chunk.get("code", "")) for chunk in chunks
-            ]
-
-            # Build reranking query with full BFS context (per algorithm spec)
-            ancestors_path = " -> ".join(context.ancestors) if context.ancestors else ""
-            rerank_query = f"{context.root_query} {ancestors_path} {query}".strip()
-
-            # Rerank all chunks against query with context
-            rerank_results = await embedding_provider.rerank(
-                query=rerank_query, documents=documents, top_k=len(documents)
-            )
-
-            # Update chunks with relevance scores
-            for rerank_result in rerank_results:
-                if 0 <= rerank_result.index < len(chunks):
-                    chunks[rerank_result.index]["relevance_score"] = rerank_result.score
-
-            # Sort by relevance score (highest first)
-            sorted_chunks = sorted(
-                chunks, key=lambda x: x.get("relevance_score", 0.0), reverse=True
-            )
-
-            logger.debug(
-                f"Reranked {len(sorted_chunks)} unified chunks, top score: {sorted_chunks[0].get('relevance_score', 0.0):.3f}"
-            )
-            return sorted_chunks
-
-        except Exception as e:
-            logger.warning(
-                f"Final chunk reranking failed: {e}, returning original order"
-            )
-            return chunks
 
     def _expand_to_natural_boundaries(
         self,
@@ -1570,8 +1441,9 @@ Generate {target_count} synthesized questions:"""
     ) -> tuple[list[dict[str, Any]], dict[str, str], dict[str, Any]]:
         """Manage token budget to fit within SINGLE_PASS_MAX_TOKENS limit.
 
-        Prioritizes files by chunk relevance scores. If total exceeds budget,
-        includes full files for high-priority items and snippets for lower-priority.
+        Prioritizes files by chunk scores from multi-hop semantic search.
+        If total exceeds budget, includes full files for high-priority items
+        and snippets for lower-priority.
 
         Args:
             chunks: All chunks from BFS traversal
@@ -1594,12 +1466,12 @@ Generate {target_count} synthesized questions:"""
             f"Managing token budget: {available_tokens:,} tokens available for code content"
         )
 
-        # Sort chunks by relevance score (highest first)
+        # Sort chunks by score from multi-hop semantic search (highest first)
         sorted_chunks = sorted(
-            chunks, key=lambda c: c.get("relevance_score", 0.0), reverse=True
+            chunks, key=lambda c: c.get("score", 0.0), reverse=True
         )
 
-        # Build file priority map based on chunk relevance
+        # Build file priority map based on chunk scores
         file_priorities: dict[str, float] = {}
         file_to_chunks: dict[str, list[dict[str, Any]]] = {}
 
@@ -1610,8 +1482,8 @@ Generate {target_count} synthesized questions:"""
                     file_priorities[file_path] = 0.0
                     file_to_chunks[file_path] = []
 
-                # Accumulate relevance scores for this file
-                file_priorities[file_path] += chunk.get("relevance_score", 0.0)
+                # Accumulate scores for this file
+                file_priorities[file_path] += chunk.get("score", 0.0)
                 file_to_chunks[file_path].append(chunk)
 
         # Sort files by priority
