@@ -1,6 +1,7 @@
 """Search service for ChunkHound - handles semantic and regex search operations."""
 
 import asyncio
+import re
 from pathlib import Path
 from typing import Any
 
@@ -11,6 +12,39 @@ from chunkhound.interfaces.database_provider import DatabaseProvider
 from chunkhound.interfaces.embedding_provider import EmbeddingProvider
 
 from .base_service import BaseService
+
+
+def _strip_chunk_part_suffix(symbol: str) -> str:
+    """Strip _partN suffixes from symbol names added during chunk splitting.
+
+    During chunk splitting, symbols get suffixes like:
+    - Binary split: _part1, _part2
+    - Multi-part: _part3, _part4, ..., _partN
+    - Nested: _part1_part2, _part2_part1, etc.
+
+    These suffixes are internal chunking artifacts that don't exist in actual
+    source code. This function removes them to expose the original code identifier.
+
+    Args:
+        symbol: Symbol name potentially containing _partN suffixes
+
+    Returns:
+        Clean symbol name without chunk suffixes
+
+    Examples:
+        >>> _strip_chunk_part_suffix("DeepResearchService_part2")
+        'DeepResearchService'
+        >>> _strip_chunk_part_suffix("MyClass_part1_part2")
+        'MyClass'
+        >>> _strip_chunk_part_suffix("block_line_767_part3")
+        'block_line_767'
+        >>> _strip_chunk_part_suffix("normal_function")
+        'normal_function'
+    """
+    # Pattern matches _partN suffixes (including nested ones)
+    # (?:_part\d+)+ matches one or more occurrences of _part followed by digits
+    # $ ensures we only strip from the end
+    return re.sub(r"(?:_part\d+)+$", "", symbol)
 
 
 class SearchService(BaseService):
@@ -730,6 +764,26 @@ class SearchService(BaseService):
             Enhanced result with additional metadata
         """
         enhanced = result.copy()
+
+        # Clean symbol name by stripping _partN suffixes added during chunk splitting
+        # This ensures consumers (like deep research) get valid code identifiers
+        # instead of internal chunking artifacts
+        if "symbol" in result and result["symbol"]:
+            original_symbol = result["symbol"]
+            clean_symbol = _strip_chunk_part_suffix(original_symbol)
+
+            # Only modify if suffix was actually stripped
+            if clean_symbol != original_symbol:
+                enhanced["symbol"] = clean_symbol
+
+                # Preserve original symbol in metadata for debugging/compatibility
+                metadata = enhanced.get("metadata", {})
+                if isinstance(metadata, dict):
+                    metadata["original_symbol"] = original_symbol
+                    enhanced["metadata"] = metadata
+                else:
+                    # If metadata isn't a dict, create a new metadata dict
+                    enhanced["metadata"] = {"original_symbol": original_symbol}
 
         # Add computed fields
         if "start_line" in result and "end_line" in result:

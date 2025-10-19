@@ -312,6 +312,7 @@ async def deep_research_impl(
     embedding_manager: EmbeddingManager,
     llm_manager: LLMManager,
     query: str,
+    progress: Any = None,
 ) -> dict[str, Any]:
     """Core deep research implementation.
 
@@ -320,6 +321,7 @@ async def deep_research_impl(
         embedding_manager: Embedding manager instance
         llm_manager: LLM manager instance
         query: Research query
+        progress: Optional Rich Progress instance for terminal UI (None for MCP)
 
     Returns:
         Dict with answer, follow_up_suggestions, and metadata
@@ -358,6 +360,7 @@ async def deep_research_impl(
         embedding_manager=embedding_manager,
         llm_manager=llm_manager,
         tool_name="code_research",  # Matches tool registration below
+        progress=progress,  # Pass progress for terminal UI (None in MCP mode)
     )
 
     # Perform code research

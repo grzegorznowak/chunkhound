@@ -2,15 +2,19 @@
 
 import asyncio
 import math
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
 from loguru import logger
 
 from chunkhound.database_factory import DatabaseServices
 from chunkhound.embeddings import EmbeddingManager
 from chunkhound.llm_manager import LLMManager
+
+if TYPE_CHECKING:
+    from chunkhound.api.cli.utils.tree_progress import TreeProgressDisplay
 
 # Constants
 RELEVANCE_THRESHOLD = 0.5  # Lower threshold for better recall, reranking will filter
@@ -83,6 +87,7 @@ class BFSNode:
     node_id: int = 0
     unanswered_aspects: list[str] = field(default_factory=list)  # Questions we couldn't answer
     token_budgets: dict[str, int] = field(default_factory=dict)  # Adaptive token budgets for this node
+    task_id: int | None = None  # Progress task ID for TUI display
 
     # Termination tracking
     is_terminated_leaf: bool = False  # True if terminated due to no new information
@@ -108,6 +113,7 @@ class DeepResearchService:
         embedding_manager: EmbeddingManager,
         llm_manager: LLMManager,
         tool_name: str = "code_research",
+        progress: "TreeProgressDisplay | None" = None,
     ):
         """Initialize deep research service.
 
@@ -116,12 +122,60 @@ class DeepResearchService:
             embedding_manager: Embedding manager for semantic search
             llm_manager: LLM manager for generating follow-ups and synthesis
             tool_name: Name of the MCP tool (used in followup suggestions)
+            progress: Optional TreeProgressDisplay instance for terminal UI (None for MCP)
         """
         self._db_services = database_services
         self._embedding_manager = embedding_manager
         self._llm_manager = llm_manager
         self._tool_name = tool_name
         self._node_counter = 0
+        self.progress = progress  # Store progress instance for event emission
+        self._progress_lock: asyncio.Lock | None = None  # Lazy init for concurrent progress updates
+        self._progress_lock_init = threading.Lock()  # Thread-safe guard for lock creation
+
+    async def _ensure_progress_lock(self) -> None:
+        """Ensure progress lock exists (must be called in async event loop context).
+
+        Lazy initialization pattern: Lock is created on first use to ensure it's created
+        in the event loop context, avoiding RuntimeError from asyncio.Lock() in __init__.
+
+        Uses double-checked locking to prevent race conditions where multiple concurrent
+        tasks could create separate locks.
+        """
+        if self.progress and self._progress_lock is None:
+            with self._progress_lock_init:  # Thread-safe initialization guard
+                if self._progress_lock is None:  # Double-check inside lock
+                    self._progress_lock = asyncio.Lock()
+
+    async def _emit_event(
+        self,
+        event_type: str,
+        message: str,
+        node_id: int | None = None,
+        depth: int | None = None,
+        **metadata: Any,
+    ) -> None:
+        """Emit a progress event with lock protection.
+
+        Args:
+            event_type: Event type identifier
+            message: Human-readable event description
+            node_id: Optional BFS node ID
+            depth: Optional BFS depth level
+            **metadata: Additional event data (chunks, files, tokens, etc.)
+        """
+        if not self.progress:
+            return
+        await self._ensure_progress_lock()
+        assert self._progress_lock is not None
+        async with self._progress_lock:
+            await self.progress.emit_event(
+                event_type=event_type,
+                message=message,
+                node_id=node_id,
+                depth=depth,
+                metadata=metadata,
+            )
 
     async def deep_research(self, query: str) -> dict[str, Any]:
         """Perform deep research on a query.
@@ -137,9 +191,15 @@ class DeepResearchService:
         """
         logger.info(f"Starting deep research for query: '{query}'")
 
+        # Emit main start event
+        await self._emit_event("main_start", f"Starting deep research: {query[:60]}...")
+
         # Calculate max depth based on repository size
         max_depth = self._calculate_max_depth()
         logger.info(f"Max depth for this repository: {max_depth}")
+
+        # Emit depth info event
+        await self._emit_event("main_info", f"Max depth: {max_depth}", max_depth=max_depth)
 
         # Initialize BFS graph with root node
         root = BFSNode(query=query, depth=0, node_id=self._get_next_node_id())
@@ -149,11 +209,29 @@ class DeepResearchService:
         current_level = [root]
         all_nodes: list[BFSNode] = [root]
 
-        for depth in range(1, max_depth + 1):
+        # Global explored data: track ALL chunks/files discovered across entire BFS graph
+        # This enables sibling nodes to detect duplicates, not just ancestors
+        global_explored_data = {
+            "files_fully_read": set(),
+            "chunk_ranges": {},  # file_path -> list[(start, end)]
+        }
+
+        # BFS traversal: Process depth 0 (root node) through max_depth
+        # Root node (depth 0) is already in current_level, so we start the loop at 0
+        for depth in range(0, max_depth + 1):
             if not current_level:
                 break
 
             logger.info(f"Processing BFS level {depth}, nodes: {len(current_level)}")
+
+            # Emit depth start event
+            await self._emit_event(
+                "depth_start",
+                f"Processing depth {depth}/{max_depth}",
+                depth=depth,
+                nodes=len(current_level),
+                max_depth=max_depth,
+            )
 
             # Process all nodes at this level concurrently (as per algorithm spec)
             # Each node gets its own context copy to avoid shared state issues
@@ -171,7 +249,7 @@ class DeepResearchService:
 
             # Process all nodes concurrently
             node_tasks = [
-                self._process_bfs_node(node, node_ctx, depth)
+                self._process_bfs_node(node, node_ctx, depth, global_explored_data)
                 for node, node_ctx in node_contexts
             ]
             children_lists = await asyncio.gather(*node_tasks, return_exceptions=True)
@@ -191,6 +269,11 @@ class DeepResearchService:
                 next_level.extend(children_result)
                 all_nodes.extend(children_result)
 
+                # Update global explored data with this node's discoveries
+                # Only update if node found new information (not terminated)
+                if not node.is_terminated_leaf and node.chunks:
+                    self._update_global_explored_data(global_explored_data, node)
+
             # Update global context with all processed queries
             for node, _ in node_contexts:
                 if node.query not in context.ancestors:
@@ -206,6 +289,10 @@ class DeepResearchService:
 
         # Aggregate all findings from BFS tree
         logger.info("BFS traversal complete, aggregating findings")
+
+        # Emit aggregating event
+        await self._emit_event("synthesis_start", "Aggregating findings from BFS tree")
+
         aggregated = self._aggregate_all_findings(root)
 
         # Manage token budget for single-pass synthesis
@@ -215,6 +302,14 @@ class DeepResearchService:
             )
         )
 
+        # Emit synthesizing event
+        await self._emit_event(
+            "synthesis_start",
+            "Synthesizing final answer",
+            chunks=len(prioritized_chunks),
+            files=len(budgeted_files),
+        )
+
         # Single-pass synthesis with all data
         answer = await self._single_pass_synthesis(
             root_query=query,
@@ -222,6 +317,9 @@ class DeepResearchService:
             files=budgeted_files,
             context=context,
         )
+
+        # Emit validating event
+        await self._emit_event("synthesis_validate", "Validating output quality")
 
         # Validate output quality (conciseness, actionability)
         llm = self._llm_manager.get_utility_provider()
@@ -244,13 +342,22 @@ class DeepResearchService:
 
         logger.info(f"Deep research completed: {metadata}")
 
+        # Emit completion event
+        await self._emit_event(
+            "main_complete",
+            f"Deep research complete",
+            depth_reached=metadata["depth_reached"],
+            nodes_explored=metadata["nodes_explored"],
+            chunks_analyzed=metadata["chunks_analyzed"],
+        )
+
         return {
             "answer": answer,
             "metadata": metadata,
         }
 
     async def _process_bfs_node(
-        self, node: BFSNode, context: ResearchContext, depth: int
+        self, node: BFSNode, context: ResearchContext, depth: int, global_explored_data: dict[str, Any]
     ) -> list[BFSNode]:
         """Process a single BFS node.
 
@@ -258,11 +365,21 @@ class DeepResearchService:
             node: BFS node to process
             context: Research context
             depth: Current depth in graph
+            global_explored_data: Global state tracking all explored chunks/files across entire BFS
 
         Returns:
             List of child nodes (follow-up questions)
         """
         logger.debug(f"Processing node at depth {depth}: '{node.query}'")
+
+        # Emit node start event
+        query_preview = node.query[:60] + "..." if len(node.query) > 60 else node.query
+        await self._emit_event(
+            "node_start",
+            query_preview,
+            node_id=node.node_id,
+            depth=depth,
+        )
 
         # Calculate adaptive token budgets for this node (assume leaf initially)
         max_depth = self._calculate_max_depth()
@@ -274,21 +391,43 @@ class DeepResearchService:
         search_query = self._build_search_query(node.query, context)
 
         # Step 2-6: Run unified search (semantic + symbol extraction + regex)
-        chunks = await self._unified_search(search_query, context)
+        chunks = await self._unified_search(search_query, context, node_id=node.node_id, depth=depth)
         node.chunks = chunks
 
         if not chunks:
             logger.warning(f"No chunks found for query: '{node.query}'")
+            await self._emit_event(
+                "node_complete",
+                "No chunks found",
+                node_id=node.node_id,
+                depth=depth,
+                chunks=0,
+            )
             return []
 
         # Step 8: Read files with adaptive token budget
+        await self._emit_event("read_files", "Reading files", node_id=node.node_id, depth=depth)
+
         file_contents = await self._read_files_with_budget(
             chunks, max_tokens=node.token_budgets["file_content_tokens"]
         )
         node.file_contents = file_contents  # Store for later synthesis
 
+        # Emit file reading results
+        llm = self._llm_manager.get_utility_provider()
+        total_tokens = sum(llm.estimate_tokens(content) for content in file_contents.values())
+        await self._emit_event(
+            "read_files_complete",
+            f"Read {len(file_contents)} files",
+            node_id=node.node_id,
+            depth=depth,
+            files=len(file_contents),
+            tokens=total_tokens,
+        )
+
         # Step 8.5: Check for new information (termination rule)
-        has_new_info, dedup_stats = self._detect_new_information(node, chunks)
+        # Uses global explored data to detect duplicates across entire BFS graph, not just ancestors
+        has_new_info, dedup_stats = self._detect_new_information(node, chunks, global_explored_data)
         node.new_chunk_count = dedup_stats["new_chunks"]
         node.duplicate_chunk_count = dedup_stats["duplicate_chunks"]
 
@@ -299,6 +438,13 @@ class DeepResearchService:
                 f"Marking as terminated leaf, skipping question generation."
             )
             node.is_terminated_leaf = True
+            await self._emit_event(
+                "node_terminated",
+                "No new information found",
+                node_id=node.node_id,
+                depth=depth,
+                duplicates=dedup_stats['duplicate_chunks'],
+            )
             return []  # No children
 
         logger.debug(
@@ -308,6 +454,8 @@ class DeepResearchService:
         )
 
         # Step 9: Generate follow-up questions using LLM with adaptive budget
+        await self._emit_event("llm_followup", "Generating follow-up questions", node_id=node.node_id, depth=depth)
+
         follow_ups = await self._generate_follow_up_questions(
             node.query,
             context,
@@ -315,6 +463,25 @@ class DeepResearchService:
             chunks,
             max_input_tokens=node.token_budgets["llm_input_tokens"],
         )
+
+        # Emit follow-up generation results
+        if follow_ups:
+            questions_preview = "; ".join(q[:40] + "..." if len(q) > 40 else q for q in follow_ups[:2])
+            await self._emit_event(
+                "llm_followup_complete",
+                f"Generated {len(follow_ups)} follow-ups",
+                node_id=node.node_id,
+                depth=depth,
+                followups=len(follow_ups),
+            )
+        else:
+            await self._emit_event(
+                "llm_followup_complete",
+                "No follow-ups generated",
+                node_id=node.node_id,
+                depth=depth,
+                followups=0,
+            )
 
         # Create child nodes
         children = []
@@ -326,6 +493,17 @@ class DeepResearchService:
                 node_id=self._get_next_node_id(),
             )
             children.append(child)
+
+        # Emit node completion
+        await self._emit_event(
+            "node_complete",
+            f"Complete",
+            node_id=node.node_id,
+            depth=depth,
+            files=len(file_contents),
+            chunks=len(chunks),
+            children=len(children),
+        )
 
         return children
 
@@ -374,67 +552,61 @@ class DeepResearchService:
         """
         llm = self._llm_manager.get_utility_provider()
 
-        system = """You are optimizing queries for CODE SEARCH in a semantic embedding system.
-Your goal: reformulate the query to match how code is actually written and documented.
-Stay within the CODE DOMAIN - no abstract concepts or unrelated technologies."""
+        # Define JSON schema for structured output
+        schema = {
+            "type": "object",
+            "properties": {
+                "queries": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": f"Array of exactly {NUM_EXPANDED_QUERIES} expanded search queries"
+                }
+            },
+            "required": ["queries"],
+            "additionalProperties": False
+        }
+
+        # Simplified system prompt per GPT-5-Nano best practices
+        system = """Generate diverse code search queries for semantic embedding systems."""
 
         # Build context string
         context_str = ""
         if context.ancestors:
             ancestor_path = " → ".join(context.ancestors[-2:])
-            context_str = f"\nPrior exploration: {ancestor_path}"
+            context_str = f"\nPrior: {ancestor_path}"
 
-        prompt = f"""Original question: {query}
-Codebase context: {context.root_query}{context_str}
+        # Simplified prompt
+        prompt = f"""Query: {query}
+Context: {context.root_query}{context_str}
 
-Generate {NUM_EXPANDED_QUERIES} code search queries for semantic embedding:
+Generate {NUM_EXPANDED_QUERIES} search variations:
+1. Original query verbatim
+2. Technical keywords (function/class names, programming terms)
+3. Hypothetical code patterns (class X, def method(), etc.)
 
-INSTRUCTIONS:
-Query 1: Output the original question EXACTLY as given (verbatim)
-Query 2: Rephrase with code-specific technical terms (add likely function/class names, programming terminology)
-Query 3: Describe hypothetical code structure (mention patterns like "class X", "def method()", "calls Y")
-
-RULES:
-- All queries must be about CODE in THIS codebase
-- NO abstract concepts ("across disciplines", "principles", "paradigms")
-- NO unrelated technologies (Docker, MLflow, CI/CD unless actually in codebase)
-- Use technical terms that would appear in actual code/comments/docstrings
-- Keep each query 1-2 sentences maximum
-
-OUTPUT FORMAT (simple numbered list):
-1. [query 1 text here]
-2. [query 2 text here]
-3. [query 3 text here]
-
-Example:
-Input: "How does the authentication system work?"
-Output:
-1. How does the authentication system work?
-2. authentication implementation user login validation middleware
-3. Auth class with login() verify_token() methods handling session management"""
+Use only code-domain terms. No abstract concepts. Keep concise."""
 
         try:
-            response = await llm.complete(prompt, system=system, max_completion_tokens=2500)
+            result = await llm.complete_structured(
+                prompt=prompt,
+                json_schema=schema,
+                system=system,
+                max_completion_tokens=2500
+            )
 
-            # Parse queries from response
-            queries = []
-            for line in response.content.split("\n"):
-                line = line.strip()
-                if line and (line[0].isdigit() or line.startswith("-")):
-                    query_text = line.lstrip("0123456789.-) ").strip()
-                    if query_text:
-                        queries.append(query_text)
+            queries = result.get("queries", [])
 
             # Ensure we have at least the original query
-            if not queries:
+            if not queries or len(queries) == 0:
                 logger.warning("LLM query expansion returned no queries, using original")
                 return [query]
 
-            # Take first NUM_EXPANDED_QUERIES, or pad with original if fewer
-            while len(queries) < NUM_EXPANDED_QUERIES:
-                queries.append(query)
+            # Filter empty queries and pad with original if needed
+            valid_queries = [q.strip() for q in queries if q and q.strip()]
+            while len(valid_queries) < NUM_EXPANDED_QUERIES:
+                valid_queries.append(query)
 
-            expanded = queries[:NUM_EXPANDED_QUERIES]
+            expanded = valid_queries[:NUM_EXPANDED_QUERIES]
             logger.debug(f"Expanded query into {len(expanded)} variants")
             return expanded
 
@@ -443,7 +615,7 @@ Output:
             return [query]
 
     async def _unified_search(
-        self, query: str, context: ResearchContext
+        self, query: str, context: ResearchContext, node_id: int | None = None, depth: int | None = None
     ) -> list[dict[str, Any]]:
         """Perform unified semantic + symbol-based regex search (Steps 2-6).
 
@@ -461,6 +633,8 @@ Output:
         Args:
             query: Search query
             context: Research context with root query and ancestors
+            node_id: Optional BFS node ID for event emission
+            depth: Optional BFS depth for event emission
 
         Returns:
             List of unified chunks
@@ -471,8 +645,20 @@ Output:
         if QUERY_EXPANSION_ENABLED:
             # Expand query into multiple diverse perspectives
             logger.debug("Step 2a: Expanding query for diverse semantic search")
+            await self._emit_event("query_expand", "Expanding query", node_id=node_id, depth=depth)
+
             expanded_queries = await self._expand_query_with_llm(query, context)
             logger.debug(f"Expanded into {len(expanded_queries)} queries: {expanded_queries}")
+
+            # Emit expanded queries event
+            queries_preview = " | ".join(q[:40] + "..." if len(q) > 40 else q for q in expanded_queries[:3])
+            await self._emit_event(
+                "query_expand_complete",
+                f"Expanded to {len(expanded_queries)} queries",
+                node_id=node_id,
+                depth=depth,
+                queries=len(expanded_queries),
+            )
 
             # Run all semantic searches in parallel
             logger.debug(f"Step 2b: Running {len(expanded_queries)} parallel semantic searches")
@@ -499,9 +685,20 @@ Output:
             logger.debug(
                 f"Unified {sum(len(r[0]) for r in search_results)} results from {len(expanded_queries)} searches -> {len(semantic_results)} unique chunks"
             )
+
+            # Emit search results event
+            await self._emit_event(
+                "search_semantic",
+                f"Found {len(semantic_results)} chunks",
+                node_id=node_id,
+                depth=depth,
+                chunks=len(semantic_results),
+            )
         else:
             # Original single-query approach (fallback)
             logger.debug(f"Step 2: Running multi-hop semantic search for query: '{query}'")
+            await self._emit_event("search_semantic", "Searching semantically", node_id=node_id, depth=depth)
+
             semantic_results, _ = await search_service.search_semantic(
                 query=query,
                 page_size=30,
@@ -510,11 +707,22 @@ Output:
             )
             logger.debug(f"Semantic search returned {len(semantic_results)} chunks")
 
+            # Emit search results event
+            await self._emit_event(
+                "search_semantic",
+                f"Found {len(semantic_results)} chunks",
+                node_id=node_id,
+                depth=depth,
+                chunks=len(semantic_results),
+            )
+
         # Steps 3-5: Symbol extraction, reranking, and regex search
         regex_results = []
         if semantic_results:
             # Step 3: Extract symbols from semantic results
             logger.debug("Step 3: Extracting symbols from semantic results")
+            await self._emit_event("extract_symbols", "Extracting symbols", node_id=node_id, depth=depth)
+
             symbols = await self._extract_symbols_from_chunks(semantic_results)
 
             if symbols:
@@ -522,12 +730,35 @@ Output:
                 logger.debug(f"Step 4: Selecting top {MAX_SYMBOLS_TO_SEARCH} symbols from {len(symbols)} extracted symbols")
                 top_symbols = symbols[:MAX_SYMBOLS_TO_SEARCH]
 
+                # Emit symbol extraction results
+                symbols_preview = ", ".join(top_symbols[:5])
+                if len(top_symbols) > 5:
+                    symbols_preview += "..."
+                await self._emit_event(
+                    "extract_symbols_complete",
+                    f"Extracted {len(symbols)} symbols, searching top {len(top_symbols)}",
+                    node_id=node_id,
+                    depth=depth,
+                    symbols=len(symbols),
+                )
+
                 if top_symbols:
                     # Step 5: Regex search for top symbols
                     logger.debug(
                         f"Step 5: Running regex search for {len(top_symbols)} top symbols"
                     )
+                    await self._emit_event("search_regex", "Running regex search", node_id=node_id, depth=depth)
+
                     regex_results = await self._search_by_symbols(top_symbols)
+
+                    # Emit regex search results
+                    await self._emit_event(
+                        "search_regex_complete",
+                        f"Found {len(regex_results)} additional chunks",
+                        node_id=node_id,
+                        depth=depth,
+                        chunks=len(regex_results),
+                    )
 
         # Step 6: Unify results at chunk level (deduplicate by chunk_id)
         logger.debug(
@@ -1017,6 +1248,9 @@ Output:
     def _collect_ancestor_data(self, node: BFSNode) -> dict[str, Any]:
         """Traverse parent chain and collect all ancestor chunks/files.
 
+        NOTE: This method is now deprecated in favor of global_explored_data tracking.
+        Kept for backward compatibility but not actively used in BFS duplicate detection.
+
         Args:
             node: Current BFS node
 
@@ -1049,24 +1283,46 @@ Output:
             "chunk_ranges": chunk_ranges,
         }
 
+    def _update_global_explored_data(self, global_explored_data: dict[str, Any], node: BFSNode) -> None:
+        """Update global explored data with discoveries from a single node.
+
+        This allows sibling nodes and future nodes to detect duplicates across the entire BFS graph,
+        not just their ancestor chain. Critical for preventing redundant exploration.
+
+        Args:
+            global_explored_data: Global state dict with files_fully_read and chunk_ranges
+            node: BFS node whose discoveries should be added to global state
+        """
+        # Add fully-read files
+        for file_path, content in node.file_contents.items():
+            if self._is_file_fully_read(content):
+                global_explored_data["files_fully_read"].add(file_path)
+
+        # Add expanded chunk ranges
+        for chunk in node.chunks:
+            file_path = chunk.get("file_path")
+            if file_path:
+                expanded_range = self._get_chunk_expanded_range(chunk)
+                global_explored_data["chunk_ranges"].setdefault(file_path, []).append(expanded_range)
+
     def _is_chunk_duplicate(
         self,
         chunk: dict[str, Any],
         chunk_expanded_range: tuple[int, int],
-        ancestor_data: dict[str, Any],
+        explored_data: dict[str, Any],
     ) -> bool:
-        """Check if chunk is 100% duplicate of ancestor's data.
+        """Check if chunk is 100% duplicate of any previously explored data in BFS graph.
 
         Returns True only if:
-        1. Chunk's file was fully read by ancestor, OR
-        2. Chunk's expanded range is 100% contained in ancestor's expanded chunk
+        1. Chunk's file was fully read by any previously explored node, OR
+        2. Chunk's expanded range is 100% contained in any previously explored chunk
 
         Partial overlaps return False (counted as new information).
 
         Args:
             chunk: Chunk dictionary
             chunk_expanded_range: Expanded range for this chunk
-            ancestor_data: Data from _collect_ancestor_data
+            explored_data: Global explored data from entire BFS graph (not just ancestors)
 
         Returns:
             True if chunk is 100% duplicate, False otherwise
@@ -1077,14 +1333,14 @@ Output:
 
         expanded_start, expanded_end = chunk_expanded_range
 
-        # Check 1: File fully read by ancestor
-        if file_path in ancestor_data["files_fully_read"]:
+        # Check 1: File fully read by any previously explored node
+        if file_path in explored_data["files_fully_read"]:
             return True
 
-        # Check 2: 100% containment in ancestor's expanded chunks
-        for anc_start, anc_end in ancestor_data["chunk_ranges"].get(file_path, []):
+        # Check 2: 100% containment in any previously explored chunk
+        for prev_start, prev_end in explored_data["chunk_ranges"].get(file_path, []):
             # Must be completely contained (100% overlap)
-            if expanded_start >= anc_start and expanded_end <= anc_end:
+            if expanded_start >= prev_start and expanded_end <= prev_end:
                 return True
 
         return False
@@ -1093,12 +1349,14 @@ Output:
         self,
         node: BFSNode,
         chunks: list[dict[str, Any]],
+        global_explored_data: dict[str, Any],
     ) -> tuple[bool, dict[str, Any]]:
-        """Detect if node has new information vs ancestors.
+        """Detect if node has new information vs all previously explored nodes in BFS graph.
 
         Args:
             node: Current BFS node
             chunks: Chunks found for this node
+            global_explored_data: Global state with files_fully_read and chunk_ranges from ALL processed nodes
 
         Returns:
             Tuple of (has_new_info, stats):
@@ -1113,10 +1371,7 @@ Output:
             # No chunks at all
             return (False, {"new_chunks": 0, "duplicate_chunks": 0, "total_chunks": 0})
 
-        # Collect ancestor data
-        ancestor_data = self._collect_ancestor_data(node)
-
-        # Check each chunk
+        # Check each chunk against global explored data (entire BFS graph, not just ancestors)
         new_count = 0
         duplicate_count = 0
 
@@ -1124,7 +1379,7 @@ Output:
             # Get expanded range (from stored data or re-compute)
             expanded_range = self._get_chunk_expanded_range(chunk)
 
-            is_duplicate = self._is_chunk_duplicate(chunk, expanded_range, ancestor_data)
+            is_duplicate = self._is_chunk_duplicate(chunk, expanded_range, global_explored_data)
 
             if is_duplicate:
                 duplicate_count += 1
@@ -1171,23 +1426,22 @@ Output:
 
         llm = self._llm_manager.get_utility_provider()
 
-        # Build prompt
-        system = """You are a research assistant helping explore a codebase.
-Your task is to generate focused follow-up questions to deepen architectural understanding.
+        # Define JSON schema for structured output
+        schema = {
+            "type": "object",
+            "properties": {
+                "questions": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": f"Array of 0-{MAX_FOLLOWUP_QUESTIONS} follow-up questions"
+                }
+            },
+            "required": ["questions"],
+            "additionalProperties": False
+        }
 
-Generate 1-3 follow-up questions that would:
-1. Clarify how components interact (if current code shows isolated components)
-2. Trace data/control flow (if flow is unclear)
-3. Understand dependencies (if related components are referenced but not found)
-
-RULES:
-- Questions must be DIRECTLY about code elements found (functions, classes, imports mentioned)
-- Prioritize architectural understanding over implementation details
-- Each question must be specific and searchable (include exact symbol/file names when possible)
-- NO generic questions like "how does X work in general"
-- If code fully answers the question, generate 0-1 follow-ups (not 3)
-
-FORMAT: Numbered list, one question per line"""
+        # Simplified system prompt per GPT-5-Nano best practices
+        system = """Generate follow-up questions to deepen code understanding."""
 
         # Build code context from file contents
         # Note: files already limited by _read_files_with_budget
@@ -1229,43 +1483,48 @@ FORMAT: Numbered list, one question per line"""
             ]
         )
 
-        prompt = f"""Root Query: {context.root_query}
+        # Simplified prompt
+        prompt = f"""Root: {context.root_query}
+Current: {query}
+Context: {" -> ".join(context.ancestors)}
 
-Current Question: {query}
-
-BFS Context: {" -> ".join(context.ancestors)}
-
-Code Found:
+Code:
 {code_section}
 
-Chunks Overview:
+Chunks:
 {chunks_preview}
 
-Generate focused follow-up questions to deepen architectural understanding of the ROOT query.
-Each question should be about specific code elements found (functions, classes, files mentioned above).
+Generate 0-{MAX_FOLLOWUP_QUESTIONS} follow-up questions about specific code elements found. Focus on:
+1. Component interactions
+2. Data/control flow
+3. Dependencies
 
-Maximum {MAX_FOLLOWUP_QUESTIONS} questions. If the code fully answers the question, generate fewer."""
+Use exact function/class/file names. If code fully answers the question, return fewer questions or empty array."""
 
-        response = await llm.complete(prompt, system=system, max_completion_tokens=3000)
-
-        # Parse questions from response
-        questions = []
-        for line in response.content.split("\n"):
-            line = line.strip()
-            # Match numbered list items
-            if line and (line[0].isdigit() or line.startswith("-")):
-                # Remove number/bullet and extract question
-                question = line.lstrip("0123456789.-) ").strip()
-                if question:
-                    questions.append(question)
-
-        # Filter questions by relevance to root query
-        if questions:
-            questions = await self._filter_relevant_followups(
-                questions, context.root_query, query, context
+        try:
+            result = await llm.complete_structured(
+                prompt=prompt,
+                json_schema=schema,
+                system=system,
+                max_completion_tokens=3000
             )
 
-        return questions[:MAX_FOLLOWUP_QUESTIONS]
+            questions = result.get("questions", [])
+
+            # Filter empty questions
+            valid_questions = [q.strip() for q in questions if q and q.strip()]
+
+            # Filter questions by relevance to root query
+            if valid_questions:
+                valid_questions = await self._filter_relevant_followups(
+                    valid_questions, context.root_query, query, context
+                )
+
+            return valid_questions[:MAX_FOLLOWUP_QUESTIONS]
+
+        except Exception as e:
+            logger.warning(f"Follow-up question generation failed: {e}, returning empty list")
+            return []
 
     async def _synthesize_questions(
         self, nodes: list[BFSNode], context: ResearchContext, target_count: int
@@ -1287,64 +1546,105 @@ Maximum {MAX_FOLLOWUP_QUESTIONS} questions. If the code fully answers the questi
         if len(nodes) <= target_count:
             return nodes
 
-        llm = self._llm_manager.get_utility_provider()
+        # Quality pre-filtering: Remove low-quality questions before synthesis
+        filtered_nodes = [
+            node for node in nodes
+            if len(node.query.strip()) > 10  # Minimum length
+            and not node.query.lower().strip().startswith(("what is ", "is there ", "does "))  # Avoid simple yes/no
+        ]
 
-        # Extract questions from all nodes
+        # If filtering reduced below target, skip synthesis
+        if len(filtered_nodes) <= target_count:
+            logger.debug(
+                f"After quality filtering, {len(filtered_nodes)} questions remain (<= target {target_count}), skipping synthesis"
+            )
+            return filtered_nodes
+
+        # Use filtered nodes for synthesis
+        synthesis_nodes = filtered_nodes
         questions_str = "\n".join(
-            [f"{i + 1}. {node.query}" for i, node in enumerate(nodes)]
+            [f"{i + 1}. {node.query}" for i, node in enumerate(synthesis_nodes)]
         )
+
+        llm = self._llm_manager.get_utility_provider()
 
         # Create synthetic merge parent
         merge_parent = BFSNode(
-            query=f"[Merge of {len(nodes)} research directions]",
+            query=f"[Merge of {len(synthesis_nodes)} research directions]",
             depth=nodes[0].depth - 1,
             node_id=self._get_next_node_id(),
-            children=nodes,  # Reference all input nodes
+            children=synthesis_nodes,  # Reference all input nodes
         )
 
-        system = """You are a research assistant synthesizing research directions.
-Your task is to create NEW questions that explore UNEXPLORED aspects to complete the research picture."""
+        # Define JSON schema with explanation parameter (forces reasoning)
+        schema = {
+            "type": "object",
+            "properties": {
+                "reasoning": {
+                    "type": "string",
+                    "description": "Brief explanation of synthesis strategy and why these questions explore different unexplored aspects"
+                },
+                "questions": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": f"Array of 1 to {target_count} synthesized research questions, each exploring a distinct aspect"
+                }
+            },
+            "required": ["reasoning", "questions"],
+            "additionalProperties": False
+        }
 
-        prompt = f"""Root Query: {context.root_query}
+        # Direct, unambiguous prompt optimized for GPT-5-Nano instruction adherence
+        system = """Synthesize research questions to explore unexplored aspects of the codebase."""
 
-Current research directions being merged:
+        prompt = f"""TASK: Synthesize research questions to explore distinct unexplored aspects.
+
+ROOT QUERY: {context.root_query}
+
+INPUT QUESTIONS TO SYNTHESIZE:
 {questions_str}
 
-Synthesize {target_count} questions that:
-1. Explore NEW, UNEXPLORED aspects to complete the full picture
-2. Integrate multiple perspectives into coherent questions
-3. Are distinct from existing research paths
-4. Uncover missing architectural pieces
-5. Are concrete and searchable (include specific code elements when possible)
+REQUIREMENTS:
+- You MUST return at least 1 synthesized question (returning zero is not acceptable)
+- You MAY return up to {target_count} questions if there are that many distinct aspects to explore
+- Each question must explore a DISTINCT architectural aspect not fully covered by the inputs
+- Questions must be specific and reference concrete code elements (function/class/file names where relevant)
+- Focus on architectural angles: component interactions, implementation details, error handling, performance, testing
 
-OUTPUT FORMAT (numbered list):
-1. [synthesized question 1]
-2. [synthesized question 2]
-3. [synthesized question 3]
+EXAMPLE:
+Input: "How is data validated?", "Where is validation defined?", "What validation rules exist?"
+Output: {{"reasoning": "Input questions cover validation details but miss architecture and error flow. Synthesizing broader questions.", "questions": ["What is the complete validation architecture from input to storage?", "How do validation errors propagate and get handled throughout the system?"]}}
 
-Generate {target_count} synthesized questions:"""
+Generate your synthesized questions now (minimum 1, maximum {target_count})."""
 
         try:
-            response = await llm.complete(prompt, system=system, max_completion_tokens=2000)
+            result = await llm.complete_structured(
+                prompt=prompt,
+                json_schema=schema,
+                system=system,
+                max_completion_tokens=4000
+            )
 
-            # Parse synthesized questions
-            synthesized_queries = []
-            for line in response.content.split("\n"):
-                line = line.strip()
-                if line and (line[0].isdigit() or line.startswith("-")):
-                    question = line.lstrip("0123456789.-) ").strip()
-                    if question:
-                        synthesized_queries.append(question)
+            reasoning = result.get("reasoning", "")
+            synthesized_queries = result.get("questions", [])
 
-            if not synthesized_queries:
-                logger.warning("Synthesis returned no questions, falling back to first N nodes")
-                return nodes[:target_count]
+            logger.debug(f"Synthesis reasoning: {reasoning}")
+
+            # Validate that we got at least some questions
+            if not synthesized_queries or len(synthesized_queries) == 0:
+                logger.warning(
+                    f"LLM returned empty questions array despite explicit requirement. "
+                    f"Reasoning provided: '{reasoning}'. Falling back to truncated node list."
+                )
+                return synthesis_nodes[:target_count]
 
             # Create fresh BFSNode objects with empty metadata
             synthesized_nodes = []
             for query in synthesized_queries[:target_count]:
+                if not query or not query.strip():
+                    continue
                 node = BFSNode(
-                    query=query,
+                    query=query.strip(),
                     parent=merge_parent,  # Point to synthetic parent
                     depth=nodes[0].depth,  # Same depth as input nodes
                     node_id=self._get_next_node_id(),
@@ -1352,6 +1652,10 @@ Generate {target_count} synthesized questions:"""
                     file_contents={},  # Empty - will populate during processing
                 )
                 synthesized_nodes.append(node)
+
+            if not synthesized_nodes:
+                logger.warning("All synthesized questions were empty, falling back to first N nodes")
+                return nodes[:target_count]
 
             logger.info(
                 f"Synthesized {len(nodes)} questions into {len(synthesized_nodes)} new research directions"
@@ -1623,11 +1927,14 @@ Generate {target_count} synthesized questions:"""
         system = f"""You are an expert code researcher with deep experience across all software domains. Your mission is comprehensive code analysis - synthesizing the complete codebase picture to answer the research question with full architectural understanding.
 
 **Context:**
-You have access to the COMPLETE set of code discovered during BFS exploration. This is not a discovery phase - all relevant code has been found and is provided to you. Your task is to synthesize this complete picture into a comprehensive answer.
+You have access to the COMPLETE set of code discovered during BFS exploration. This is not a discovery phase - all relevant code has been found and is provided to you. Your task is to synthesize this complete picture into a comprehensive answer. Start with the architectural big picture, then provide detailed component analysis.
 
 **Target Output:** {SINGLE_PASS_OUTPUT_TOKENS:,} tokens of comprehensive, factual analysis.
 
 **Analysis Methodology:**
+
+0. **System Architecture** (ANALYZE FIRST)
+   Identify the architectural style (monolithic, microservices, layered, hexagonal, event-driven, etc.). Map major subsystems and their high-level relationships. Identify architectural layers, boundaries, and abstraction levels. Document core design principles that span multiple components. Extract the big-picture organization before diving into individual components.
 
 1. **Structure & Organization**
    Map the directory layout and module organization. Identify component responsibilities and boundaries. Document key design decisions observed in the code. Explain the "why" behind the organization when evident from the code.
@@ -1640,6 +1947,7 @@ You have access to the COMPLETE set of code discovered during BFS exploration. T
    - **Dependencies**: What it uses and what uses it
    - **Patterns**: Design patterns and conventions observed
    - **Critical Sections**: Important logic with specific citations
+   - **Algorithms & Formulas**: Core algorithms, mathematical expressions, and computational logic with step-by-step descriptions or pseudocode
 
 3. **Data & Control Flow**
    Trace how data moves through relevant components. Document execution paths and state management. Include concrete values: buffer sizes, timeouts, limits, thresholds. Show transformations with actual data types. Map async/sync boundaries and concurrency patterns.
@@ -1650,10 +1958,30 @@ You have access to the COMPLETE set of code discovered during BFS exploration. T
 5. **Integration Points**
    Document APIs, external systems, and configurations. Show how components collaborate with exact method signatures. Include parameter types, return values, and data formats. Map coordination mechanisms and shared resources.
 
+**CRITICAL: NO VAGUE LANGUAGE**
+NEVER use imprecise measurements. Instead, extract exact values from code:
+- ❌ "around 100" → ✅ "exactly 127" (from constant MAX_ITEMS)
+- ❌ "several files" → ✅ "5 configuration files"
+- ❌ "many seconds" → ✅ "30-second timeout"
+- ❌ "approximately 1MB" → ✅ "1,048,576 bytes (DEFAULT_BUFFER_SIZE)"
+- ❌ "hundreds of entries" → ✅ "247 cache entries"
+- ❌ "uses a sorting algorithm" → ✅ "implements quicksort with median-of-three pivot selection (sort.py:145-178)"
+- ❌ "calculates the score" → ✅ "score = (relevance × 0.7) + (recency × 0.3), normalized to [0,1] range (scorer.py:89)"
+
+FORBIDDEN TERMS: around, approximately, roughly, about, several, many, few, some, various, multiple, numerous, hundreds of, thousands of
+
+REQUIRED: Cite the exact constant, variable, or code location for every numeric value.
+
 **Output Format:**
 ```
 ## Overview
 [Direct answer to the query with system purpose and design approach]
+
+## System Architecture
+[Architectural style and patterns, high-level design approach, core architectural principles, system-level organization]
+
+## Component Relationships
+[Major component interactions, dependency graph, data/event flow between subsystems, architectural boundaries, collaboration patterns]
 
 ## Structure & Organization
 [Directory layout, module organization, key design decisions observed]
@@ -1668,6 +1996,7 @@ You have access to the COMPLETE set of code discovered during BFS exploration. T
 - **Dependencies**: [What it uses/what uses it]
 - **Patterns**: [Design patterns observed]
 - **Critical Sections**: [Important logic with citations]
+- **Algorithms & Formulas**: [Core algorithms, calculations, formulas with step descriptions]
 
 ## Data & Control Flow
 [How data moves through components, execution paths, state management]
@@ -1685,7 +2014,12 @@ You have access to the COMPLETE set of code discovered during BFS exploration. T
 **Quality Principles:**
 - Always provide specific file paths and line numbers (file.py:123 format)
 - Explain the 'why' behind code organization when evident
-- Extract exact values from code (never "several", "many", "various")
+- **PRECISION REQUIREMENT**: Extract EXACT numeric values from code
+  - Find constants, literals, configuration values with their names
+  - Never use approximations: "around", "approximately", "roughly", "about"
+  - Never use vague quantities: "several", "many", "few", "various", "multiple", "numerous"
+  - Never use order-of-magnitude: "hundreds of", "thousands of"
+  - Example: "timeout=30 (DEFAULT_TIMEOUT at config.py:15)" not "around 30 seconds"
 - Document HOW things work, not just that they exist
 - Include actual error messages, log formats, constants with values
 - State complexity (O() notation) and performance characteristics
@@ -1707,7 +2041,10 @@ Complete Code Context:
 {code_context}
 
 Provide a comprehensive analysis that answers the question using ALL the code provided.
-Focus on complete architectural understanding - you have the full picture."""
+Focus on complete architectural understanding - you have the full picture.
+
+CRITICAL REMINDER: Use EXACT values from code - never "around", "approximately", "several", "many", etc.
+Extract specific constants, counts, and measurements with their variable names and locations."""
 
         logger.info(
             f"Calling LLM for single-pass synthesis "
