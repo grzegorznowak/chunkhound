@@ -770,6 +770,14 @@ class ChunkingService:
             node_id=2,
         )
 
+        # Build global_explored_data from parent (simulates global state)
+        global_explored_data = {
+            "files_fully_read": set(),
+            "chunk_ranges": {
+                "test.py": [(8, 52)]  # Parent's expanded range
+            }
+        }
+
         # Test case 1: 100% duplicate (same expanded range)
         duplicate_chunks = [
             {
@@ -782,7 +790,7 @@ class ChunkingService:
             }
         ]
 
-        has_new, stats = research_service._detect_new_information(child, duplicate_chunks)
+        has_new, stats = research_service._detect_new_information(child, duplicate_chunks, global_explored_data)
         assert not has_new, "Should detect 100% duplicate"
         assert stats["duplicate_chunks"] == 1
         assert stats["new_chunks"] == 0
@@ -802,7 +810,7 @@ class ChunkingService:
         ]
 
         has_new, stats = research_service._detect_new_information(
-            child, partial_overlap_chunks
+            child, partial_overlap_chunks, global_explored_data
         )
         assert has_new, "Should count partial overlap as new"
         assert stats["new_chunks"] == 1
@@ -822,7 +830,7 @@ class ChunkingService:
         ]
 
         has_new, stats = research_service._detect_new_information(
-            child, new_file_chunks
+            child, new_file_chunks, global_explored_data
         )
         assert has_new, "Should count new file as new"
         assert stats["new_chunks"] == 1
@@ -869,8 +877,9 @@ class ChunkingService:
 
         # Mock the search to return duplicate chunk
         original_unified_search = research_service._unified_search
+        original_read_files = research_service._read_files_with_budget
 
-        async def mock_search(query, context):
+        async def mock_search(query, context, **kwargs):
             return [
                 {
                     "file_path": "test.py",
@@ -883,14 +892,28 @@ class ChunkingService:
                 }
             ]
 
+        async def mock_read_files(chunks, max_tokens):
+            # Return empty file_contents since this is testing duplicate detection
+            # which happens before follow-up generation
+            return {"test.py": "pass"}
+
         research_service._unified_search = mock_search
+        research_service._read_files_with_budget = mock_read_files
 
         try:
             # Process child node (should terminate)
             child = BFSNode(query="child", depth=2, parent=parent, node_id=2)
             context = ResearchContext(root_query="test")
 
-            children = await research_service._process_bfs_node(child, context, 2)
+            # Build global_explored_data from parent
+            global_explored_data = {
+                "files_fully_read": set(),
+                "chunk_ranges": {
+                    "test.py": [(8, 52)]  # Parent's expanded range
+                }
+            }
+
+            children = await research_service._process_bfs_node(child, context, 2, global_explored_data)
 
             # Should return empty children (terminated)
             assert children == [], "Should return no children when only duplicates found"
@@ -906,6 +929,7 @@ class ChunkingService:
 
         finally:
             research_service._unified_search = original_unified_search
+            research_service._read_files_with_budget = original_read_files
 
     @pytest.mark.asyncio
     async def test_question_synthesis(self, research_setup):
