@@ -10,20 +10,22 @@ jobs:
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
+        python: ["3.12"]   # pyarrow wheels exist for 3.9–3.13
       fail-fast: false
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
-    
+
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-      
-      - name: Install uv
-        uses: astral-sh/setup-uv@v3
-        
-      - name: Install dependencies
-        run: uv sync --locked
-        
+      - uses: actions/checkout@v5
+
+      - name: Install uv & set Python
+        uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ matrix.python }}
+          enable-cache: true
+
+      - name: Install dependencies (no-build for pyarrow)
+        run: uv sync --locked --no-build-package pyarrow
+
       - name: Run test suite
         run: uv run pytest tests/ -v
-        
