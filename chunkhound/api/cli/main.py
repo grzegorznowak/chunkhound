@@ -53,6 +53,7 @@ def create_parser() -> argparse.ArgumentParser:
     # Import parsers dynamically to avoid early loading
     from .parsers import create_main_parser, setup_subparsers
     from .parsers.mcp_parser import add_mcp_subparser
+    from .parsers.research_parser import add_research_subparser
     from .parsers.run_parser import add_run_subparser
     from .parsers.search_parser import add_search_subparser
 
@@ -63,6 +64,7 @@ def create_parser() -> argparse.ArgumentParser:
     add_run_subparser(subparsers)
     add_mcp_subparser(subparsers)
     add_search_subparser(subparsers)
+    add_research_subparser(subparsers)
 
     return parser
 
@@ -137,6 +139,11 @@ async def async_main() -> None:
             from .commands.search import search_command
 
             await search_command(args, config)
+        elif args.command == "research":
+            # Dynamic import to avoid early chunkhound module loading
+            from .commands.research import research_command
+
+            await research_command(args, config)
         else:
             logger.error(f"Unknown command: {args.command}")
             sys.exit(1)
