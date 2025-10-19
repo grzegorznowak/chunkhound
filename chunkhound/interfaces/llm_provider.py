@@ -50,6 +50,35 @@ class LLMProvider(ABC):
         """
         ...
 
+    async def complete_structured(
+        self,
+        prompt: str,
+        json_schema: dict[str, Any],
+        system: str | None = None,
+        max_completion_tokens: int = 4096,
+    ) -> dict[str, Any]:
+        """
+        Generate a structured JSON completion conforming to the given schema.
+
+        Best practice for GPT-5-Nano and modern LLMs: Use response_format with
+        json_schema and strict: true to guarantee valid, parseable output.
+
+        Args:
+            prompt: User prompt
+            json_schema: JSON Schema definition for structured output
+            system: Optional system message
+            max_completion_tokens: Maximum completion tokens to generate
+
+        Returns:
+            Parsed JSON object conforming to schema
+
+        Raises:
+            NotImplementedError: If provider doesn't support structured outputs
+        """
+        raise NotImplementedError(
+            f"{self.name} provider does not support structured outputs"
+        )
+
     @abstractmethod
     async def batch_complete(
         self,

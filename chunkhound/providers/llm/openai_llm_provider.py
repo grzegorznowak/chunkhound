@@ -1,6 +1,7 @@
 """OpenAI LLM provider implementation for ChunkHound deep research."""
 
 import asyncio
+import json
 from typing import Any
 
 from loguru import logger
@@ -122,6 +123,71 @@ class OpenAILLMProvider(LLMProvider):
         except Exception as e:
             logger.error(f"OpenAI completion failed: {e}")
             raise RuntimeError(f"LLM completion failed: {e}") from e
+
+    async def complete_structured(
+        self,
+        prompt: str,
+        json_schema: dict[str, Any],
+        system: str | None = None,
+        max_completion_tokens: int = 4096,
+        timeout: int | None = None,
+    ) -> dict[str, Any]:
+        """Generate a structured JSON completion conforming to the given schema.
+
+        Uses OpenAI's structured outputs with strict JSON Schema validation.
+        Best practice for GPT-5-Nano: Guarantees valid, parseable JSON output.
+
+        Args:
+            prompt: The user prompt
+            json_schema: JSON Schema definition for structured output
+            system: Optional system prompt
+            max_completion_tokens: Maximum tokens to generate
+            timeout: Optional timeout in seconds (overrides default)
+
+        Returns:
+            Parsed JSON object conforming to schema
+        """
+        messages = []
+        if system:
+            messages.append({"role": "system", "content": system})
+        messages.append({"role": "user", "content": prompt})
+
+        # Use provided timeout or fall back to default
+        request_timeout = timeout if timeout is not None else self._timeout
+
+        try:
+            response = await self._client.chat.completions.create(
+                model=self._model,
+                messages=messages,
+                max_completion_tokens=max_completion_tokens,
+                timeout=request_timeout,
+                response_format={
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "structured_response",
+                        "strict": True,
+                        "schema": json_schema,
+                    },
+                },
+            )
+
+            self._requests_made += 1
+            if response.usage:
+                self._prompt_tokens += response.usage.prompt_tokens
+                self._completion_tokens += response.usage.completion_tokens
+                self._tokens_used += response.usage.total_tokens
+
+            content = response.choices[0].message.content or "{}"
+            parsed = json.loads(content)
+
+            return parsed
+
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to parse structured output as JSON: {e}")
+            raise RuntimeError(f"Invalid JSON in structured output: {e}") from e
+        except Exception as e:
+            logger.error(f"OpenAI structured completion failed: {e}")
+            raise RuntimeError(f"LLM structured completion failed: {e}") from e
 
     async def batch_complete(
         self,
