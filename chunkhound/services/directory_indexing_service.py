@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from loguru import logger
+from chunkhound.utils.file_patterns import normalize_include_patterns
 
 
 @dataclass
@@ -115,16 +116,8 @@ class DirectoryIndexingService:
         exclude_patterns: list[str],
     ) -> dict[str, Any]:
         """Extracted from run.py:237-284 - directory processing logic."""
-        # Normalize patterns: only prefix with **/ if missing.
-        # Default config already includes patterns like "**/*.py" which match root files too
-        # via our include matcher (filename fallback). Avoid duplicating **/ which can hinder
-        # filename-only matches on root-level files.
-        processed_patterns: list[str] = []
-        for pattern in include_patterns:
-            if pattern.startswith("**/"):
-                processed_patterns.append(pattern)
-            else:
-                processed_patterns.append(f"**/{pattern}")
+        # Normalize patterns using shared utility (prevents double-prefixing)
+        processed_patterns: list[str] = normalize_include_patterns(include_patterns)
 
         # Process directory using indexing coordinator with config threshold
         result = await self.indexing_coordinator.process_directory(

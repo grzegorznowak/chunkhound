@@ -187,11 +187,8 @@ def load_gitignore_patterns(dir_path: Path, root_dir: Path) -> list[str]:
                 # Recursive pattern
                 rel_from_root = dir_path.relative_to(root_dir)
                 if rel_from_root == Path("."):
-                    if not line.startswith("**/"):
-                        patterns_from_gitignore.append(f"**/{line}")
-                        patterns_from_gitignore.append(f"**/{line}/**")
-                    else:
-                        patterns_from_gitignore.append(line)
+                    # Use shared normalization utility to avoid double prefixing
+                    patterns_from_gitignore.append(normalize_include_pattern(line))
                 else:
                     patterns_from_gitignore.append(
                         f"{rel_from_root.as_posix()}/**/{line}"
@@ -349,6 +346,25 @@ def walk_directory_tree(
                 files.append(file_path)
 
     return files, gitignore_patterns
+
+# ---------------------------------------------------------------------------
+# Normalization helpers (shared across services)
+# ---------------------------------------------------------------------------
+
+def normalize_include_pattern(pattern: str) -> str:
+    """Ensure include pattern starts with "**/" prefix without double-prefixing.
+
+    Examples:
+    - "*.py"      -> "**/*.py"
+    - "**/*.py"   -> "**/*.py" (unchanged)
+    - "README"    -> "**/README"
+    """
+    return pattern if pattern.startswith("**/") else f"**/{pattern}"
+
+
+def normalize_include_patterns(patterns: list[str]) -> list[str]:
+    """Normalize a list of include patterns with consistent "**/" prefixing."""
+    return [normalize_include_pattern(p) for p in patterns]
 
 
 def walk_subtree_worker(
