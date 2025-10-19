@@ -502,6 +502,7 @@ class TestParserLoading:
             Language.TOML: "hello = 'world'",
             Language.TEXT: "hello world",
             Language.PDF: "hello world",
+            Language.SWIFT: "struct Point { let x: Int; let y: Int }",
         }
 
         factory = get_parser_factory()
