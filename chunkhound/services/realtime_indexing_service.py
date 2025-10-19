@@ -20,6 +20,7 @@ from typing import Any, Callable
 from loguru import logger
 from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
+from chunkhound.utils.windows_constants import IS_WINDOWS
 
 from chunkhound.core.config.config import Config
 from chunkhound.database_factory import DatabaseServices
@@ -393,7 +394,9 @@ class RealtimeIndexingService:
         self.observer.start()
 
         # Wait for observer thread to be fully running
-        max_wait = 1.0
+        # On Windows, observer thread startup can be noticeably slower.
+        # Give it more time to become alive to avoid falling back to polling unnecessarily.
+        max_wait = 5.0 if IS_WINDOWS else 1.0
         start = time.time()
         while not self.observer.is_alive() and (time.time() - start) < max_wait:
             time.sleep(0.01)
@@ -417,6 +420,10 @@ class RealtimeIndexingService:
 
         # Create a simple event handler for shouldIndex check once
         simple_handler = SimpleEventHandler(None, self.config, None)
+
+        # Use a shorter interval during the first few seconds to ensure
+        # freshly created files are detected quickly after startup/fallback.
+        polling_start = time.time()
 
         while True:
             try:
@@ -461,8 +468,10 @@ class RealtimeIndexingService:
 
                 known_files = current_files
 
-                # Poll every 5 seconds
-                await asyncio.sleep(5)
+                # Adaptive poll interval: 1s for the first 10s, then 5s
+                elapsed = time.time() - polling_start
+                interval = 1.0 if elapsed < 10.0 else 5.0
+                await asyncio.sleep(interval)
 
             except Exception as e:
                 logger.error(f"Polling monitor error: {e}")
