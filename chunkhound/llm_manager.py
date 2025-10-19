@@ -5,6 +5,7 @@ from typing import Any
 from loguru import logger
 
 from chunkhound.interfaces.llm_provider import LLMProvider
+from chunkhound.providers.llm.claude_code_cli_provider import ClaudeCodeCLIProvider
 from chunkhound.providers.llm.openai_llm_provider import OpenAILLMProvider
 
 
@@ -19,6 +20,7 @@ class LLMManager:
     # Registry of available providers
     _providers: dict[str, type[LLMProvider]] = {
         "openai": OpenAILLMProvider,
+        "claude-code-cli": ClaudeCodeCLIProvider,
     }
 
     def __init__(self, utility_config: dict[str, Any], synthesis_config: dict[str, Any]):
