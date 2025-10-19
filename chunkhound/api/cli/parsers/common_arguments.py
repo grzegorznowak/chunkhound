@@ -54,3 +54,8 @@ def add_config_arguments(parser: argparse.ArgumentParser, configs: list[str]) ->
         from chunkhound.core.config.mcp_config import MCPConfig
 
         MCPConfig.add_cli_arguments(parser)
+
+    if "llm" in configs:
+        from chunkhound.core.config.llm_config import LLMConfig
+
+        LLMConfig.add_cli_arguments(parser)
