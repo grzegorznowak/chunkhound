@@ -41,8 +41,8 @@ class LLMConfig(BaseSettings):
     )
 
     # Provider Selection
-    provider: Literal["openai", "anthropic", "ollama"] = Field(
-        default="openai", description="LLM provider (openai, anthropic, ollama)"
+    provider: Literal["openai", "anthropic", "ollama", "claude-code-cli"] = Field(
+        default="openai", description="LLM provider (openai, anthropic, ollama, claude-code-cli)"
     )
 
     # Model Configuration (dual-model architecture)
@@ -132,6 +132,9 @@ class LLMConfig(BaseSettings):
         elif self.provider == "ollama":
             # Ollama: use same model for both (local deployment)
             return ("llama3.2", "llama3.2")
+        elif self.provider == "claude-code-cli":
+            # Claude Code CLI: Haiku 4.5 for utility, Sonnet 4.5 for synthesis
+            return ("claude-3-5-haiku-20241022", "claude-sonnet-4-5-20250929")
         else:
             return ("gpt-5-nano", "gpt-5")
 
@@ -142,8 +145,9 @@ class LLMConfig(BaseSettings):
         Returns:
             True if provider is properly configured
         """
-        if self.provider == "ollama":
-            # Ollama doesn't require API key
+        if self.provider in ("ollama", "claude-code-cli"):
+            # Ollama and Claude Code CLI don't require API key
+            # Claude Code CLI uses subscription-based authentication
             return True
         else:
             # OpenAI and Anthropic require API key
@@ -158,7 +162,7 @@ class LLMConfig(BaseSettings):
         """
         missing = []
 
-        if self.provider != "ollama" and not self.api_key:
+        if self.provider not in ("ollama", "claude-code-cli") and not self.api_key:
             missing.append("api_key (set CHUNKHOUND_LLM_API_KEY)")
 
         return missing
@@ -188,7 +192,7 @@ class LLMConfig(BaseSettings):
 
         parser.add_argument(
             "--llm-provider",
-            choices=["openai", "anthropic", "ollama"],
+            choices=["openai", "anthropic", "ollama", "claude-code-cli"],
             help="LLM provider (default: openai)",
         )
 
