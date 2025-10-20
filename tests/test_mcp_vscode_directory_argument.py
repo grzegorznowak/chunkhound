@@ -12,6 +12,8 @@ from subprocess import PIPE
 
 import pytest
 
+from tests.utils import SubprocessJsonRpcClient
+
 
 @pytest.mark.asyncio
 async def test_mcp_server_uses_positional_directory_argument():
@@ -54,79 +56,52 @@ async def test_mcp_server_uses_positional_directory_argument():
             stdout=PIPE,
             stderr=PIPE
         )
-        
+
+        client = SubprocessJsonRpcClient(proc)
+        await client.start()
+
         try:
-            # Send initialize request
-            init_request = {
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "initialize",
-                "params": {
+            # Send initialize request and get response
+            response = await client.send_request(
+                "initialize",
+                {
                     "protocolVersion": "2024-11-05",
                     "capabilities": {},
                     "clientInfo": {
                         "name": "test-client",
                         "version": "1.0.0"
                     }
-                }
-            }
-            
-            request_json = json.dumps(init_request) + "\n"
-            proc.stdin.write(request_json.encode())
-            await proc.stdin.drain()
-            
-            # Read the response line
-            try:
-                response_line = await asyncio.wait_for(
-                    proc.stdout.readline(), timeout=5.0
-                )
-                response_text = response_line.decode().strip()
-                print(f"Raw response: {response_text}")
-                
-                if response_text:
-                    response = json.loads(response_text)
-                    print(f"Parsed response: {response}")
-                else:
-                    print("Empty response line")
-                    
-            except asyncio.TimeoutError:
-                print("Timeout waiting for response")
-            except json.JSONDecodeError as e:
-                print(f"JSON decode error: {e}, raw: {response_text}")
-            except Exception as e:
-                print(f"Unexpected error reading response: {e}")
-            
-            # Close stdin and wait for process to finish  
-            proc.stdin.close()
-            await proc.wait()
-            
-            # Get the output
-            remaining_stdout, stderr = await proc.communicate()
-            stderr_text = stderr.decode()
-            stdout_text = remaining_stdout.decode()
-            
-            print(f"MCP server exit code: {proc.returncode}")
-            print(f"stdout: {stdout_text}")
-            print(f"stderr: {stderr_text}")
-            
-            if "No ChunkHound project found" in stderr_text:
+                },
+                timeout=5.0
+            )
+            print(f"Parsed response: {response}")
+
+            # Success! The server started and responded
+            # This means it correctly used the positional directory argument
+            print("✓ MCP server correctly used positional directory argument")
+            print(f"✓ Server started successfully from different working directory")
+
+        finally:
+            # Read stderr before closing (subprocess may be blocking on it)
+            stderr_text = ""
+            if proc.stderr:
+                try:
+                    stderr_bytes = await asyncio.wait_for(proc.stderr.read(), timeout=0.5)
+                    stderr_text = stderr_bytes.decode()
+                    print(f"stderr: {stderr_text}")
+                except asyncio.TimeoutError:
+                    print("No stderr output captured")
+                    pass
+
+            await client.close()
+
+            # Check if we got the error we're testing for
+            if stderr_text and "No ChunkHound project found" in stderr_text:
                 # This would be the bug we're testing for
                 pytest.fail(
                     "MCP server failed to use positional directory argument. "
                     f"Error: {stderr_text}"
                 )
-            
-            # Success! The server started without the "No ChunkHound project found" error
-            # This means it correctly used the positional directory argument
-            assert proc.returncode == 0, f"MCP server exited with error code {proc.returncode}"
-            print("✓ MCP server correctly used positional directory argument")
-            print(f"✓ No 'No ChunkHound project found' error in stderr")
-            print(f"✓ Server started successfully from different working directory")
-                
-        finally:
-            if proc.returncode is None:
-                proc.terminate()
-                await proc.wait()
     
     finally:
         # Cleanup
@@ -151,8 +126,8 @@ async def test_mcp_server_handles_empty_directory_gracefully():
     
     try:
         # Don't create any config files - test graceful handling
-        
-        # Run MCP server from home_dir with project_dir as argument  
+
+        # Run MCP server from home_dir with project_dir as argument
         proc = await asyncio.create_subprocess_exec(
             "uv", "run", "chunkhound", "mcp", "--stdio", str(project_dir),
             cwd=str(home_dir),
@@ -160,80 +135,42 @@ async def test_mcp_server_handles_empty_directory_gracefully():
             stdout=PIPE,
             stderr=PIPE
         )
-        
+
+        client = SubprocessJsonRpcClient(proc)
+        await client.start()
+
         try:
-            # Step 1: Send initialize request (with id)
-            init_request = {
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "initialize",
-                "params": {
+            # Step 1: Send initialize request and receive response
+            init_result = await client.send_request(
+                "initialize",
+                {
                     "protocolVersion": "2024-11-05",
                     "capabilities": {},
                     "clientInfo": {"name": "test", "version": "1.0"}
-                }
-            }
-            
-            proc.stdin.write((json.dumps(init_request) + "\n").encode())
-            await proc.stdin.drain()
-            
-            # Step 2: Receive initialize response
-            response_line = await asyncio.wait_for(
-                proc.stdout.readline(), timeout=5.0
+                },
+                timeout=5.0
             )
-            
-            init_response = json.loads(response_line.decode())
-            
+
             # Verify we got a valid response with correct structure
-            assert "jsonrpc" in init_response and init_response["jsonrpc"] == "2.0"
-            assert "id" in init_response and init_response["id"] == 1
-            assert "result" in init_response, f"No result in response: {init_response}"
-            assert "serverInfo" in init_response["result"]
-            assert "protocolVersion" in init_response["result"]
-            
-            print(f"✓ Server responded with serverInfo: {init_response['result']['serverInfo']}")
-            
-            # Step 3: Send initialized notification (no id - it's a notification)
-            initialized_notification = {
-                "jsonrpc": "2.0",
-                "method": "notifications/initialized"
-                # No "id" field for notifications
-            }
-            
-            proc.stdin.write((json.dumps(initialized_notification) + "\n").encode())
-            await proc.stdin.drain()
-            
-            # Optional: Test that server is now ready by requesting tools list
-            tools_request = {
-                "jsonrpc": "2.0",
-                "id": 2,
-                "method": "tools/list"
-            }
-            
-            proc.stdin.write((json.dumps(tools_request) + "\n").encode())
-            await proc.stdin.drain()
-            
-            # Read tools response
-            tools_line = await asyncio.wait_for(
-                proc.stdout.readline(), timeout=5.0
-            )
-            tools_response = json.loads(tools_line.decode())
-            
+            assert "serverInfo" in init_result
+            assert "protocolVersion" in init_result
+
+            print(f"✓ Server responded with serverInfo: {init_result['serverInfo']}")
+
+            # Step 2: Send initialized notification (no response expected)
+            await client.send_notification("notifications/initialized")
+
+            # Step 3: Test that server is now ready by requesting tools list
+            tools_result = await client.send_request("tools/list", timeout=5.0)
+
             # Verify tools response
-            assert "result" in tools_response
-            assert "tools" in tools_response["result"]
-            
-            print(f"✓ Server initialized successfully with {len(tools_response['result']['tools'])} tools")
+            assert "tools" in tools_result
+
+            print(f"✓ Server initialized successfully with {len(tools_result['tools'])} tools")
             print("✓ Server handles empty directory gracefully")
-            
+
         finally:
-            # Properly terminate the server
-            proc.terminate()
-            try:
-                await asyncio.wait_for(proc.wait(), timeout=2.0)
-            except asyncio.TimeoutError:
-                proc.kill()
-                await proc.wait()
+            await client.close()
     
     finally:
         shutil.rmtree(home_dir, ignore_errors=True)
