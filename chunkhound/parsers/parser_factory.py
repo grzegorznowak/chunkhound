@@ -40,6 +40,7 @@ from chunkhound.parsers.mappings import (
     PHPMapping,
     PythonMapping,
     RustMapping,
+    SwiftMapping,
     TextMapping,
     TomlMapping,
     TSXMapping,
@@ -208,6 +209,25 @@ try:
 except ImportError:
     ts_php = None
     PHP_AVAILABLE = False
+
+try:
+    from tree_sitter_language_pack import get_language as _get_language_swift
+
+    _swift_lang = _get_language_swift("swift")
+    if _swift_lang:
+        # Create a module-like wrapper for compatibility with LanguageConfig
+        class _SwiftLanguageWrapper:
+            def language(self):
+                return _swift_lang
+
+        ts_swift = _SwiftLanguageWrapper()
+        SWIFT_AVAILABLE = True
+    else:
+        ts_swift = None
+        SWIFT_AVAILABLE = False
+except ImportError:
+    ts_swift = None
+    SWIFT_AVAILABLE = False
 
 if not HASKELL_AVAILABLE:
     try:
@@ -441,6 +461,7 @@ LANGUAGE_CONFIGS: dict[Language, LanguageConfig] = {
     ),
     Language.OBJC: LanguageConfig(ts_objc, ObjCMapping, OBJC_AVAILABLE, "objc"),
     Language.PHP: LanguageConfig(ts_php, PHPMapping, PHP_AVAILABLE, "php"),
+    Language.SWIFT: LanguageConfig(ts_swift, SwiftMapping, SWIFT_AVAILABLE, "swift"),
     Language.VUE: LanguageConfig(
         ts_typescript, VueMapping, TYPESCRIPT_AVAILABLE, "vue"
     ),  # Vue uses TypeScript parser for script sections
@@ -528,6 +549,9 @@ EXTENSION_TO_LANGUAGE: dict[str, Language] = {
     ".php4": Language.PHP,
     ".php5": Language.PHP,
     ".phps": Language.PHP,
+    # Swift
+    ".swift": Language.SWIFT,
+    ".swiftinterface": Language.SWIFT,
     ".vue": Language.VUE,
     # Config & Data
     ".json": Language.JSON,

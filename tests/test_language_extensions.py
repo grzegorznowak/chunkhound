@@ -261,7 +261,6 @@ class TestExtensionConsistency:
         # Test extensions that are NOT in the parser system
         unsupported_extensions = [
             ".rb",  # Ruby (no parser)
-            ".swift",  # Swift (no parser)
             ".scala",  # Scala (no parser)
             ".r",  # R language (no parser)
             ".xyz",  # Completely invalid
