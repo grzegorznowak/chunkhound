@@ -152,6 +152,7 @@ class Language(Enum):
     OBJC = "objc"
     PHP = "php"
     VUE = "vue"
+    SWIFT = "swift"
 
     # Documentation languages
     MARKDOWN = "markdown"
@@ -238,6 +239,8 @@ class Language(Enum):
             ".php5": cls.PHP,
             ".phps": cls.PHP,
             ".vue": cls.VUE,
+            ".swift": cls.SWIFT,
+            ".swiftinterface": cls.SWIFT,
         }
 
         return extension_map.get(extension, cls.UNKNOWN)
@@ -274,6 +277,7 @@ class Language(Enum):
             Language.OBJC,
             Language.PHP,
             Language.VUE,
+            Language.SWIFT,
         }
 
     @property
@@ -293,6 +297,7 @@ class Language(Enum):
             Language.OBJC,
             Language.PHP,
             Language.VUE,
+            Language.SWIFT,
         }
 
     @property
@@ -305,6 +310,7 @@ class Language(Enum):
             Language.TSX,
             Language.PHP,
             Language.VUE,
+            Language.SWIFT,
         }
 
     @property

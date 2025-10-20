@@ -22,6 +22,7 @@ from pathlib import Path
 # Import Windows-safe subprocess utilities
 from tests.utils.windows_subprocess import create_subprocess_exec_safe, get_safe_subprocess_env
 from tests.utils.windows_compat import windows_safe_tempdir
+from tests.utils import SubprocessJsonRpcClient
 
 # Add parent directory to path to import chunkhound
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -394,79 +395,48 @@ sys.exit(asyncio.run(test()))
                 stderr=asyncio.subprocess.PIPE
             )
             
+            client = SubprocessJsonRpcClient(proc)
+            await client.start()
+
             try:
                 # 1. Send initialize request
-                init_request = {
-                    "jsonrpc": "2.0",
-                    "id": 1,
-                    "method": "initialize",
-                    "params": {
+                init_result = await client.send_request(
+                    "initialize",
+                    {
                         "protocolVersion": "2024-11-05",
                         "capabilities": {},
                         "clientInfo": {"name": "test", "version": "1.0"}
-                    }
-                }
-                
-                proc.stdin.write((json.dumps(init_request) + "\n").encode())
-                await proc.stdin.drain()
-                
-                # Read initialize response
-                response_line = await asyncio.wait_for(
-                    proc.stdout.readline(), timeout=10.0
+                    },
+                    timeout=10.0
                 )
-                init_response = json.loads(response_line.decode())
-                
+
                 # Verify response structure
-                assert "result" in init_response, f"No result in response: {init_response}"
-                assert "serverInfo" in init_response["result"], f"No serverInfo in result: {init_response['result']}"
-                assert init_response["result"]["serverInfo"]["name"] == "ChunkHound Code Search"
-                
+                assert "serverInfo" in init_result, f"No serverInfo in result: {init_result}"
+                assert init_result["serverInfo"]["name"] == "ChunkHound Code Search"
+
                 # 2. Send initialized notification
-                proc.stdin.write((json.dumps({
-                    "jsonrpc": "2.0",
-                    "method": "notifications/initialized"
-                }) + "\n").encode())
-                await proc.stdin.drain()
-                
+                await client.send_notification("notifications/initialized")
+
                 # 3. Request tool list
-                tools_request = {
-                    "jsonrpc": "2.0",
-                    "id": 2,
-                    "method": "tools/list"
-                }
-                
-                proc.stdin.write((json.dumps(tools_request) + "\n").encode())
-                await proc.stdin.drain()
-                
-                # Read tools response
-                tools_line = await asyncio.wait_for(
-                    proc.stdout.readline(), timeout=5.0
-                )
-                tools_response = json.loads(tools_line.decode())
-                
+                tools_result = await client.send_request("tools/list", timeout=5.0)
+
                 # Verify tools
-                assert "result" in tools_response, f"No result in tools response: {tools_response}"
-                tools = tools_response["result"].get("tools", [])
+                tools = tools_result.get("tools", [])
                 tool_names = [t["name"] for t in tools]
-                
+
                 # Should have at least regex search (works without embeddings)
                 assert "search_regex" in tool_names, f"search_regex not in tools: {tool_names}"
                 assert "get_stats" in tool_names, f"get_stats not in tools: {tool_names}"
                 assert "health_check" in tool_names, f"health_check not in tools: {tool_names}"
-                
+
                 # Semantic search only if embeddings available
                 if api_key:
                     assert "search_semantic" in tool_names, f"search_semantic not in tools: {tool_names}"
-                    
+
             except asyncio.TimeoutError:
                 pytest.fail("MCP stdio protocol handshake timed out")
             finally:
-                proc.terminate()
-                try:
-                    await asyncio.wait_for(proc.wait(), timeout=2.0)
-                except asyncio.TimeoutError:
-                    proc.kill()
-                    await proc.wait()
+                await client.close()
 
 
 class TestParserLoading:
@@ -502,6 +472,7 @@ class TestParserLoading:
             Language.TOML: "hello = 'world'",
             Language.TEXT: "hello world",
             Language.PDF: "hello world",
+            Language.SWIFT: "struct Point { let x: Int; let y: Int }",
         }
 
         factory = get_parser_factory()

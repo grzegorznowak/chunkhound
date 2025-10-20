@@ -21,113 +21,13 @@ from chunkhound.core.config.config import Config
 from chunkhound.utils.windows_constants import IS_WINDOWS, WINDOWS_FILE_HANDLE_DELAY
 from .test_utils import get_api_key_for_tests
 
-# Import Windows-safe subprocess utilities
-from tests.utils.windows_subprocess import create_subprocess_exec_safe, get_safe_subprocess_env
+# Import Windows-safe subprocess utilities and JSON-RPC client
+from tests.utils import (
+    SubprocessJsonRpcClient,
+    create_subprocess_exec_safe,
+    get_safe_subprocess_env,
+)
 from tests.utils.windows_compat import path_contains, windows_safe_tempdir, database_cleanup_context
-
-
-class MCPStdioClient:
-    """Real MCP client for stdio communication testing."""
-    
-    def __init__(self, process):
-        self.process = process
-        self.request_id = 0
-    
-    def _next_request_id(self):
-        self.request_id += 1
-        return self.request_id
-    
-    async def _send_request(self, request):
-        """Send JSON-RPC request and get response."""
-        request_json = json.dumps(request) + "\n"
-        self.process.stdin.write(request_json.encode())
-        await self.process.stdin.drain()
-        
-        # Read response
-        response_line = await self.process.stdout.readline()
-        if not response_line:
-            raise Exception("MCP server closed connection")
-        
-        return json.loads(response_line.decode().strip())
-    
-    async def initialize(self):
-        """Send MCP initialize request."""
-        request = {
-            "jsonrpc": "2.0",
-            "id": self._next_request_id(),
-            "method": "initialize",
-            "params": {
-                "protocolVersion": "2024-11-05",
-                "capabilities": {},
-                "clientInfo": {
-                    "name": "chunkhound-test-client",
-                    "version": "1.0.0"
-                }
-            }
-        }
-        response = await self._send_request(request)
-        
-        # Send initialized notification (NO RESPONSE EXPECTED)
-        if "result" in response:
-            initialized_notification = {
-                "jsonrpc": "2.0",
-                "method": "notifications/initialized",  # Correct method name per MCP spec
-                "params": {}
-            }
-            notification_json = json.dumps(initialized_notification) + "\n"
-            self.process.stdin.write(notification_json.encode())
-            await self.process.stdin.drain()
-            
-            # Wait a moment for server to process the notification
-            await asyncio.sleep(0.1)
-        
-        return response
-    
-    async def list_tools(self):
-        """Send list tools request."""
-        request = {
-            "jsonrpc": "2.0",
-            "id": self._next_request_id(),
-            "method": "tools/list",
-            "params": {}
-        }
-        return await self._send_request(request)
-
-    async def search_regex(self, pattern, page_size=10, offset=0):
-        """Send regex search request."""
-        request = {
-            "jsonrpc": "2.0",
-            "id": self._next_request_id(),
-            "method": "tools/call",
-            "params": {
-                "name": "search_regex",
-                "arguments": {
-                    "pattern": pattern,
-                    "page_size": page_size,
-                    "offset": offset
-                }
-            }
-        }
-        return await self._send_request(request)
-    
-    async def search_semantic(self, query, page_size=10, offset=0):
-        """Send semantic search request."""
-        request = {
-            "jsonrpc": "2.0", 
-            "id": self._next_request_id(),
-            "method": "tools/call",
-            "params": {
-                "name": "search_semantic",
-                "arguments": {
-                    "query": query,
-                    "page_size": page_size,
-                    "offset": offset,
-                    "provider": "openai",
-                    "model": "text-embedding-3-small"
-                }
-            }
-        }
-        return await self._send_request(request)
 
 
 class TestMCPServerDirectoryIsolationWithRealCommunication:
@@ -342,19 +242,35 @@ Run the application with proper configuration.
                     print(f"stdout: {stdout.decode()}")
                     print(f"stderr: {stderr.decode()}")
                     raise Exception(f"MCP server failed to start with code {mcp_process.returncode}")
-                
+
                 print("MCP server is running, proceeding with initialization...")
-                
+
                 # === STEP 4: Real MCP Communication ===
-                mcp_client = MCPStdioClient(mcp_process)
-                
+                mcp_client = SubprocessJsonRpcClient(mcp_process)
+                await mcp_client.start()
+
                 # Initialize MCP server
                 print("Initializing MCP server...")
                 try:
-                    init_response = await mcp_client.initialize()
-                    assert "result" in init_response
-                    assert init_response["result"]["protocolVersion"] == "2024-11-05"
+                    init_result = await mcp_client.send_request(
+                        "initialize",
+                        {
+                            "protocolVersion": "2024-11-05",
+                            "capabilities": {},
+                            "clientInfo": {
+                                "name": "chunkhound-test-client",
+                                "version": "1.0.0"
+                            }
+                        }
+                    )
+                    assert init_result["protocolVersion"] == "2024-11-05"
                     print("MCP server initialized successfully")
+
+                    # Send initialized notification
+                    await mcp_client.send_notification("notifications/initialized", {})
+
+                    # Wait a moment for server to process the notification
+                    await asyncio.sleep(0.1)
                 except Exception as e:
                     # Get any stderr output before failing
                     if mcp_process.returncode is None:
@@ -362,7 +278,7 @@ Run the application with proper configuration.
                         print("MCP server still running, checking for stderr...")
                         # Give a moment for any stderr output
                         await asyncio.sleep(0.5)
-                        
+
                         # Try to read any available stderr without blocking
                         try:
                             stderr_data = mcp_process.stderr.read_nowait()
@@ -372,75 +288,71 @@ Run the application with proper configuration.
                             pass
                         except Exception:
                             pass
-                    
+
                     print(f"MCP initialization failed: {e}")
                     raise
-                
+
                 # Wait for server to fully start (extended for Ollama compatibility)
                 await asyncio.sleep(4)
-                
+
                 # List available tools for debugging
                 print("Listing available tools...")
-                tools_response = await mcp_client.list_tools()
-                if "result" in tools_response:
-                    tools = tools_response["result"]["tools"]
-                    print(f"Available tools: {[tool['name'] for tool in tools]}")
-                else:
-                    print(f"Error listing tools: {tools_response}")
+                tools_result = await mcp_client.send_request("tools/list", {})
+                tools = tools_result["tools"]
+                print(f"Available tools: {[tool['name'] for tool in tools]}")
                 
                 # === STEP 5: Test Search Queries ===
-                
+
                 # Test 0.1: Check what the MCP server sees in the database
                 print("Getting database stats from MCP server...")
-                stats_request = {
-                    "jsonrpc": "2.0",
-                    "id": mcp_client._next_request_id(),
-                    "method": "tools/call",
-                    "params": {
+                stats_result = await mcp_client.send_request(
+                    "tools/call",
+                    {
                         "name": "get_stats",
                         "arguments": {}
                     }
-                }
-                stats_response = await mcp_client._send_request(stats_request)
-                if "result" in stats_response and "content" in stats_response["result"]:
-                    stats_data = json.loads(stats_response["result"]["content"][0]["text"])
+                )
+                if "content" in stats_result:
+                    stats_data = json.loads(stats_result["content"][0]["text"])
                     print(f"MCP server stats: {stats_data}")
                 else:
-                    print(f"Stats error: {stats_response}")
-                
+                    print(f"Stats error: {stats_result}")
+
                 # Test 0.2: Quick check - search for any content
                 print("Testing search for 'def' to see if any content is searchable...")
-                def_response = await mcp_client.search_regex("def")
-                print(f"Def search response: {def_response}")
-                
-                # Test 1: Search for function name
-                print("Testing regex search for fibonacci function...")
-                fibonacci_response = await mcp_client.search_regex("calculate_fibonacci")
-                print(f"Fibonacci response: {fibonacci_response}")
-                
-                if "error" in fibonacci_response:
-                    print(f"Search error: {fibonacci_response['error']}")
-                    # Let's try a basic get_stats call to see if the server is working
-                    stats_request = {
-                        "jsonrpc": "2.0",
-                        "id": mcp_client._next_request_id(),
-                        "method": "tools/call",
-                        "params": {
-                            "name": "get_stats",
-                            "arguments": {}
+                def_result = await mcp_client.send_request(
+                    "tools/call",
+                    {
+                        "name": "search_regex",
+                        "arguments": {
+                            "pattern": "def",
+                            "page_size": 10,
+                            "offset": 0
                         }
                     }
-                    stats_response = await mcp_client._send_request(stats_request)
-                    print(f"Stats response: {stats_response}")
-                    
-                assert "result" in fibonacci_response, f"Search failed: {fibonacci_response}"
-                
+                )
+                print(f"Def search response: {def_result}")
+
+                # Test 1: Search for function name
+                print("Testing regex search for fibonacci function...")
+                fibonacci_result = await mcp_client.send_request(
+                    "tools/call",
+                    {
+                        "name": "search_regex",
+                        "arguments": {
+                            "pattern": "calculate_fibonacci",
+                            "page_size": 10,
+                            "offset": 0
+                        }
+                    }
+                )
+                print(f"Fibonacci response: {fibonacci_result}")
+
                 # The result has content array with text
-                result_content = fibonacci_response["result"]
-                if "content" in result_content and len(result_content["content"]) > 0:
-                    fibonacci_results = json.loads(result_content["content"][0]["text"])["results"]
+                if "content" in fibonacci_result and len(fibonacci_result["content"]) > 0:
+                    fibonacci_results = json.loads(fibonacci_result["content"][0]["text"])["results"]
                 else:
-                    print(f"Unexpected result format: {result_content}")
+                    print(f"Unexpected result format: {fibonacci_result}")
                     fibonacci_results = []
                 assert len(fibonacci_results) > 0, "Should find fibonacci function"
                 
@@ -461,12 +373,21 @@ Run the application with proper configuration.
                 
                 # Test 2: Search for unique identifier from utils.py
                 print("Testing regex search for unique app identifier...")
-                app_response = await mcp_client.search_regex("test_isolated_app_67890")
-                assert "result" in app_response
-                
-                app_results = json.loads(app_response["result"]["content"][0]["text"])["results"]
+                app_result = await mcp_client.send_request(
+                    "tools/call",
+                    {
+                        "name": "search_regex",
+                        "arguments": {
+                            "pattern": "test_isolated_app_67890",
+                            "page_size": 10,
+                            "offset": 0
+                        }
+                    }
+                )
+
+                app_results = json.loads(app_result["content"][0]["text"])["results"]
                 assert len(app_results) > 0, "Should find unique app identifier"
-                
+
                 found_app_id = False
                 for result in app_results:
                     if "test_isolated_app_67890" in result.get("content", ""):
@@ -477,18 +398,27 @@ Run the application with proper configuration.
                         assert not Path(file_path).is_absolute(), f"File path should be relative: {file_path}"
                         found_app_id = True
                         break
-                
+
                 assert found_app_id, "Should find app identifier in target project"
                 print("✓ App identifier found in correct directory")
-                
+
                 # Test 3: Search for content from README
                 print("Testing regex search for README content...")
-                readme_response = await mcp_client.search_regex("unique_feature_identifier_99999")
-                assert "result" in readme_response
-                
-                readme_results = json.loads(readme_response["result"]["content"][0]["text"])["results"] 
+                readme_result = await mcp_client.send_request(
+                    "tools/call",
+                    {
+                        "name": "search_regex",
+                        "arguments": {
+                            "pattern": "unique_feature_identifier_99999",
+                            "page_size": 10,
+                            "offset": 0
+                        }
+                    }
+                )
+
+                readme_results = json.loads(readme_result["content"][0]["text"])["results"]
                 assert len(readme_results) > 0, "Should find README content"
-                
+
                 found_readme = False
                 for result in readme_results:
                     if "unique_feature_identifier_99999" in result.get("content", ""):
@@ -499,45 +429,60 @@ Run the application with proper configuration.
                         assert not Path(file_path).is_absolute(), f"File path should be relative: {file_path}"
                         found_readme = True
                         break
-                        
+
                 assert found_readme, "Should find README content in target project"
                 print("✓ README content found in correct directory")
-                
+
                 # Test 4: Search for class definition
                 print("Testing regex search for class definition...")
-                class_response = await mcp_client.search_regex("class DataProcessor")
-                assert "result" in class_response
-                
-                class_results = json.loads(class_response["result"]["content"][0]["text"])["results"]
+                class_result = await mcp_client.send_request(
+                    "tools/call",
+                    {
+                        "name": "search_regex",
+                        "arguments": {
+                            "pattern": "class DataProcessor",
+                            "page_size": 10,
+                            "offset": 0
+                        }
+                    }
+                )
+
+                class_results = json.loads(class_result["content"][0]["text"])["results"]
                 assert len(class_results) > 0, "Should find DataProcessor class"
                 print("✓ DataProcessor class found")
-                
+
                 # Test 5: Verify no content from test_cwd directory
                 print("Testing that no content from test_cwd is returned...")
-                
+
                 # Create a file in test_cwd that should NOT be found
                 (test_cwd / "should_not_be_found.py").write_text("""
 def should_not_appear():
     return "this_should_not_be_indexed_54321"
 """)
-                
+
                 # Search for content that only exists in test_cwd
-                isolation_response = await mcp_client.search_regex("this_should_not_be_indexed_54321")
-                isolation_results = json.loads(isolation_response["result"]["content"][0]["text"])["results"]
-                
+                isolation_result = await mcp_client.send_request(
+                    "tools/call",
+                    {
+                        "name": "search_regex",
+                        "arguments": {
+                            "pattern": "this_should_not_be_indexed_54321",
+                            "page_size": 10,
+                            "offset": 0
+                        }
+                    }
+                )
+                isolation_results = json.loads(isolation_result["content"][0]["text"])["results"]
+
                 # Should find nothing because test_cwd is not indexed
                 assert len(isolation_results) == 0, "Should not find content from test_cwd"
                 print("✓ Content isolation verified - test_cwd content not indexed")
-                
+
                 print("All MCP stdio communication tests passed!")
-                
+
             finally:
-                mcp_process.terminate()
-                try:
-                    await asyncio.wait_for(mcp_process.wait(), timeout=5.0)
-                except asyncio.TimeoutError:
-                    mcp_process.kill()
-                    await mcp_process.wait()
+                # Clean shutdown of client
+                await mcp_client.close()
                     
         finally:
             # Use Windows-safe cleanup
