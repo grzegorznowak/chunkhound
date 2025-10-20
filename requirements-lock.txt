@@ -374,6 +374,8 @@ tree-sitter-make==1.1.1
     # via chunkhound (pyproject.toml)
 tree-sitter-markdown==0.5.1
     # via chunkhound (pyproject.toml)
+tree-sitter-php==0.24.1
+    # via chunkhound (pyproject.toml)
 tree-sitter-python==0.25.0
     # via chunkhound (pyproject.toml)
 tree-sitter-rust==0.24.0
@@ -384,6 +386,8 @@ tree-sitter-typescript==0.23.2
     # via chunkhound (pyproject.toml)
 tree-sitter-yaml==0.7.0
     # via tree-sitter-language-pack
+tree-sitter-zig==1.1.2
+    # via chunkhound (pyproject.toml)
 typing-extensions==4.15.0
     # via
     #   aiosignal
