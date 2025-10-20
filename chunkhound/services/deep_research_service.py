@@ -22,7 +22,7 @@ NODE_SIMILARITY_THRESHOLD = 0.2  # Reserved for future similarity-based deduplic
 MAX_FOLLOWUP_QUESTIONS = 3
 MAX_SYMBOLS_TO_SEARCH = 5  # Top N symbols to search via regex (from spec)
 QUERY_EXPANSION_ENABLED = True  # Enable LLM-powered query expansion for better recall
-NUM_EXPANDED_QUERIES = 3  # Number of diverse queries to generate for semantic search
+NUM_LLM_EXPANDED_QUERIES = 2  # LLM generates 2 queries, we prepend original = 3 total
 
 # Adaptive token budgets (depth-dependent)
 ENABLE_ADAPTIVE_BUDGETS = True  # Enable depth-based adaptive budgets
@@ -214,6 +214,7 @@ class DeepResearchService:
         global_explored_data = {
             "files_fully_read": set(),
             "chunk_ranges": {},  # file_path -> list[(start, end)]
+            "chunks": [],  # All chunks for building exploration gist
         }
 
         # BFS traversal: Process depth 0 (root node) through max_depth
@@ -461,6 +462,7 @@ class DeepResearchService:
             context,
             file_contents,
             chunks,
+            global_explored_data,
             max_input_tokens=node.token_budgets["llm_input_tokens"],
         )
 
@@ -559,7 +561,7 @@ class DeepResearchService:
                 "queries": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": f"Array of exactly {NUM_EXPANDED_QUERIES} expanded search queries"
+                    "description": f"Array of exactly {NUM_LLM_EXPANDED_QUERIES} expanded search queries (semantically complete sentences)"
                 }
             },
             "required": ["queries"],
@@ -575,16 +577,25 @@ class DeepResearchService:
             ancestor_path = " → ".join(context.ancestors[-2:])
             context_str = f"\nPrior: {ancestor_path}"
 
-        # Simplified prompt
+        # Optimized prompt for semantic diversity
         prompt = f"""Query: {query}
 Context: {context.root_query}{context_str}
 
-Generate {NUM_EXPANDED_QUERIES} search variations:
-1. Original query verbatim
-2. Technical keywords (function/class names, programming terms)
-3. Hypothetical code patterns (class X, def method(), etc.)
+Generate {NUM_LLM_EXPANDED_QUERIES} semantically diverse search queries for code retrieval:
 
-Use only code-domain terms. No abstract concepts. Keep concise."""
+1. Rephrase using synonyms and alternative perspectives
+   - Use different words with same meaning (e.g., "implement" → "build/create", "authentication" → "login/verification")
+   - Ask from a different angle while preserving intent
+
+2. Implementation-focused natural language
+   - Target code elements: "Find classes that...", "What functions handle..."
+   - Mention specific code concepts (services, handlers, middleware, etc.)
+
+Requirements:
+- COMPLETE SENTENCES only - no keyword lists, no pseudo-code
+- Each query must be self-contained and semantically rich
+- Different semantic angles of the same question
+- Concise (1-2 sentences max per query)"""
 
         try:
             result = await llm.complete_structured(
@@ -594,24 +605,27 @@ Use only code-domain terms. No abstract concepts. Keep concise."""
                 max_completion_tokens=2500
             )
 
-            queries = result.get("queries", [])
+            expanded = result.get("queries", [])
 
-            # Ensure we have at least the original query
-            if not queries or len(queries) == 0:
-                logger.warning("LLM query expansion returned no queries, using original")
+            # Validation: expect exactly 2 queries from LLM
+            if not expanded or len(expanded) < NUM_LLM_EXPANDED_QUERIES:
+                logger.warning(
+                    f"LLM returned {len(expanded) if expanded else 0} queries, expected {NUM_LLM_EXPANDED_QUERIES}, using original query only"
+                )
                 return [query]
 
-            # Filter empty queries and pad with original if needed
-            valid_queries = [q.strip() for q in queries if q and q.strip()]
-            while len(valid_queries) < NUM_EXPANDED_QUERIES:
-                valid_queries.append(query)
+            # Filter empty strings
+            expanded = [q.strip() for q in expanded if q and q.strip()]
 
-            expanded = valid_queries[:NUM_EXPANDED_QUERIES]
-            logger.debug(f"Expanded query into {len(expanded)} variants")
-            return expanded
+            # PREPEND ORIGINAL QUERY (new logic)
+            # Original query goes first for position bias in embedding models
+            final_queries = [query] + expanded[:NUM_LLM_EXPANDED_QUERIES]
+
+            logger.debug(f"Expanded query into {len(final_queries)} variations: {final_queries}")
+            return final_queries
 
         except Exception as e:
-            logger.warning(f"Query expansion failed: {e}, using original query")
+            logger.warning(f"Query expansion failed: {e}, using original query only")
             return [query]
 
     async def _unified_search(
@@ -648,7 +662,9 @@ Use only code-domain terms. No abstract concepts. Keep concise."""
             await self._emit_event("query_expand", "Expanding query", node_id=node_id, depth=depth)
 
             expanded_queries = await self._expand_query_with_llm(query, context)
-            logger.debug(f"Expanded into {len(expanded_queries)} queries: {expanded_queries}")
+            logger.debug(
+                f"Query expansion: 1 original + {len(expanded_queries)-1} LLM-generated = {len(expanded_queries)} total: {expanded_queries}"
+            )
 
             # Emit expanded queries event
             queries_preview = " | ".join(q[:40] + "..." if len(q) > 40 else q for q in expanded_queries[:3])
@@ -1290,7 +1306,7 @@ Use only code-domain terms. No abstract concepts. Keep concise."""
         not just their ancestor chain. Critical for preventing redundant exploration.
 
         Args:
-            global_explored_data: Global state dict with files_fully_read and chunk_ranges
+            global_explored_data: Global state dict with files_fully_read, chunk_ranges, and chunks
             node: BFS node whose discoveries should be added to global state
         """
         # Add fully-read files
@@ -1298,12 +1314,54 @@ Use only code-domain terms. No abstract concepts. Keep concise."""
             if self._is_file_fully_read(content):
                 global_explored_data["files_fully_read"].add(file_path)
 
-        # Add expanded chunk ranges
+        # Add expanded chunk ranges and chunks
         for chunk in node.chunks:
             file_path = chunk.get("file_path")
             if file_path:
                 expanded_range = self._get_chunk_expanded_range(chunk)
                 global_explored_data["chunk_ranges"].setdefault(file_path, []).append(expanded_range)
+                # Store chunk for building exploration gist
+                global_explored_data["chunks"].append(chunk)
+
+    def _build_exploration_gist(self, global_explored_data: dict[str, Any]) -> str | None:
+        """Build compact file/symbol inventory from global exploration.
+
+        Optimized for LLM caching:
+        - Sorted alphabetically (stable prefix)
+        - Append-only compatible
+        - ~5-10 tokens per file
+
+        Args:
+            global_explored_data: Global state with chunks list
+
+        Returns:
+            Compact string listing explored files and symbols, or None if no exploration yet
+        """
+        # Group chunks by file and collect symbols
+        file_symbols: dict[str, set[str]] = {}
+        for chunk in global_explored_data["chunks"]:
+            file_path = chunk.get("file_path")
+            symbol = chunk.get("symbol", "")
+            if file_path:
+                file_symbols.setdefault(file_path, set()).add(symbol)
+
+        if not file_symbols:
+            return None  # No exploration yet - skip gist section entirely
+
+        # Sort for LLM cache stability
+        sorted_files = sorted(file_symbols.items())
+
+        # Format compactly
+        lines = []
+        for file_path, symbols in sorted_files[:25]:  # Limit to 25 files
+            symbol_list = sorted(s for s in symbols if s)[:5]  # Top 5 symbols
+            symbols_str = ", ".join(symbol_list) if symbol_list else "general"
+            lines.append(f"✓ {file_path}: {symbols_str}")
+
+        if len(sorted_files) > 25:
+            lines.append(f"... +{len(sorted_files) - 25} more files")
+
+        return "\n".join(lines)
 
     def _is_chunk_duplicate(
         self,
@@ -1402,6 +1460,7 @@ Use only code-domain terms. No abstract concepts. Keep concise."""
         context: ResearchContext,
         file_contents: dict[str, str],
         chunks: list[dict[str, Any]],
+        global_explored_data: dict[str, Any],
         max_input_tokens: int | None = None,
     ) -> list[str]:
         """Generate follow-up questions using LLM.
@@ -1411,6 +1470,7 @@ Use only code-domain terms. No abstract concepts. Keep concise."""
             context: Research context
             file_contents: File contents found
             chunks: Chunks found
+            global_explored_data: Global state with all explored chunks/files
             max_input_tokens: Maximum tokens for LLM input (uses adaptive budget if provided)
 
         Returns:
@@ -1483,8 +1543,19 @@ Use only code-domain terms. No abstract concepts. Keep concise."""
             ]
         )
 
-        # Simplified prompt
-        prompt = f"""Root: {context.root_query}
+        # Build exploration gist to prevent redundant exploration
+        exploration_gist = self._build_exploration_gist(global_explored_data)
+
+        # Build common prompt sections
+        gist_section = f"""Already explored:
+{exploration_gist}
+
+""" if exploration_gist else ""
+
+        target_instruction = "NEW code elements (not in explored files above)" if exploration_gist else "specific code elements found"
+
+        # Construct prompt with conditional gist section
+        prompt = f"""{gist_section}Root: {context.root_query}
 Current: {query}
 Context: {" -> ".join(context.ancestors)}
 
@@ -1494,7 +1565,7 @@ Code:
 Chunks:
 {chunks_preview}
 
-Generate 0-{MAX_FOLLOWUP_QUESTIONS} follow-up questions about specific code elements found. Focus on:
+Generate 0-{MAX_FOLLOWUP_QUESTIONS} follow-up questions about {target_instruction}. Focus on:
 1. Component interactions
 2. Data/control flow
 3. Dependencies
