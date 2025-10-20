@@ -12,6 +12,7 @@ import time
 from pathlib import Path
 
 import pytest
+from tests.utils import SubprocessJsonRpcClient
 from tests.utils.windows_compat import windows_safe_tempdir, database_cleanup_context
 
 
@@ -61,7 +62,7 @@ class Class_{i}:
                 # Start MCP server
                 mcp_env = os.environ.copy()
                 mcp_env["CHUNKHOUND_MCP_MODE"] = "1"
-                
+
                 proc = await asyncio.create_subprocess_exec(
                     "uv", "run", "chunkhound", "mcp", str(temp_path),
                     cwd=temp_path,
@@ -70,50 +71,37 @@ class Class_{i}:
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE
                 )
-                
+
+                client = SubprocessJsonRpcClient(proc)
+                await client.start()
+
                 try:
                     start_time = time.time()
-                
+
                     # Send initialize request
-                    init_request = {
-                        "jsonrpc": "2.0",
-                        "id": 1,
-                        "method": "initialize",
-                        "params": {
+                    init_result = await client.send_request(
+                        "initialize",
+                        {
                             "protocolVersion": "2024-11-05",
                             "capabilities": {},
                             "clientInfo": {"name": "test", "version": "1.0"}
-                        }
-                    }
-                    
-                    proc.stdin.write((json.dumps(init_request) + "\n").encode())
-                    await proc.stdin.drain()
-                    
-                    # Should respond quickly now (within 5 seconds - allow extra time for macOS)
-                    response_line = await asyncio.wait_for(
-                        proc.stdout.readline(), timeout=5.0
+                        },
+                        timeout=5.0
                     )
 
                     response_time = time.time() - start_time
 
                     # Verify quick response
                     assert response_time < 5.0, f"Server took {response_time:.2f} seconds to respond (should be < 5s)"
-                    
+
                     # Verify response structure
-                    init_response = json.loads(response_line.decode())
-                    assert "result" in init_response, f"No result in response: {init_response}"
-                    assert "serverInfo" in init_response["result"], f"No serverInfo in result: {init_response['result']}"
-                    assert init_response["result"]["serverInfo"]["name"] == "ChunkHound Code Search"
-                    
+                    assert "serverInfo" in init_result, f"No serverInfo in result: {init_result}"
+                    assert init_result["serverInfo"]["name"] == "ChunkHound Code Search"
+
                     print(f"✅ Server responded in {response_time:.2f} seconds")
-                        
+
                 finally:
-                    proc.terminate()
-                    try:
-                        await asyncio.wait_for(proc.wait(), timeout=2.0)
-                    except asyncio.TimeoutError:
-                        proc.kill()
-                        await proc.wait()
+                    await client.close()
 
     @pytest.mark.asyncio
     async def test_stats_includes_scan_progress(self):
@@ -141,7 +129,7 @@ class Class_{i}:
                 # Start MCP server
                 mcp_env = os.environ.copy()
                 mcp_env["CHUNKHOUND_MCP_MODE"] = "1"
-                
+
                 proc = await asyncio.create_subprocess_exec(
                     "uv", "run", "chunkhound", "mcp", str(temp_path),
                     cwd=temp_path,
@@ -150,76 +138,52 @@ class Class_{i}:
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE
                 )
-                
+
+                client = SubprocessJsonRpcClient(proc)
+                await client.start()
+
                 try:
                     # Initialize the server
-                    init_request = {
-                        "jsonrpc": "2.0",
-                        "id": 1,
-                        "method": "initialize",
-                        "params": {
+                    await client.send_request(
+                        "initialize",
+                        {
                             "protocolVersion": "2024-11-05",
                             "capabilities": {},
                             "clientInfo": {"name": "test", "version": "1.0"}
-                        }
-                    }
-                    
-                    proc.stdin.write((json.dumps(init_request) + "\n").encode())
-                    await proc.stdin.drain()
-                    
-                    # Read initialize response
-                    await asyncio.wait_for(proc.stdout.readline(), timeout=5.0)
-                    
+                        },
+                        timeout=5.0
+                    )
+
                     # Send initialized notification
-                    proc.stdin.write((json.dumps({
-                        "jsonrpc": "2.0",
-                        "method": "notifications/initialized"
-                    }) + "\n").encode())
-                    await proc.stdin.drain()
-                    
+                    await client.send_notification("notifications/initialized")
+
                     # Call get_stats tool
-                    stats_request = {
-                        "jsonrpc": "2.0",
-                        "id": 2,
-                        "method": "tools/call",
-                        "params": {
+                    stats_result = await client.send_request(
+                        "tools/call",
+                        {
                             "name": "get_stats",
                             "arguments": {}
-                        }
-                    }
-                    
-                    proc.stdin.write((json.dumps(stats_request) + "\n").encode())
-                    await proc.stdin.drain()
-                    
-                    # Read stats response
-                    stats_line = await asyncio.wait_for(
-                        proc.stdout.readline(), timeout=5.0
+                        },
+                        timeout=5.0
                     )
-                    stats_response = json.loads(stats_line.decode())
-                    
+
                     # Verify stats structure
-                    assert "result" in stats_response, f"No result in stats response: {stats_response}"
-                    assert "content" in stats_response["result"], f"No content in stats result: {stats_response['result']}"
-                    
+                    assert "content" in stats_result, f"No content in stats result: {stats_result}"
+
                     # Parse the stats content
-                    content = stats_response["result"]["content"][0]["text"]
+                    content = stats_result["content"][0]["text"]
                     stats_data = json.loads(content)
-                    
+
                     # Verify scan progress is included
                     assert "initial_scan" in stats_data, f"No initial_scan in stats: {stats_data}"
-                    
+
                     scan_info = stats_data["initial_scan"]
                     assert "is_scanning" in scan_info, f"No is_scanning field: {scan_info}"
                     assert "files_processed" in scan_info, f"No files_processed field: {scan_info}"
                     assert "chunks_created" in scan_info, f"No chunks_created field: {scan_info}"
                     assert "started_at" in scan_info, f"No started_at field: {scan_info}"
-                    
+
                     print(f"✅ Scan progress info: {scan_info}")
-                        
+
                 finally:
-                    proc.terminate()
-                    try:
-                        await asyncio.wait_for(proc.wait(), timeout=2.0)
-                    except asyncio.TimeoutError:
-                        proc.kill()
-                        await proc.wait()
+                    await client.close()
