@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from loguru import logger
+from chunkhound.utils.file_patterns import normalize_include_patterns
 
 
 @dataclass
@@ -115,8 +116,8 @@ class DirectoryIndexingService:
         exclude_patterns: list[str],
     ) -> dict[str, Any]:
         """Extracted from run.py:237-284 - directory processing logic."""
-        # Convert patterns to service layer format
-        processed_patterns = [f"**/{pattern}" for pattern in include_patterns]
+        # Normalize patterns using shared utility (prevents double-prefixing)
+        processed_patterns: list[str] = normalize_include_patterns(include_patterns)
 
         # Process directory using indexing coordinator with config threshold
         result = await self.indexing_coordinator.process_directory(
