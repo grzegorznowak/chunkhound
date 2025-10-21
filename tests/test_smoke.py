@@ -80,6 +80,7 @@ class TestCLICommands:
             ["chunkhound", "search", "--help"],
             ["chunkhound", "research", "--help"],
             ["chunkhound", "mcp", "--help"],
+            ["chunkhound", "calibrate", "--help"],
         ],
     )
     def test_cli_help_commands(self, command):
