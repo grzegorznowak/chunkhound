@@ -423,6 +423,19 @@ class VoyageAIEmbeddingProvider:
         """
         return 3.0
 
+    def get_max_rerank_batch_size(self) -> int:
+        """Get maximum documents per batch for reranking operations.
+
+        VoyageAI's SDK handles batching internally, so we return a large limit.
+        The actual batch splitting is managed by the VoyageAI client library.
+
+        Returns:
+            Conservative limit to prevent OOM on client side: 1000 documents
+        """
+        # VoyageAI SDK handles batching, but we set a conservative client-side limit
+        # to prevent memory issues when processing very large result sets
+        return 1000
+
     # Reranking Operations
     def supports_reranking(self) -> bool:
         """VoyageAI provider supports reranking."""
