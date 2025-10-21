@@ -450,16 +450,187 @@ class TestAnthropicBedrockProvider:
             AnthropicBedrockProvider,
         )
 
+        # Mock Session
+        mock_session = MagicMock()
+        mock_boto3.Session.return_value = mock_session
+
         # Mock STS to raise NoCredentialsError
         mock_sts = MagicMock()
         mock_sts.get_caller_identity.side_effect = NoCredentialsError()
 
-        def client_factory(service_name, **kwargs):
+        def session_client_factory(service_name, **kwargs):
             if service_name == "sts":
                 return mock_sts
             return MagicMock()
 
-        mock_boto3.client.side_effect = client_factory
+        mock_session.client.side_effect = session_client_factory
 
         with pytest.raises(ValueError, match="credentials not configured"):
             AnthropicBedrockProvider()
+
+    def test_profile_name_creates_session(self, mock_boto3, mock_config):
+        """Test that profile_name parameter creates a boto3 Session."""
+        from chunkhound.providers.llm.anthropic_bedrock_provider import (
+            AnthropicBedrockProvider,
+        )
+
+        # Mock Session
+        mock_session = MagicMock()
+        mock_boto3.Session.return_value = mock_session
+
+        # Mock client creation from session
+        mock_client = MagicMock()
+        mock_session.client.return_value = mock_client
+
+        # Mock STS for validation
+        mock_sts = MagicMock()
+        mock_sts.get_caller_identity.return_value = {
+            "Account": "123456789012",
+            "Arn": "arn:aws:iam::123456789012:user/test-user",
+        }
+
+        def session_client_factory(service_name, **kwargs):
+            if service_name == "sts":
+                return mock_sts
+            elif service_name == "bedrock-runtime":
+                return mock_client
+            return MagicMock()
+
+        mock_session.client.side_effect = session_client_factory
+
+        # Create provider with profile_name
+        provider = AnthropicBedrockProvider(profile_name="my-profile")
+
+        # Verify Session was created with profile_name
+        mock_boto3.Session.assert_called_once_with(profile_name="my-profile")
+
+        # Verify client was created from session
+        assert mock_session.client.call_count >= 1
+        bedrock_call = [
+            call
+            for call in mock_session.client.call_args_list
+            if call[0][0] == "bedrock-runtime"
+        ][0]
+        assert bedrock_call[1]["region_name"] == "us-east-1"
+        assert bedrock_call[1]["endpoint_url"] is None
+
+    def test_profile_name_overrides_env_var(self, mock_boto3, mock_config, monkeypatch):
+        """Test that profile_name parameter overrides AWS_PROFILE env var."""
+        from chunkhound.providers.llm.anthropic_bedrock_provider import (
+            AnthropicBedrockProvider,
+        )
+
+        # Set AWS_PROFILE env var
+        monkeypatch.setenv("AWS_PROFILE", "env-profile")
+
+        # Mock Session
+        mock_session = MagicMock()
+        mock_boto3.Session.return_value = mock_session
+
+        # Mock clients
+        mock_client = MagicMock()
+        mock_sts = MagicMock()
+        mock_sts.get_caller_identity.return_value = {"Account": "123456789012"}
+
+        def session_client_factory(service_name, **kwargs):
+            if service_name == "sts":
+                return mock_sts
+            return mock_client
+
+        mock_session.client.side_effect = session_client_factory
+
+        # Create provider with explicit profile_name (should override env var)
+        provider = AnthropicBedrockProvider(profile_name="param-profile")
+
+        # Verify Session was created with parameter value, not env var
+        mock_boto3.Session.assert_called_once_with(profile_name="param-profile")
+
+    def test_custom_endpoint_url_via_base_url(self, mock_boto3, mock_config):
+        """Test that base_url parameter sets custom Bedrock endpoint URL."""
+        from chunkhound.providers.llm.anthropic_bedrock_provider import (
+            AnthropicBedrockProvider,
+        )
+
+        # Mock Session
+        mock_session = MagicMock()
+        mock_boto3.Session.return_value = mock_session
+
+        # Mock client
+        mock_client = MagicMock()
+        mock_session.client.return_value = mock_client
+
+        custom_endpoint = "https://vpce-123.bedrock-runtime.us-west-2.vpce.amazonaws.com"
+
+        # Create provider with custom endpoint
+        provider = AnthropicBedrockProvider(base_url=custom_endpoint)
+
+        # Verify client was created with custom endpoint_url
+        bedrock_call = [
+            call
+            for call in mock_session.client.call_args_list
+            if call[0][0] == "bedrock-runtime"
+        ][0]
+        assert bedrock_call[1]["endpoint_url"] == custom_endpoint
+
+    def test_custom_endpoint_skips_sts_validation(self, mock_boto3, mock_config):
+        """Test that STS validation is skipped when custom endpoint_url is provided."""
+        from chunkhound.providers.llm.anthropic_bedrock_provider import (
+            AnthropicBedrockProvider,
+        )
+
+        # Mock Session
+        mock_session = MagicMock()
+        mock_boto3.Session.return_value = mock_session
+
+        # Mock bedrock client
+        mock_client = MagicMock()
+        mock_session.client.return_value = mock_client
+
+        custom_endpoint = "https://vpce-123.bedrock-runtime.us-west-2.vpce.amazonaws.com"
+
+        # Create provider with custom endpoint (should NOT call STS)
+        provider = AnthropicBedrockProvider(base_url=custom_endpoint)
+
+        # Verify STS client was NOT created
+        sts_calls = [
+            call for call in mock_session.client.call_args_list if call[0][0] == "sts"
+        ]
+        assert len(sts_calls) == 0
+
+    def test_profile_and_endpoint_together(self, mock_boto3, mock_config):
+        """Test that profile_name and base_url can be used together."""
+        from chunkhound.providers.llm.anthropic_bedrock_provider import (
+            AnthropicBedrockProvider,
+        )
+
+        # Mock Session
+        mock_session = MagicMock()
+        mock_boto3.Session.return_value = mock_session
+
+        # Mock client
+        mock_client = MagicMock()
+        mock_session.client.return_value = mock_client
+
+        custom_endpoint = "https://vpce-123.bedrock-runtime.us-west-2.vpce.amazonaws.com"
+
+        # Create provider with both profile and custom endpoint
+        provider = AnthropicBedrockProvider(
+            profile_name="vpc-profile", base_url=custom_endpoint
+        )
+
+        # Verify Session was created with profile
+        mock_boto3.Session.assert_called_once_with(profile_name="vpc-profile")
+
+        # Verify client was created with custom endpoint
+        bedrock_call = [
+            call
+            for call in mock_session.client.call_args_list
+            if call[0][0] == "bedrock-runtime"
+        ][0]
+        assert bedrock_call[1]["endpoint_url"] == custom_endpoint
+
+        # Verify STS was NOT called (custom endpoint skips validation)
+        sts_calls = [
+            call for call in mock_session.client.call_args_list if call[0][0] == "sts"
+        ]
+        assert len(sts_calls) == 0

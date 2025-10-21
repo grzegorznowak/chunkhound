@@ -25,7 +25,9 @@ class LLMManager:
         "anthropic-bedrock": AnthropicBedrockProvider,
     }
 
-    def __init__(self, utility_config: dict[str, Any], synthesis_config: dict[str, Any]):
+    def __init__(
+        self, utility_config: dict[str, Any], synthesis_config: dict[str, Any]
+    ):
         """Initialize LLM manager with dual providers.
 
         Args:
@@ -74,9 +76,14 @@ class LLMManager:
                 "max_retries": config.get("max_retries", 3),
             }
 
-            # Add bedrock_region if present (for anthropic-bedrock provider)
+            # Add Bedrock-specific parameters (for anthropic-bedrock provider)
             if "bedrock_region" in config:
                 provider_kwargs["bedrock_region"] = config["bedrock_region"]
+            if "aws_profile" in config:
+                # Map config field name to boto3 parameter name
+                # Config uses 'aws_profile' (matches AWS_PROFILE env var)
+                # boto3.Session expects 'profile_name' parameter
+                provider_kwargs["profile_name"] = config["aws_profile"]
 
             provider = provider_class(**provider_kwargs)
             return provider
@@ -133,8 +140,7 @@ class LLMManager:
             True if both providers are configured
         """
         return (
-            self._utility_provider is not None
-            and self._synthesis_provider is not None
+            self._utility_provider is not None and self._synthesis_provider is not None
         )
 
     def list_providers(self) -> list[str]:

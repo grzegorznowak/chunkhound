@@ -39,36 +39,51 @@ class AnthropicBedrockProvider(LLMProvider):
         self,
         api_key: str | None = None,  # Not used - kept for interface compatibility
         model: str = "claude-3-5-sonnet-20241022",
-        base_url: str | None = None,  # Not used - kept for interface compatibility
+        base_url: str
+        | None = None,  # Custom Bedrock endpoint URL (VPC endpoint or non-default deployment)
         timeout: int = 60,
         max_retries: int = 3,
         bedrock_region: str | None = None,
+        profile_name: str | None = None,
     ):
         """Initialize Anthropic Bedrock LLM provider.
 
         Args:
             api_key: Not used (boto3 uses AWS credentials). Present for interface compatibility.
             model: Model name to use (e.g., "claude-3-5-sonnet-20241022")
-            base_url: Not used (Bedrock uses AWS endpoints). Present for interface compatibility.
+            base_url: Custom Bedrock endpoint URL for VPC/private deployments.
+                Examples:
+                - VPC endpoint: "https://vpce-123abc.bedrock-runtime.us-west-2.vpce.amazonaws.com"
+                - PrivateLink: "https://bedrock-runtime.us-east-1.amazonaws.com"
+                Leave None for standard public AWS Bedrock endpoints.
             timeout: Request timeout in seconds
             max_retries: Number of retry attempts for failed requests
             bedrock_region: AWS region for Bedrock (defaults to AWS_REGION env var)
+            profile_name: AWS profile name from ~/.aws/credentials (overrides AWS_PROFILE env var)
+                Profile enables multi-account/role scenarios without changing credentials.
         """
         if not BEDROCK_AVAILABLE:
-            raise ImportError("boto3 not available - install with: uv pip install boto3")
+            raise ImportError(
+                "boto3 not available - install with: uv pip install boto3"
+            )
 
-        # Explicitly mark unused parameters (kept for LLMProvider interface compatibility)
+        # Mark unused parameter
         _ = api_key
-        _ = base_url
 
         self._model = model
         self._timeout = timeout
         self._max_retries = max_retries
+        self._endpoint_url = base_url
 
         # Initialize Bedrock client
-        # AWS credential resolution (boto3 handles automatically):
+        # Profile resolution order (first non-None wins):
+        #   1. profile_name parameter (from config or constructor)
+        #   2. AWS_PROFILE environment variable
+        #   3. Default credential chain (no profile specified)
+        #
+        # Credential resolution (boto3 handles automatically via Session):
         #   1. AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY environment variables
-        #   2. ~/.aws/credentials file
+        #   2. ~/.aws/credentials file (uses profile if specified)
         #   3. IAM role (when running on AWS infrastructure)
         #
         # Region resolution order (first non-None wins):
@@ -76,6 +91,10 @@ class AnthropicBedrockProvider(LLMProvider):
         #   2. AWS_REGION environment variable
         #   3. AWS_DEFAULT_REGION environment variable
         #   4. Hardcoded fallback: "us-east-1"
+
+        # Determine which profile to use (parameter overrides env var)
+        resolved_profile = profile_name or os.getenv("AWS_PROFILE")
+
         region = (
             bedrock_region
             or os.getenv("AWS_REGION")
@@ -84,9 +103,20 @@ class AnthropicBedrockProvider(LLMProvider):
         )
 
         try:
-            self._client = boto3.client(
+            # Create boto3 Session with profile if specified
+            # NOTE: Using Session is required for profile support - boto3.client() doesn't
+            # accept profile_name parameter. Session encapsulates credential resolution.
+            if resolved_profile:
+                session = boto3.Session(profile_name=resolved_profile)
+                logger.info(f"Using AWS profile: {resolved_profile}")
+            else:
+                session = boto3.Session()
+
+            # Create Bedrock client from session
+            self._client = session.client(
                 "bedrock-runtime",
                 region_name=region,
+                endpoint_url=self._endpoint_url,
                 config=Config(
                     retries={"max_attempts": max_retries, "mode": "adaptive"},
                     read_timeout=timeout,
@@ -98,35 +128,46 @@ class AnthropicBedrockProvider(LLMProvider):
                 "Please configure AWS credentials using one of these methods:\n"
                 "1. Environment variables: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY\n"
                 "2. AWS credentials file: ~/.aws/credentials\n"
-                "3. IAM role (when running on AWS infrastructure)\n\n"
+                "3. AWS profile: Set profile_name parameter or AWS_PROFILE env var\n"
+                "4. IAM role (when running on AWS infrastructure)\n\n"
                 f"Also ensure AWS_REGION is set (current: {region})"
             ) from e
 
-        # Validate credentials by attempting a lightweight operation
-        try:
-            # Get caller identity to verify credentials work
-            sts_client = boto3.client("sts", region_name=region)
-            sts_client.get_caller_identity()
-        except NoCredentialsError as e:
-            raise ValueError(
-                "AWS credentials not configured. "
-                "Set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY, "
-                "or configure ~/.aws/credentials"
-            ) from e
-        except ClientError as e:
-            error_code = e.response.get("Error", {}).get("Code", "Unknown")
-            if error_code == "InvalidClientTokenId":
+        # Validate credentials (skip if custom endpoint - VPC may lack STS access)
+        if not self._endpoint_url:
+            try:
+                # Get caller identity to verify credentials work
+                sts_client = session.client("sts", region_name=region)
+                identity = sts_client.get_caller_identity()
+                logger.info(f"Authenticated as: {identity['Arn']}")
+            except NoCredentialsError as e:
                 raise ValueError(
-                    "Invalid AWS credentials. Please check your AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY"
+                    "AWS credentials not configured. "
+                    "Set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY, "
+                    "configure ~/.aws/credentials, or specify profile_name"
                 ) from e
-            elif error_code == "SignatureDoesNotMatch":
-                raise ValueError(
-                    "AWS signature mismatch. Please check your AWS_SECRET_ACCESS_KEY"
-                ) from e
-            else:
-                logger.warning(f"AWS credential validation failed with {error_code}: {e}")
-        except Exception as e:
-            logger.warning(f"Could not validate AWS credentials: {e}")
+            except ClientError as e:
+                error_code = e.response.get("Error", {}).get("Code", "Unknown")
+                if error_code == "InvalidClientTokenId":
+                    raise ValueError(
+                        "Invalid AWS credentials. "
+                        "Check AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY"
+                    ) from e
+                elif error_code == "SignatureDoesNotMatch":
+                    raise ValueError(
+                        "AWS signature mismatch. Please check your AWS_SECRET_ACCESS_KEY"
+                    ) from e
+                else:
+                    logger.warning(
+                        f"AWS credential validation failed with {error_code}: {e}"
+                    )
+            except Exception as e:
+                logger.warning(f"Could not validate AWS credentials: {e}")
+        else:
+            logger.info(f"Using custom Bedrock endpoint: {self._endpoint_url}")
+            logger.info(
+                "Skipping STS credential validation (custom endpoint may restrict STS access)"
+            )
 
         # Usage tracking
         self._requests_made = 0
@@ -275,7 +316,8 @@ class AnthropicBedrockProvider(LLMProvider):
                 logger.error(f"Bedrock access denied: {error_message}")
                 raise RuntimeError(
                     f"AWS Bedrock access denied: {error_message}. "
-                    f"Ensure your AWS credentials have bedrock:InvokeModel permission for {self._model}"
+                    f"Ensure credentials have bedrock:InvokeModel permission "
+                    f"for {self._model}"
                 ) from e
             elif error_code == "ResourceNotFoundException":
                 logger.error(f"Bedrock model not found: {error_message}")
