@@ -5,6 +5,7 @@ from typing import Any
 from loguru import logger
 
 from chunkhound.interfaces.llm_provider import LLMProvider
+from chunkhound.providers.llm.anthropic_bedrock_provider import AnthropicBedrockProvider
 from chunkhound.providers.llm.claude_code_cli_provider import ClaudeCodeCLIProvider
 from chunkhound.providers.llm.openai_llm_provider import OpenAILLMProvider
 
@@ -21,6 +22,7 @@ class LLMManager:
     _providers: dict[str, type[LLMProvider]] = {
         "openai": OpenAILLMProvider,
         "claude-code-cli": ClaudeCodeCLIProvider,
+        "anthropic-bedrock": AnthropicBedrockProvider,
     }
 
     def __init__(self, utility_config: dict[str, Any], synthesis_config: dict[str, Any]):
@@ -63,14 +65,20 @@ class LLMManager:
         provider_class = self._providers[provider_name]
 
         try:
-            # Standard parameters for OpenAI and Claude CLI
-            provider = provider_class(
-                api_key=config.get("api_key"),
-                model=config.get("model", "gpt-5-nano"),
-                base_url=config.get("base_url"),
-                timeout=config.get("timeout", 60),
-                max_retries=config.get("max_retries", 3),
-            )
+            # Build provider initialization parameters
+            provider_kwargs = {
+                "api_key": config.get("api_key"),
+                "model": config.get("model", "gpt-5-nano"),
+                "base_url": config.get("base_url"),
+                "timeout": config.get("timeout", 60),
+                "max_retries": config.get("max_retries", 3),
+            }
+
+            # Add bedrock_region if present (for anthropic-bedrock provider)
+            if "bedrock_region" in config:
+                provider_kwargs["bedrock_region"] = config["bedrock_region"]
+
+            provider = provider_class(**provider_kwargs)
             return provider
         except Exception as e:
             logger.error(f"Failed to initialize LLM provider {provider_name}: {e}")
