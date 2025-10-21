@@ -69,6 +69,7 @@ dependencies = [
     "pymupdf>=1.23.0",
     "rich>=13.0.0",
     "readchar>=4.2.1",
+    "boto3>=1.28.57",
 ]
 
 [project.optional-dependencies]
