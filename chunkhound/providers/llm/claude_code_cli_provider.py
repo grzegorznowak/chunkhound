@@ -10,13 +10,13 @@ Note: The CLI includes Claude Code's agentic system prompt and cannot provide
 import asyncio
 import json
 import os
-import re
 import subprocess
 from typing import Any
 
 from loguru import logger
 
 from chunkhound.interfaces.llm_provider import LLMProvider, LLMResponse
+from chunkhound.utils.json_extraction import extract_json_from_response
 
 
 class ClaudeCodeCLIProvider(LLMProvider):
@@ -137,45 +137,6 @@ class ClaudeCodeCLIProvider(LLMProvider):
         """
         # Pass through model name as-is - CLI requires full names
         return model
-
-    def _extract_json_from_response(self, content: str) -> str:
-        """Extract JSON from response, handling markdown code blocks.
-
-        Handles multiple patterns:
-        - Raw JSON (no code blocks)
-        - JSON in ```json code block
-        - JSON in generic ``` code block
-        - Nested code blocks (takes the first valid one)
-
-        Args:
-            content: Response content potentially containing JSON
-
-        Returns:
-            Extracted JSON string
-
-        Raises:
-            ValueError: If no valid JSON content can be extracted
-        """
-        # Try to find JSON in markdown code blocks using regex
-        # Pattern matches ```json or ``` followed by content until closing ```
-        code_block_pattern = r"```(?:json)?\s*\n?(.*?)\n?```"
-        matches = re.findall(code_block_pattern, content, re.DOTALL)
-
-        if matches:
-            # Return the first non-empty match
-            for match in matches:
-                if match.strip():
-                    return match.strip()
-
-        # No code blocks found, try to use content as-is
-        # Strip any leading/trailing whitespace
-        json_content = content.strip()
-
-        # If content is empty, raise error
-        if not json_content:
-            raise ValueError("No JSON content found in response")
-
-        return json_content
 
     async def _run_cli_command(
         self,
@@ -386,7 +347,7 @@ Respond with JSON only, no additional text."""
             self._estimated_tokens_used += total_tokens
 
             # Extract JSON from response (handle markdown code blocks)
-            json_content = self._extract_json_from_response(content)
+            json_content = extract_json_from_response(content)
 
             # Parse JSON
             parsed = json.loads(json_content)
