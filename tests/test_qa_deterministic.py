@@ -303,9 +303,27 @@ def added_during_edit():
                 
                 print(f"Created {language.value} test file: {filename}")
         
-        # Wait for all files to be processed (extended for Ollama)
-        await asyncio.sleep(5.0)
-        
+        # Wait for all files to be processed - poll until all files are in database
+        expected_file_count = len(created_files)
+        max_wait = 60.0  # Maximum 60 seconds (allow time for embeddings)
+        poll_interval = 0.5
+        elapsed = 0.0
+
+        while elapsed < max_wait:
+            db_stats = await execute_tool("get_stats", services, None, {})
+            indexed_files = db_stats.get('total_files', 0)
+
+            if indexed_files >= expected_file_count:
+                print(f"📊 All {expected_file_count} files processed in {elapsed:.1f}s")
+                break
+
+            await asyncio.sleep(poll_interval)
+            elapsed += poll_interval
+
+        # Final stats check
+        db_stats = await execute_tool("get_stats", services, None, {})
+        print(f"📊 Final: {db_stats.get('total_files', 0)} files, {db_stats.get('total_chunks', 0)} chunks")
+
         # QA Item 5: Test concurrent processing for all languages
         # Search for each language's unique content
         successful_languages = []

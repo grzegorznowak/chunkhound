@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from loguru import logger
+from chunkhound.utils.file_patterns import normalize_include_patterns
 
 
 @dataclass
@@ -22,6 +23,9 @@ class IndexingStats:
     cleanup_deleted_files: int = 0
     cleanup_deleted_chunks: int = 0
     errors_encountered: list[str] = field(default_factory=list)
+    skipped_due_to_timeout: list[str] = field(default_factory=list)
+    skipped_unchanged: int = 0
+    skipped_filtered: int = 0
 
 
 class DirectoryIndexingService:
@@ -112,8 +116,8 @@ class DirectoryIndexingService:
         exclude_patterns: list[str],
     ) -> dict[str, Any]:
         """Extracted from run.py:237-284 - directory processing logic."""
-        # Convert patterns to service layer format
-        processed_patterns = [f"**/{pattern}" for pattern in include_patterns]
+        # Normalize patterns using shared utility (prevents double-prefixing)
+        processed_patterns: list[str] = normalize_include_patterns(include_patterns)
 
         # Process directory using indexing coordinator with config threshold
         result = await self.indexing_coordinator.process_directory(
@@ -151,6 +155,9 @@ class DirectoryIndexingService:
         stats.files_skipped = result.get("skipped", 0)
         stats.files_errors = result.get("errors", 0)
         stats.chunks_created = result.get("total_chunks", 0)
+        stats.skipped_due_to_timeout = result.get("skipped_due_to_timeout", [])
+        stats.skipped_unchanged = result.get("skipped_unchanged", 0)
+        stats.skipped_filtered = result.get("skipped_filtered", 0)
 
         # Cleanup statistics
         cleanup = result.get("cleanup", {})

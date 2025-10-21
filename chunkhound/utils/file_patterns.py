@@ -177,19 +177,22 @@ def load_gitignore_patterns(dir_path: Path, root_dir: Path) -> list[str]:
                     patterns_from_gitignore.append(f"{line[1:]}/**")
                 else:
                     # In subdirectory
-                    patterns_from_gitignore.append((rel_from_root / line[1:]).as_posix())
-                    patterns_from_gitignore.append(f"{(rel_from_root / line[1:]).as_posix()}/**")
+                    patterns_from_gitignore.append(
+                        (rel_from_root / line[1:]).as_posix()
+                    )
+                    patterns_from_gitignore.append(
+                        f"{(rel_from_root / line[1:]).as_posix()}/**"
+                    )
             else:
                 # Recursive pattern
                 rel_from_root = dir_path.relative_to(root_dir)
                 if rel_from_root == Path("."):
-                    if not line.startswith("**/"):
-                        patterns_from_gitignore.append(f"**/{line}")
-                        patterns_from_gitignore.append(f"**/{line}/**")
-                    else:
-                        patterns_from_gitignore.append(line)
+                    # Use shared normalization utility to avoid double prefixing
+                    patterns_from_gitignore.append(normalize_include_pattern(line))
                 else:
-                    patterns_from_gitignore.append(f"{rel_from_root.as_posix()}/**/{line}")
+                    patterns_from_gitignore.append(
+                        f"{rel_from_root.as_posix()}/**/{line}"
+                    )
                     patterns_from_gitignore.append(f"{rel_from_root.as_posix()}/{line}")
 
         return patterns_from_gitignore
@@ -222,7 +225,9 @@ def scan_directory_files(
         for item in directory.iterdir():
             if item.is_file():
                 # Check against exclude patterns
-                if should_exclude_path(item, directory, exclude_patterns, pattern_cache):
+                if should_exclude_path(
+                    item, directory, exclude_patterns, pattern_cache
+                ):
                     continue
 
                 # Check against gitignore patterns
@@ -342,6 +347,25 @@ def walk_directory_tree(
 
     return files, gitignore_patterns
 
+# ---------------------------------------------------------------------------
+# Normalization helpers (shared across services)
+# ---------------------------------------------------------------------------
+
+def normalize_include_pattern(pattern: str) -> str:
+    """Ensure include pattern starts with "**/" prefix without double-prefixing.
+
+    Examples:
+    - "*.py"      -> "**/*.py"
+    - "**/*.py"   -> "**/*.py" (unchanged)
+    - "README"    -> "**/README"
+    """
+    return pattern if pattern.startswith("**/") else f"**/{pattern}"
+
+
+def normalize_include_patterns(patterns: list[str]) -> list[str]:
+    """Normalize a list of include patterns with consistent "**/" prefixing."""
+    return [normalize_include_pattern(p) for p in patterns]
+
 
 def walk_subtree_worker(
     subtree_path: Path,
@@ -394,6 +418,8 @@ def walk_subtree_worker(
         return [], errors
     except Exception as e:
         # Unexpected error - capture for debugging
-        error_msg = f"Unexpected error in worker for {subtree_path}: {type(e).__name__}: {e}"
+        error_msg = (
+            f"Unexpected error in worker for {subtree_path}: {type(e).__name__}: {e}"
+        )
         errors.append(error_msg)
         return [], errors

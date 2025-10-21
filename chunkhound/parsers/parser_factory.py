@@ -26,6 +26,7 @@ from chunkhound.parsers.mappings import (
     GoMapping,
     GroovyMapping,
     HaskellMapping,
+    HclMapping,
     JavaMapping,
     JavaScriptMapping,
     JsonMapping,
@@ -36,12 +37,15 @@ from chunkhound.parsers.mappings import (
     MatlabMapping,
     ObjCMapping,
     PDFMapping,
+    PHPMapping,
     PythonMapping,
     RustMapping,
+    SwiftMapping,
     TextMapping,
     TomlMapping,
     TSXMapping,
     TypeScriptMapping,
+    VueMapping,
     YamlMapping,
     ZigMapping,
 )
@@ -198,6 +202,33 @@ except ImportError:
     ts_objc = None
     OBJC_AVAILABLE = False
 
+try:
+    import tree_sitter_php as ts_php
+
+    PHP_AVAILABLE = True
+except ImportError:
+    ts_php = None
+    PHP_AVAILABLE = False
+
+try:
+    from tree_sitter_language_pack import get_language as _get_language_swift
+
+    _swift_lang = _get_language_swift("swift")
+    if _swift_lang:
+        # Create a module-like wrapper for compatibility with LanguageConfig
+        class _SwiftLanguageWrapper:
+            def language(self):
+                return _swift_lang
+
+        ts_swift = _SwiftLanguageWrapper()
+        SWIFT_AVAILABLE = True
+    else:
+        ts_swift = None
+        SWIFT_AVAILABLE = False
+except ImportError:
+    ts_swift = None
+    SWIFT_AVAILABLE = False
+
 if not HASKELL_AVAILABLE:
     try:
         from tree_sitter_language_pack import get_language as _get_language_haskell
@@ -238,6 +269,31 @@ try:
 except ImportError:
     ts_toml = None
     TOML_AVAILABLE = False
+
+# HCL (Terraform) language
+try:
+    import tree_sitter_hcl as ts_hcl
+
+    HCL_AVAILABLE = True
+except ImportError:
+    ts_hcl = None
+    HCL_AVAILABLE = False
+
+if not HCL_AVAILABLE:
+    try:
+        from tree_sitter_language_pack import get_language as _get_language_hcl
+
+        _hcl_lang = _get_language_hcl("hcl")
+        if _hcl_lang:
+
+            class _HclLanguageWrapper:
+                def language(self):
+                    return _hcl_lang
+
+            ts_hcl = _HclLanguageWrapper()
+            HCL_AVAILABLE = True
+    except ImportError:
+        pass
 
 try:
     import tree_sitter_markdown as ts_markdown
@@ -358,6 +414,11 @@ class LanguageConfig:
             lang_func = self.tree_sitter_module.language_javascript
             result = lang_func() if callable(lang_func) else lang_func
             return self._handle_language_result(result)
+        elif self.language_name == "php":
+            # PHP uses language_php instead of language
+            lang_func = self.tree_sitter_module.language_php
+            result = lang_func() if callable(lang_func) else lang_func
+            return self._handle_language_result(result)
         else:
             # Standard case - most tree-sitter modules use .language function
             lang_func = self.tree_sitter_module.language
@@ -399,9 +460,15 @@ LANGUAGE_CONFIGS: dict[Language, LanguageConfig] = {
         ts_matlab, MatlabMapping, MATLAB_AVAILABLE, "matlab"
     ),
     Language.OBJC: LanguageConfig(ts_objc, ObjCMapping, OBJC_AVAILABLE, "objc"),
+    Language.PHP: LanguageConfig(ts_php, PHPMapping, PHP_AVAILABLE, "php"),
+    Language.SWIFT: LanguageConfig(ts_swift, SwiftMapping, SWIFT_AVAILABLE, "swift"),
+    Language.VUE: LanguageConfig(
+        ts_typescript, VueMapping, TYPESCRIPT_AVAILABLE, "vue"
+    ),  # Vue uses TypeScript parser for script sections
     Language.JSON: LanguageConfig(ts_json, JsonMapping, JSON_AVAILABLE, "json"),
     Language.YAML: LanguageConfig(ts_yaml, YamlMapping, YAML_AVAILABLE, "yaml"),
     Language.TOML: LanguageConfig(ts_toml, TomlMapping, TOML_AVAILABLE, "toml"),
+    Language.HCL: LanguageConfig(ts_hcl, HclMapping, HCL_AVAILABLE, "hcl"),
     Language.MARKDOWN: LanguageConfig(
         ts_markdown, MarkdownMapping, MARKDOWN_AVAILABLE, "markdown"
     ),
@@ -475,11 +542,25 @@ EXTENSION_TO_LANGUAGE: dict[str, Language] = {
     # Note: .m is ambiguous, content detection used in File.from_path()
     ".m": Language.MATLAB,
     ".mm": Language.OBJC,
+    # PHP
+    ".php": Language.PHP,
+    ".phtml": Language.PHP,
+    ".php3": Language.PHP,
+    ".php4": Language.PHP,
+    ".php5": Language.PHP,
+    ".phps": Language.PHP,
+    # Swift
+    ".swift": Language.SWIFT,
+    ".swiftinterface": Language.SWIFT,
+    ".vue": Language.VUE,
     # Config & Data
     ".json": Language.JSON,
     ".yaml": Language.YAML,
     ".yml": Language.YAML,
     ".toml": Language.TOML,
+    ".hcl": Language.HCL,
+    ".tf": Language.HCL,
+    ".tfvars": Language.HCL,
     ".md": Language.MARKDOWN,
     ".markdown": Language.MARKDOWN,
     ".mdown": Language.MARKDOWN,
@@ -538,6 +619,12 @@ class ParserFactory:
             SetupError: If the required tree-sitter module is not available
             ValueError: If the language is not supported
         """
+        # Special case: Vue uses custom parser
+        if language == Language.VUE:
+            from chunkhound.parsers.vue_parser import VueParser
+
+            return VueParser(cast_config)
+
         # Use cache to avoid recreating parsers
         cache_key = language
         if cache_key in self._parser_cache:
