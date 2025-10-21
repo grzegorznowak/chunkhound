@@ -5,6 +5,7 @@ from typing import Any
 from loguru import logger
 
 from chunkhound.interfaces.llm_provider import LLMProvider
+from chunkhound.providers.llm.bedrock_llm_provider import BedrockLLMProvider
 from chunkhound.providers.llm.claude_code_cli_provider import ClaudeCodeCLIProvider
 from chunkhound.providers.llm.openai_llm_provider import OpenAILLMProvider
 
@@ -19,6 +20,7 @@ class LLMManager:
 
     # Registry of available providers
     _providers: dict[str, type[LLMProvider]] = {
+        "bedrock": BedrockLLMProvider,
         "openai": OpenAILLMProvider,
         "claude-code-cli": ClaudeCodeCLIProvider,
     }
@@ -63,14 +65,25 @@ class LLMManager:
         provider_class = self._providers[provider_name]
 
         try:
-            # Create provider with config
-            provider = provider_class(
-                api_key=config.get("api_key"),
-                model=config.get("model", "gpt-5-nano"),
-                base_url=config.get("base_url"),
-                timeout=config.get("timeout", 60),
-                max_retries=config.get("max_retries", 3),
-            )
+            # Create provider with config - handle provider-specific parameters
+            if provider_name == "bedrock":
+                provider = provider_class(
+                    model=config.get(
+                        "model", "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
+                    ),
+                    region=config.get("region"),
+                    timeout=config.get("timeout", 60),
+                    max_retries=config.get("max_retries", 3),
+                )
+            else:
+                # Standard parameters for OpenAI and Claude CLI
+                provider = provider_class(
+                    api_key=config.get("api_key"),
+                    model=config.get("model", "gpt-5-nano"),
+                    base_url=config.get("base_url"),
+                    timeout=config.get("timeout", 60),
+                    max_retries=config.get("max_retries", 3),
+                )
             return provider
         except Exception as e:
             logger.error(f"Failed to initialize LLM provider {provider_name}: {e}")
