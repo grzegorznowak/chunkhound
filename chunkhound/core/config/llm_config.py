@@ -41,8 +41,8 @@ class LLMConfig(BaseSettings):
     )
 
     # Provider Selection
-    provider: Literal["openai", "anthropic", "ollama", "claude-code-cli", "bedrock"] = Field(
-        default="openai", description="LLM provider (openai, anthropic, ollama, claude-code-cli, bedrock)"
+    provider: Literal["openai", "anthropic", "ollama", "claude-code-cli"] = Field(
+        default="openai", description="LLM provider (openai, anthropic, ollama, claude-code-cli)"
     )
 
     # Model Configuration (dual-model architecture)
@@ -62,10 +62,6 @@ class LLMConfig(BaseSettings):
 
     base_url: str | None = Field(
         default=None, description="Base URL for the LLM API"
-    )
-
-    region: str | None = Field(
-        default=None, description="AWS region for Bedrock (uses AWS_REGION env var if not specified)"
     )
 
     # Internal settings
@@ -111,10 +107,6 @@ class LLMConfig(BaseSettings):
         if self.base_url:
             base_config["base_url"] = self.base_url
 
-        # Add region if available (for AWS Bedrock)
-        if self.region:
-            base_config["region"] = self.region
-
         # Build utility config
         utility_config = base_config.copy()
         utility_config["model"] = self.utility_model or utility_default
@@ -143,13 +135,6 @@ class LLMConfig(BaseSettings):
         elif self.provider == "claude-code-cli":
             # Claude Code CLI: Haiku 4.5 for utility, Sonnet 4.5 for synthesis
             return ("claude-3-5-haiku-20241022", "claude-sonnet-4-5-20250929")
-        elif self.provider == "bedrock":
-            # AWS Bedrock: Haiku 3.5 for utility (cost), Sonnet 4.5 for synthesis (quality)
-            # Use US regional inference profiles for data residency
-            return (
-                "us.anthropic.claude-3-5-haiku-20241022-v1:0",
-                "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
-            )
         else:
             return ("gpt-5-nano", "gpt-5")
 
@@ -160,10 +145,9 @@ class LLMConfig(BaseSettings):
         Returns:
             True if provider is properly configured
         """
-        if self.provider in ("ollama", "claude-code-cli", "bedrock"):
+        if self.provider in ("ollama", "claude-code-cli"):
             # Ollama and Claude Code CLI don't require API key
             # Claude Code CLI uses subscription-based authentication
-            # Bedrock uses AWS credential chain (env vars, ~/.aws/credentials, IAM roles)
             return True
         else:
             # OpenAI and Anthropic require API key
@@ -178,7 +162,7 @@ class LLMConfig(BaseSettings):
         """
         missing = []
 
-        if self.provider not in ("ollama", "claude-code-cli", "bedrock") and not self.api_key:
+        if self.provider not in ("ollama", "claude-code-cli") and not self.api_key:
             missing.append("api_key (set CHUNKHOUND_LLM_API_KEY)")
 
         return missing
@@ -207,13 +191,8 @@ class LLMConfig(BaseSettings):
         )
 
         parser.add_argument(
-            "--llm-region",
-            help="AWS region for Bedrock (uses env var if not specified)",
-        )
-
-        parser.add_argument(
             "--llm-provider",
-            choices=["openai", "anthropic", "ollama", "claude-code-cli", "bedrock"],
+            choices=["openai", "anthropic", "ollama", "claude-code-cli"],
             help="LLM provider (default: openai)",
         )
 
@@ -226,8 +205,6 @@ class LLMConfig(BaseSettings):
             config["api_key"] = api_key
         if base_url := os.getenv("CHUNKHOUND_LLM_BASE_URL"):
             config["base_url"] = base_url
-        if region := os.getenv("CHUNKHOUND_LLM_REGION"):
-            config["region"] = region
         if provider := os.getenv("CHUNKHOUND_LLM_PROVIDER"):
             config["provider"] = provider
         if utility_model := os.getenv("CHUNKHOUND_LLM_UTILITY_MODEL"):
