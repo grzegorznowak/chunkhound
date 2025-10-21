@@ -455,6 +455,24 @@ class DeepResearchService:
         )
 
         # Step 9: Generate follow-up questions using LLM with adaptive budget
+        # Skip followup generation if we're at max depth (children would never be processed)
+        max_depth = self._calculate_max_depth()
+        if depth >= max_depth:
+            logger.debug(
+                f"Node '{node.query[:50]}...' at max depth {depth}/{max_depth}, "
+                f"skipping followup generation (no deeper exploration)"
+            )
+            await self._emit_event(
+                "node_complete",
+                f"Complete (leaf at max depth)",
+                node_id=node.node_id,
+                depth=depth,
+                files=len(file_contents),
+                chunks=len(chunks),
+                children=0,
+            )
+            return []
+
         await self._emit_event("llm_followup", "Generating follow-up questions", node_id=node.node_id, depth=depth)
 
         follow_ups = await self._generate_follow_up_questions(
