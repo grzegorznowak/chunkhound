@@ -37,6 +37,24 @@ def add_research_subparser(subparsers: Any) -> argparse.ArgumentParser:
         help="Directory path to research (default: current directory)",
     )
 
+    # Add mutually exclusive depth mode flags
+    depth_group = research_parser.add_mutually_exclusive_group()
+    depth_group.add_argument(
+        "--shallow",
+        dest="depth",
+        action="store_const",
+        const="shallow",
+        help="Quick insights and key patterns (default)",
+    )
+    depth_group.add_argument(
+        "--deep",
+        dest="depth",
+        action="store_const",
+        const="deep",
+        help="Comprehensive architectural analysis",
+    )
+    research_parser.set_defaults(depth="shallow")
+
     # Add common arguments
     add_common_arguments(research_parser)
 

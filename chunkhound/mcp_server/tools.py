@@ -11,7 +11,7 @@ across server types.
 import json
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, TypedDict, cast
+from typing import Any, Literal, TypedDict, cast
 
 try:
     from typing import NotRequired  # type: ignore[attr-defined]
@@ -313,6 +313,7 @@ async def deep_research_impl(
     llm_manager: LLMManager,
     query: str,
     progress: Any = None,
+    depth: Literal["shallow", "deep"] = "shallow",
 ) -> dict[str, Any]:
     """Core deep research implementation.
 
@@ -322,12 +323,14 @@ async def deep_research_impl(
         llm_manager: LLM manager instance
         query: Research query
         progress: Optional Rich Progress instance for terminal UI (None for MCP)
+        depth: Research depth mode: "shallow" for quick insights, "deep" for comprehensive analysis
 
     Returns:
         Dict with answer, follow_up_suggestions, and metadata
 
     Raises:
         Exception: If LLM or reranker not configured
+        ValueError: If depth is not "shallow" or "deep"
     """
     # Validate LLM is configured
     if not llm_manager or not llm_manager.is_configured():
@@ -364,7 +367,7 @@ async def deep_research_impl(
     )
 
     # Perform code research
-    result = await research_service.deep_research(query)
+    result = await research_service.deep_research(query, depth=depth)
 
     return result
 
@@ -495,6 +498,12 @@ TOOL_DEFINITIONS = [
                     "description": "Research query to investigate",
                     "type": "string",
                 },
+                "depth": {
+                    "description": "Research depth: 'shallow' for quick insights and key patterns, 'deep' for comprehensive architectural analysis",
+                    "type": "string",
+                    "enum": ["shallow", "deep"],
+                    "default": "shallow",
+                },
             },
             "required": ["query"],
             "type": "object",
@@ -582,6 +591,7 @@ async def execute_tool(
             embedding_manager=embedding_manager,
             llm_manager=llm_manager,
             query=arguments["query"],
+            depth=arguments.get("depth", "shallow"),
         )
         # Return raw markdown string
         return result.get("answer", f"Research incomplete: Unable to analyze '{arguments['query']}'. Try a more specific query or check that relevant code exists.")
