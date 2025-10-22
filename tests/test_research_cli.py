@@ -197,3 +197,129 @@ class TestResearchCLIRequirements:
                 or "llm" in error_output.lower()
                 or "embedding" in error_output.lower()
             ), f"Error should mention missing configuration, got: {error_output}"
+
+
+class TestResearchDepthFlags:
+    """Test research CLI depth mode flags (--shallow and --deep)."""
+
+    def test_shallow_flag_in_help(self):
+        """Test that --shallow flag appears in help."""
+        result = subprocess.run(
+            ["uv", "run", "chunkhound", "research", "--help"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            env=get_safe_subprocess_env(),
+        )
+
+        assert result.returncode == 0, f"Help command failed: {result.stderr}"
+        assert "--shallow" in result.stdout, "Help should show --shallow flag"
+        assert (
+            "quick insights" in result.stdout.lower()
+            or "shallow" in result.stdout.lower()
+        ), "Help should describe shallow mode"
+
+    def test_deep_flag_in_help(self):
+        """Test that --deep flag appears in help."""
+        result = subprocess.run(
+            ["uv", "run", "chunkhound", "research", "--help"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            env=get_safe_subprocess_env(),
+        )
+
+        assert result.returncode == 0, f"Help command failed: {result.stderr}"
+        assert "--deep" in result.stdout, "Help should show --deep flag"
+        assert (
+            "comprehensive" in result.stdout.lower()
+            or "architectural" in result.stdout.lower()
+        ), "Help should describe deep mode"
+
+    def test_shallow_and_deep_mutually_exclusive(self):
+        """Test that --shallow and --deep cannot be used together."""
+        result = subprocess.run(
+            [
+                "uv",
+                "run",
+                "chunkhound",
+                "research",
+                "test query",
+                "--shallow",
+                "--deep",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            env=get_safe_subprocess_env(),
+        )
+
+        # Should fail because flags are mutually exclusive
+        assert result.returncode != 0, "Should fail when both flags are used"
+        error_output = result.stderr + result.stdout
+        assert (
+            "mutually exclusive" in error_output.lower()
+            or "not allowed" in error_output.lower()
+        ), f"Should indicate mutual exclusivity, got: {error_output}"
+
+    def test_shallow_flag_accepted(self):
+        """Test that --shallow flag is accepted by parser."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            empty_dir = Path(temp_dir) / "empty_project"
+            empty_dir.mkdir()
+
+            result = subprocess.run(
+                [
+                    "uv",
+                    "run",
+                    "chunkhound",
+                    "research",
+                    "test query",
+                    "--shallow",
+                    "--config",
+                    "/nonexistent/config.json",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                env=get_safe_subprocess_env(),
+                cwd=empty_dir,
+            )
+
+            # Should fail for other reasons (no database), but flag should be accepted
+            # If flag wasn't accepted, we'd get "unrecognized arguments" error
+            error_output = result.stderr + result.stdout
+            assert (
+                "unrecognized arguments: --shallow" not in error_output
+            ), "Flag --shallow should be recognized"
+
+    def test_deep_flag_accepted(self):
+        """Test that --deep flag is accepted by parser."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            empty_dir = Path(temp_dir) / "empty_project"
+            empty_dir.mkdir()
+
+            result = subprocess.run(
+                [
+                    "uv",
+                    "run",
+                    "chunkhound",
+                    "research",
+                    "test query",
+                    "--deep",
+                    "--config",
+                    "/nonexistent/config.json",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                env=get_safe_subprocess_env(),
+                cwd=empty_dir,
+            )
+
+            # Should fail for other reasons (no database), but flag should be accepted
+            # If flag wasn't accepted, we'd get "unrecognized arguments" error
+            error_output = result.stderr + result.stdout
+            assert (
+                "unrecognized arguments: --deep" not in error_output
+            ), "Flag --deep should be recognized"
