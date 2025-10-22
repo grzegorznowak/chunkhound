@@ -5,7 +5,7 @@ import math
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, TYPE_CHECKING
+from typing import Any, Literal, TYPE_CHECKING
 
 from loguru import logger
 
@@ -50,6 +50,20 @@ LEAF_ANSWER_TOKENS_BONUS = 3_000    # Additional tokens for deeper leaves (was 5
 INTERNAL_ROOT_TARGET = 11_000       # Root synthesis target (was 17.5k, reduced for cost)
 INTERNAL_MAX_TOKENS = 19_000        # Maximum for deep internal nodes (was 32k, reduced for cost)
 
+# Follow-up question generation output budget (what LLM generates for follow-up questions)
+# NOTE: High budgets needed for reasoning models (o1/o3/GPT-5) which use internal "thinking" tokens
+# WHY: Reasoning models consume 5-15k tokens for internal reasoning before producing 100-500 tokens of output
+# The actual generated questions are concise, but the model needs reasoning budget to evaluate relevance
+FOLLOWUP_OUTPUT_TOKENS_MIN = 8_000   # Root/shallow nodes: simpler questions, less reasoning needed
+FOLLOWUP_OUTPUT_TOKENS_MAX = 15_000  # Deep nodes: complex synthesis requires more reasoning depth
+
+# Utility operation output budgets (for reasoning models like o1/o3/GPT-5)
+# These operations use utility provider and don't vary by depth
+# WHY: Each utility operation produces small output but requires reasoning budget for quality
+QUERY_EXPANSION_TOKENS = 10_000      # Generate 2 queries (~200 output + ~8k reasoning to ensure diversity)
+QUESTION_SYNTHESIS_TOKENS = 15_000   # Synthesize to 1-3 questions (~500 output + ~12k reasoning for quality)
+QUESTION_FILTERING_TOKENS = 5_000    # Filter by relevance (~50 output + ~4k reasoning for accuracy)
+
 # Legacy constants (used when ENABLE_ADAPTIVE_BUDGETS = False)
 TOKEN_BUDGET_PER_FILE = 4000
 EXTRA_CONTEXT_TOKENS = 1000
@@ -60,10 +74,17 @@ MAX_SYNTHESIS_TOKENS = 600
 
 # Single-pass synthesis constants (new architecture)
 SINGLE_PASS_MAX_TOKENS = 150_000  # Total budget for single-pass synthesis (input + output)
-SINGLE_PASS_OUTPUT_TOKENS = 30_000  # Target/max tokens for synthesis output
+OUTPUT_TOKENS_WITH_REASONING = 30_000  # Fixed token limit (18k output + 12k reasoning buffer for GPT-5/Gemini 2.5)
 SINGLE_PASS_OVERHEAD_TOKENS = 5_000  # Prompt template and overhead
 SINGLE_PASS_TIMEOUT_SECONDS = 600  # 10 minutes timeout for large synthesis calls
 # Available for code/chunks: 150k - 30k - 5k = 115k tokens
+
+# Target output lengths (controlled via prompt instructions, not API token limits)
+# WHY: Both modes use OUTPUT_TOKENS_WITH_REASONING (30k) for API, but prompts guide output length
+# This allows reasoning models to use thinking tokens while producing appropriately sized output
+SHALLOW_TARGET_WORDS = 1_500    # Concise insights for shallow mode (~2k tokens) - daily use
+SHALLOW_TARGET_TOKENS = 10_000  # Target for shallow: quick, focused answers
+DEEP_TARGET_TOKENS = 20_000     # Target for deep: comprehensive, detailed analysis
 
 # Output control
 REQUIRE_CITATIONS = True  # Validate file:line format
@@ -177,26 +198,52 @@ class DeepResearchService:
                 metadata=metadata,
             )
 
-    async def deep_research(self, query: str) -> dict[str, Any]:
+    async def deep_research(self, query: str, depth: Literal["shallow", "deep"] = "shallow") -> dict[str, Any]:
         """Perform deep research on a query.
 
         Removed user-facing follow-up suggestions from output for cleaner responses.
         Internal BFS exploration still generates follow-ups to drive multi-level search.
 
         Args:
-            query: Research query
+            query: Research question to investigate
+            depth: Research depth mode controlling exploration breadth and output detail:
+                - "shallow" (default): Quick insights for daily use
+                  * BFS max_depth=1 (2 levels: root query + immediate follow-ups)
+                  * Output limited to 10k tokens (plus sources footer)
+                  * Faster responses, lower API costs
+                  * Good for: quick lookups, focused questions, day-to-day development
+                - "deep": Comprehensive architectural analysis
+                  * BFS max_depth adaptive (2-4 levels based on repository size)
+                  * Output up to 20k tokens (plus sources footer)
+                  * Thorough exploration, higher API costs
+                  * Good for: architecture reviews, complex debugging, unfamiliar codebases
 
         Returns:
             Dictionary with answer and metadata (no follow_up_suggestions)
+
+        Raises:
+            ValueError: If depth is not "shallow" or "deep"
         """
-        logger.info(f"Starting deep research for query: '{query}'")
+        # Validate depth parameter
+        if depth not in ("shallow", "deep"):
+            raise ValueError(f"Invalid depth '{depth}'. Must be 'shallow' or 'deep'")
+
+        logger.info(f"Starting deep research for query: '{query}' (depth={depth})")
 
         # Emit main start event
         await self._emit_event("main_start", f"Starting deep research: {query[:60]}...")
 
         # Calculate max depth based on repository size
-        max_depth = self._calculate_max_depth()
-        logger.info(f"Max depth for this repository: {max_depth}")
+        max_depth = self._calculate_max_depth(depth=depth)
+        logger.info(f"Max depth for this repository: {max_depth} (depth={depth})")
+
+        # Emit mode info for user awareness
+        mode_label = "shallow (quick insights)" if depth == "shallow" else "deep (comprehensive)"
+        target = f"~{SHALLOW_TARGET_TOKENS//1000}k tokens" if depth == "shallow" else f"~{DEEP_TARGET_TOKENS//1000}k tokens"
+        await self._emit_event(
+            "main_info",
+            f"Mode: {mode_label}, max_depth: {max_depth}, target: {target}"
+        )
 
         # Emit depth info event
         await self._emit_event("main_info", f"Max depth: {max_depth}", max_depth=max_depth)
@@ -250,7 +297,7 @@ class DeepResearchService:
 
             # Process all nodes concurrently
             node_tasks = [
-                self._process_bfs_node(node, node_ctx, depth, global_explored_data)
+                self._process_bfs_node(node, node_ctx, depth, global_explored_data, max_depth)
                 for node, node_ctx in node_contexts
             ]
             children_lists = await asyncio.gather(*node_tasks, return_exceptions=True)
@@ -299,7 +346,7 @@ class DeepResearchService:
         # Manage token budget for single-pass synthesis
         prioritized_chunks, budgeted_files, budget_info = (
             self._manage_token_budget_for_synthesis(
-                aggregated["chunks"], aggregated["files"]
+                aggregated["chunks"], aggregated["files"], depth
             )
         )
 
@@ -317,6 +364,7 @@ class DeepResearchService:
             chunks=prioritized_chunks,
             files=budgeted_files,
             context=context,
+            depth=depth,
         )
 
         # Emit validating event
@@ -358,7 +406,12 @@ class DeepResearchService:
         }
 
     async def _process_bfs_node(
-        self, node: BFSNode, context: ResearchContext, depth: int, global_explored_data: dict[str, Any]
+        self,
+        node: BFSNode,
+        context: ResearchContext,
+        depth: int,
+        global_explored_data: dict[str, Any],
+        max_depth: int,
     ) -> list[BFSNode]:
         """Process a single BFS node.
 
@@ -367,6 +420,7 @@ class DeepResearchService:
             context: Research context
             depth: Current depth in graph
             global_explored_data: Global state tracking all explored chunks/files across entire BFS
+            max_depth: Maximum depth for BFS traversal (used for adaptive budgets)
 
         Returns:
             List of child nodes (follow-up questions)
@@ -383,7 +437,7 @@ class DeepResearchService:
         )
 
         # Calculate adaptive token budgets for this node (assume leaf initially)
-        max_depth = self._calculate_max_depth()
+        # Use max_depth passed from deep_research() to respect shallow mode
         node.token_budgets = self._get_adaptive_token_budgets(
             depth=depth, max_depth=max_depth, is_leaf=True
         )
@@ -456,7 +510,7 @@ class DeepResearchService:
 
         # Step 9: Generate follow-up questions using LLM with adaptive budget
         # Skip followup generation if we're at max depth (children would never be processed)
-        max_depth = self._calculate_max_depth()
+        # Use max_depth passed from deep_research() to respect shallow mode
         if depth >= max_depth:
             logger.debug(
                 f"Node '{node.query[:50]}...' at max depth {depth}/{max_depth}, "
@@ -482,6 +536,8 @@ class DeepResearchService:
             chunks,
             global_explored_data,
             max_input_tokens=node.token_budgets["llm_input_tokens"],
+            depth=depth,
+            max_depth=max_depth,
         )
 
         # Emit follow-up generation results
@@ -615,12 +671,16 @@ Requirements:
 - Different semantic angles of the same question
 - Concise (1-2 sentences max per query)"""
 
+        logger.debug(
+            f"Query expansion budget: {QUERY_EXPANSION_TOKENS:,} tokens (model: {llm.model})"
+        )
+
         try:
             result = await llm.complete_structured(
                 prompt=prompt,
                 json_schema=schema,
                 system=system,
-                max_completion_tokens=2500
+                max_completion_tokens=QUERY_EXPANSION_TOKENS
             )
 
             expanded = result.get("queries", [])
@@ -1208,12 +1268,17 @@ Requirements:
                 logger.warning(f"Failed to read file {file_path}: {e}")
                 continue
 
-        # Validate that at least some files were loaded if chunks were provided
+        # FAIL-FAST: Validate that at least some files were loaded if chunks were provided
+        # This prevents silent data loss where searches find chunks but synthesis gets no code
         if chunks and not file_contents:
             raise RuntimeError(
-                f"Failed to load ANY files from {len(files_to_chunks)} unique paths. "
-                f"Check base_directory configuration and file paths in database. "
-                f"Base directory: {base_dir}"
+                f"DATA LOSS DETECTED: Found {len(chunks)} chunks across {len(files_to_chunks)} files "
+                f"but failed to read ANY file contents. "
+                f"Possible causes: "
+                f"(1) Token budget exhausted ({budget_limit:,} tokens insufficient), "
+                f"(2) Files not found at base_directory: {base_dir}, "
+                f"(3) All file read operations failed. "
+                f"Check logs above for file-specific errors."
             )
 
         logger.debug(
@@ -1342,44 +1407,34 @@ Requirements:
                 global_explored_data["chunks"].append(chunk)
 
     def _build_exploration_gist(self, global_explored_data: dict[str, Any]) -> str | None:
-        """Build compact file/symbol inventory from global exploration.
+        """Build markdown tree view of explored files and chunks.
 
-        Optimized for LLM caching:
-        - Sorted alphabetically (stable prefix)
-        - Append-only compatible
-        - ~5-10 tokens per file
+        Uses the same format as the final synthesis sources footer for consistency.
+        Shows explored files in a tree structure with chunk line ranges.
 
         Args:
             global_explored_data: Global state with chunks list
 
         Returns:
-            Compact string listing explored files and symbols, or None if no exploration yet
+            Markdown tree structure of explored files and chunks, or None if no exploration yet
         """
-        # Group chunks by file and collect symbols
-        file_symbols: dict[str, set[str]] = {}
-        for chunk in global_explored_data["chunks"]:
-            file_path = chunk.get("file_path")
-            symbol = chunk.get("symbol", "")
-            if file_path:
-                file_symbols.setdefault(file_path, set()).add(symbol)
-
-        if not file_symbols:
+        chunks = global_explored_data["chunks"]
+        if not chunks:
             return None  # No exploration yet - skip gist section entirely
 
-        # Sort for LLM cache stability
-        sorted_files = sorted(file_symbols.items())
+        # Extract unique files from chunks (we don't need content, just the list)
+        files = {chunk.get("file_path"): "" for chunk in chunks if chunk.get("file_path")}
 
-        # Format compactly
-        lines = []
-        for file_path, symbols in sorted_files[:25]:  # Limit to 25 files
-            symbol_list = sorted(s for s in symbols if s)[:5]  # Top 5 symbols
-            symbols_str = ", ".join(symbol_list) if symbol_list else "general"
-            lines.append(f"✓ {file_path}: {symbols_str}")
+        if not files:
+            return None
 
-        if len(sorted_files) > 25:
-            lines.append(f"... +{len(sorted_files) - 25} more files")
+        # Reuse the sources footer builder for consistent formatting
+        # This creates a markdown tree structure with chunk line ranges
+        footer = self._build_sources_footer(chunks, files)
 
-        return "\n".join(lines)
+        # Return just the tree portion (skip "---" separator at the start)
+        # Keep the "## Sources" header and the tree
+        return footer
 
     def _is_chunk_duplicate(
         self,
@@ -1480,6 +1535,8 @@ Requirements:
         chunks: list[dict[str, Any]],
         global_explored_data: dict[str, Any],
         max_input_tokens: int | None = None,
+        depth: int = 0,
+        max_depth: int = 1,
     ) -> list[str]:
         """Generate follow-up questions using LLM.
 
@@ -1490,6 +1547,8 @@ Requirements:
             chunks: Chunks found
             global_explored_data: Global state with all explored chunks/files
             max_input_tokens: Maximum tokens for LLM input (uses adaptive budget if provided)
+            depth: Current depth in BFS traversal
+            max_depth: Maximum depth for this codebase
 
         Returns:
             List of follow-up questions
@@ -1590,12 +1649,23 @@ Generate 0-{MAX_FOLLOWUP_QUESTIONS} follow-up questions about {target_instructio
 
 Use exact function/class/file names. If code fully answers the question, return fewer questions or empty array."""
 
+        # Calculate adaptive output budget (scales 3k → 8k with depth)
+        depth_ratio = depth / max(max_depth, 1)
+        max_output_tokens = int(
+            FOLLOWUP_OUTPUT_TOKENS_MIN
+            + (FOLLOWUP_OUTPUT_TOKENS_MAX - FOLLOWUP_OUTPUT_TOKENS_MIN) * depth_ratio
+        )
+        logger.debug(
+            f"Follow-up generation budget: {max_output_tokens:,} tokens "
+            f"(depth {depth}/{max_depth}, ratio {depth_ratio:.2f})"
+        )
+
         try:
             result = await llm.complete_structured(
                 prompt=prompt,
                 json_schema=schema,
                 system=system,
-                max_completion_tokens=3000
+                max_completion_tokens=max_output_tokens
             )
 
             questions = result.get("questions", [])
@@ -1706,12 +1776,16 @@ Output: {{"reasoning": "Input questions cover validation details but miss archit
 
 Generate your synthesized questions now (minimum 1, maximum {target_count})."""
 
+        logger.debug(
+            f"Question synthesis budget: {QUESTION_SYNTHESIS_TOKENS:,} tokens (model: {llm.model})"
+        )
+
         try:
             result = await llm.complete_structured(
                 prompt=prompt,
                 json_schema=schema,
                 system=system,
-                max_completion_tokens=4000
+                max_completion_tokens=QUESTION_SYNTHESIS_TOKENS
             )
 
             reasoning = result.get("reasoning", "")
@@ -1791,10 +1865,44 @@ Generate your synthesized questions now (minimum 1, maximum {target_count})."""
 
         # Aggregate files (deduplicate by file_path)
         files_map: dict[str, str] = {}
+        nodes_with_data_loss: list[str] = []  # Track nodes with chunks but no files
+
         for node in all_nodes:
+            # Detect data loss: node has chunks but no file_contents
+            if node.chunks and not node.file_contents:
+                query_preview = node.query[:50] + "..." if len(node.query) > 50 else node.query
+                nodes_with_data_loss.append(query_preview)
+
             for file_path, content in node.file_contents.items():
                 if file_path not in files_map:
                     files_map[file_path] = content
+
+        # FAIL-FAST: If ALL nodes lost data (chunks exist but no files aggregated), raise error
+        # This catches cascading failures from file reading errors
+        if chunks_map and not files_map:
+            logger.error(
+                f"DATA LOSS: Aggregation found {len(chunks_map)} unique chunks "
+                f"but ZERO files across {len(all_nodes)} nodes. "
+                f"Nodes with data loss: {nodes_with_data_loss}"
+            )
+            raise RuntimeError(
+                f"Complete data loss during aggregation: "
+                f"Found {len(chunks_map)} chunks but failed to read ANY files. "
+                f"{len(nodes_with_data_loss)} nodes had chunks but empty file_contents. "
+                f"This indicates file reading failed for all nodes - check token budgets and file paths. "
+                f"Failed queries: {', '.join(nodes_with_data_loss[:5])}"
+                + (f" and {len(nodes_with_data_loss) - 5} more" if len(nodes_with_data_loss) > 5 else "")
+            )
+
+        # WARN: If SOME nodes lost data (partial data loss), log warning but continue
+        if nodes_with_data_loss:
+            logger.warning(
+                f"Partial data loss: {len(nodes_with_data_loss)}/{len(all_nodes)} nodes "
+                f"found chunks but failed to read files. "
+                f"Synthesis will proceed with {len(files_map)} files from successful nodes. "
+                f"Failed queries: {', '.join(nodes_with_data_loss[:3])}"
+                + (f" and {len(nodes_with_data_loss) - 3} more" if len(nodes_with_data_loss) > 3 else "")
+            )
 
         # Calculate statistics
         total_chunks_found = sum(len(node.chunks) for node in all_nodes)
@@ -1830,7 +1938,7 @@ Generate your synthesized questions now (minimum 1, maximum {target_count})."""
         }
 
     def _manage_token_budget_for_synthesis(
-        self, chunks: list[dict[str, Any]], files: dict[str, str]
+        self, chunks: list[dict[str, Any]], files: dict[str, str], depth: str = "shallow"
     ) -> tuple[list[dict[str, Any]], dict[str, str], dict[str, Any]]:
         """Manage token budget to fit within SINGLE_PASS_MAX_TOKENS limit.
 
@@ -1841,17 +1949,22 @@ Generate your synthesized questions now (minimum 1, maximum {target_count})."""
         Args:
             chunks: All chunks from BFS traversal
             files: All file contents from BFS traversal
+            depth: Research depth mode - affects output token allocation
 
         Returns:
             Tuple of (prioritized_chunks, budgeted_files, budget_info)
         """
         llm = self._llm_manager.get_utility_provider()
 
+        # Use fixed output token budget (sufficient for reasoning models)
+        # Actual output length is controlled by prompt instructions, not token limits
+        output_tokens = OUTPUT_TOKENS_WITH_REASONING
+
         # Calculate available tokens for code content
         # Total budget - output budget - overhead = input budget
         available_tokens = (
             SINGLE_PASS_MAX_TOKENS
-            - SINGLE_PASS_OUTPUT_TOKENS
+            - output_tokens
             - SINGLE_PASS_OVERHEAD_TOKENS
         )
 
@@ -1962,24 +2075,54 @@ Generate your synthesized questions now (minimum 1, maximum {target_count})."""
         chunks: list[dict[str, Any]],
         files: dict[str, str],
         context: ResearchContext,
+        depth: str = "shallow",
     ) -> str:
         """Perform single-pass synthesis with all aggregated data.
 
         Uses modern LLM large context windows to synthesize answer from complete
         data in one pass, avoiding information loss from progressive compression.
 
+        Token Budget:
+            - The max_output_tokens limit applies only to the LLM-generated content
+            - A sources footer is appended AFTER synthesis (outside the token budget)
+            - Total output = LLM content (10k/20k tokens) + sources footer (~100-500 tokens)
+            - Footer size scales with number of files/chunks analyzed
+
         Args:
             root_query: Original research query
             chunks: Prioritized chunks from BFS traversal
             files: Budgeted file contents
             context: Research context
+            depth: Research depth mode - "shallow" for quick insights (10k tokens),
+                "deep" for comprehensive analysis (20k tokens)
 
         Returns:
-            Synthesized answer from single LLM call
+            Synthesized answer from single LLM call with appended sources footer
         """
-        logger.info(f"Starting single-pass synthesis with {len(files)} files, {len(chunks)} chunks")
+        # Use fixed token limit (sufficient for reasoning models)
+        # Actual output length controlled by prompt instructions
+        max_output_tokens = OUTPUT_TOKENS_WITH_REASONING
+
+        logger.info(
+            f"Starting single-pass synthesis with {len(files)} files, {len(chunks)} chunks "
+            f"(depth={depth}, token_limit={max_output_tokens:,})"
+        )
 
         llm = self._llm_manager.get_synthesis_provider()
+
+        # SAFETY NET: Final validation before synthesis
+        # This should never happen due to earlier validations, but catch it just in case
+        if not files:
+            logger.error(
+                f"Synthesis called with empty files dict despite {len(chunks)} chunks. "
+                "This indicates a bug in aggregation or budget management."
+            )
+            raise RuntimeError(
+                f"Cannot synthesize answer: no code context available. "
+                f"Found {len(chunks)} chunks but received 0 files for synthesis. "
+                f"This is a bug - earlier validation should have caught this. "
+                f"Check aggregation and budget management logs."
+            )
 
         # Build code context sections
         code_sections = []
@@ -2012,13 +2155,28 @@ Generate your synthesized questions now (minimum 1, maximum {target_count})."""
 
         code_context = "\n\n".join(code_sections)
 
+        # Build output guidance based on research depth
+        if depth == "shallow":
+            output_guidance = (
+                f"**Target Output:** Provide a concise, focused analysis of approximately "
+                f"{SHALLOW_TARGET_WORDS:,} words (~{SHALLOW_TARGET_TOKENS:,} tokens). "
+                f"Prioritize key insights and essential architectural understanding. "
+                f"Be direct and to-the-point while maintaining technical accuracy."
+            )
+        else:  # deep
+            output_guidance = (
+                f"**Target Output:** Provide a comprehensive, detailed analysis of approximately "
+                f"{DEEP_TARGET_TOKENS:,} tokens. Cover all relevant architectural layers, "
+                f"component interactions, and implementation details with thorough explanations."
+            )
+
         # Build comprehensive synthesis prompt (adapted from Code Expert methodology)
         system = f"""You are an expert code researcher with deep experience across all software domains. Your mission is comprehensive code analysis - synthesizing the complete codebase picture to answer the research question with full architectural understanding.
 
 **Context:**
 You have access to the COMPLETE set of code discovered during BFS exploration. This is not a discovery phase - all relevant code has been found and is provided to you. Your task is to synthesize this complete picture into a comprehensive answer. Start with the architectural big picture, then provide detailed component analysis.
 
-**Target Output:** {SINGLE_PASS_OUTPUT_TOKENS:,} tokens of comprehensive, factual analysis.
+{output_guidance}
 
 **Analysis Methodology:**
 
@@ -2137,18 +2295,50 @@ Extract specific constants, counts, and measurements with their variable names a
 
         logger.info(
             f"Calling LLM for single-pass synthesis "
-            f"(max_completion_tokens={SINGLE_PASS_OUTPUT_TOKENS:,}, "
+            f"(max_completion_tokens={max_output_tokens:,}, "
             f"timeout={SINGLE_PASS_TIMEOUT_SECONDS}s)"
         )
 
         response = await llm.complete(
             prompt,
             system=system,
-            max_completion_tokens=SINGLE_PASS_OUTPUT_TOKENS,
+            max_completion_tokens=max_output_tokens,
             timeout=SINGLE_PASS_TIMEOUT_SECONDS,
         )
 
         answer = response.content
+
+        # Validate synthesis response
+        answer_length = len(answer.strip()) if answer else 0
+        logger.info(
+            f"LLM synthesis response: length={answer_length}, "
+            f"finish_reason={response.finish_reason}"
+        )
+
+        # Minimum threshold for valid synthesis (excluding footer)
+        MIN_SYNTHESIS_LENGTH = 100  # Chars, not tokens
+
+        if answer_length < MIN_SYNTHESIS_LENGTH:
+            logger.error(
+                f"Synthesis returned suspiciously short answer: {answer_length} chars "
+                f"(minimum: {MIN_SYNTHESIS_LENGTH}, finish_reason={response.finish_reason})"
+            )
+            raise RuntimeError(
+                f"LLM synthesis failed: generated only {answer_length} characters "
+                f"(minimum: {MIN_SYNTHESIS_LENGTH}). finish_reason={response.finish_reason}. "
+                "This indicates an LLM error, content filter, or model refusal."
+            )
+
+        # Append sources footer with file and chunk information
+        try:
+            footer = self._build_sources_footer(chunks, files)
+            if footer:
+                answer = f"{answer}\n\n{footer}"
+        except Exception as e:
+            logger.warning(
+                f"Failed to generate sources footer: {e}. "
+                "Continuing without footer."
+            )
 
         logger.info(
             f"Single-pass synthesis complete: {llm.estimate_tokens(answer):,} tokens generated"
@@ -2296,20 +2486,167 @@ Extract specific constants, counts, and measurements with their variable names a
         citations = re.findall(citation_pattern, answer)
 
         if not citations and chunks:
-            # Answer missing citations - warn and append key files
-            logger.warning("LLM answer missing file:line citations")
-            key_files = set()
-            for chunk in chunks[:5]:  # Top 5 chunks
-                file_path = chunk.get('file_path', '')
-                line = chunk.get('start_line', '')
-                if file_path and line:
-                    key_files.add(f"{file_path}:{line}")
+            # Answer missing inline citations - footer provides separate comprehensive listing
+            answer_length = len(answer.strip())
 
-            if key_files:
-                answer += "\n\n**Key files referenced:**\n"
-                answer += "\n".join(f"- {f}" for f in sorted(key_files))
+            # Enhanced warning with context
+            if answer_length == 0:
+                logger.warning(
+                    "LLM answer is EMPTY - this indicates an LLM error. "
+                    "Should have been caught by synthesis validation."
+                )
+            elif answer_length < 200:
+                logger.warning(
+                    f"LLM answer suspiciously short ({answer_length} chars) and missing "
+                    f"file:line citations in analysis body"
+                )
+            else:
+                logger.warning(
+                    f"LLM answer missing file:line citations in analysis body "
+                    f"(answer_length={answer_length} chars)"
+                )
 
         return answer
+
+    def _build_sources_footer(
+        self, chunks: list[dict[str, Any]], files: dict[str, str]
+    ) -> str:
+        """Build footer section with source file and chunk information.
+
+        Creates a compact nested tree of analyzed files with chunk line ranges,
+        optimized for token efficiency (using tabs) and readability.
+
+        Args:
+            chunks: List of chunks used in synthesis
+            files: Dictionary of files used in synthesis (file_path -> content)
+
+        Returns:
+            Formatted markdown footer with source information
+
+        Examples:
+            >>> chunks = [
+            ...     {"file_path": "src/main.py", "start_line": 10, "end_line": 25},
+            ...     {"file_path": "src/main.py", "start_line": 50, "end_line": 75},
+            ...     {"file_path": "tests/test.py", "start_line": 5, "end_line": 15}
+            ... ]
+            >>> files = {"src/main.py": "...", "tests/test.py": "..."}
+            >>> footer = service._build_sources_footer(chunks, files)
+            >>> print(footer)
+            ---
+
+            ## Sources
+
+            **Files**: 2 | **Chunks**: 3
+
+            ├── src/
+            │	└── main.py (2 chunks: L10-25, L50-75)
+            └── tests/
+            	└── test.py (1 chunks: L5-15)
+        """
+        if not files and not chunks:
+            return ""
+
+        # Group chunks by file
+        chunks_by_file: dict[str, list[dict[str, Any]]] = {}
+        for chunk in chunks:
+            file_path = chunk.get("file_path", "unknown")
+            if file_path not in chunks_by_file:
+                chunks_by_file[file_path] = []
+            chunks_by_file[file_path].append(chunk)
+
+        # Build footer header
+        footer_lines = [
+            "---",
+            "",
+            "## Sources",
+            "",
+            f"**Files**: {len(files)} | **Chunks**: {len(chunks)}",
+            "",
+        ]
+
+        # Build tree structure
+        class TreeNode:
+            def __init__(self, name: str):
+                self.name = name
+                self.children: dict[str, TreeNode] = {}
+                self.is_file = False
+                self.full_path = ""
+
+        root = TreeNode("")
+
+        for file_path in sorted(files.keys()):
+            parts = file_path.split("/")
+            current = root
+            path_so_far = []
+
+            for part in parts:
+                path_so_far.append(part)
+                if part not in current.children:
+                    node = TreeNode(part)
+                    node.full_path = "/".join(path_so_far)
+                    current.children[part] = node
+                current = current.children[part]
+
+            current.is_file = True
+
+        # Render tree recursively
+        def render_node(node: TreeNode, prefix: str = "", is_last: bool = True) -> None:
+            if node.name:  # Skip root
+                # Build connector
+                connector = "└── " if is_last else "├── "
+                display_name = node.name
+
+                # Add / suffix for directories
+                if not node.is_file and node.children:
+                    display_name += "/"
+
+                line = f"{prefix}{connector}{display_name}"
+
+                # Add chunk info for files
+                if node.is_file:
+                    if node.full_path in chunks_by_file:
+                        file_chunks = chunks_by_file[node.full_path]
+                        chunk_count = len(file_chunks)
+
+                        # Get line ranges
+                        ranges = []
+                        for chunk in sorted(file_chunks, key=lambda c: c.get("start_line", 0)):
+                            start = chunk.get("start_line", "?")
+                            end = chunk.get("end_line", "?")
+                            ranges.append(f"L{start}-{end}")
+
+                        # Compact format: show first 3 ranges + count if more
+                        if len(ranges) <= 3:
+                            range_str = ", ".join(ranges)
+                        else:
+                            range_str = f"{', '.join(ranges[:3])}, +{len(ranges) - 3} more"
+
+                        line += f" ({chunk_count} chunks: {range_str})"
+                    else:
+                        # Full file analyzed without specific chunks
+                        line += " (full file)"
+
+                footer_lines.append(line)
+
+            # Render children
+            children_list = list(node.children.values())
+            for idx, child in enumerate(children_list):
+                is_last_child = idx == len(children_list) - 1
+
+                # Build new prefix with tab indentation
+                if node.name:  # Not root
+                    if is_last:
+                        new_prefix = prefix + "\t"
+                    else:
+                        new_prefix = prefix + "│\t"
+                else:
+                    new_prefix = ""
+
+                render_node(child, new_prefix, is_last_child)
+
+        render_node(root)
+
+        return "\n".join(footer_lines)
 
     async def _filter_relevant_followups(
         self,
@@ -2352,8 +2689,12 @@ Select the questions that:
 Return ONLY the question numbers (comma-separated, e.g., "1,3") for the most relevant questions.
 Maximum {MAX_FOLLOWUP_QUESTIONS} questions."""
 
+        logger.debug(
+            f"Question filtering budget: {QUESTION_FILTERING_TOKENS:,} tokens (model: {llm.model})"
+        )
+
         try:
-            response = await llm.complete(prompt, system=system, max_completion_tokens=1000)
+            response = await llm.complete(prompt, system=system, max_completion_tokens=QUESTION_FILTERING_TOKENS)
             # Parse selected indices
             selected = [
                 int(n.strip()) - 1
@@ -2372,12 +2713,20 @@ Maximum {MAX_FOLLOWUP_QUESTIONS} questions."""
 
         return questions[:MAX_FOLLOWUP_QUESTIONS]
 
-    def _calculate_max_depth(self) -> int:
+    def _calculate_max_depth(self, depth: str = "shallow") -> int:
         """Calculate max depth based on repository size.
 
+        Args:
+            depth: Research depth mode - "shallow" for quick insights, "deep" for comprehensive analysis
+
         Returns:
-            Max depth for BFS traversal
+            Max depth for BFS traversal (zero-based: 0=root only, 1=root+children, etc)
         """
+        # In shallow mode, always use depth 1 (2 levels: root + children)
+        if depth == "shallow":
+            return 1
+
+        # Deep mode: adaptive based on repository size
         # Get total LOC from database
         stats = self._db_services.provider.get_stats()
         total_chunks = stats.get("chunks", 0)
@@ -2464,15 +2813,24 @@ Maximum {MAX_FOLLOWUP_QUESTIONS} questions."""
                 + (INTERNAL_MAX_TOKENS - INTERNAL_ROOT_TARGET) * depth_ratio
             )
 
+        # Follow-up question generation budget: Scales with depth (3k → 8k)
+        # Deeper nodes have more context to analyze, need more output tokens
+        followup_output_tokens = int(
+            FOLLOWUP_OUTPUT_TOKENS_MIN
+            + (FOLLOWUP_OUTPUT_TOKENS_MAX - FOLLOWUP_OUTPUT_TOKENS_MIN) * depth_ratio
+        )
+
         logger.debug(
             f"Adaptive budgets for depth {depth}/{max_depth} ({'leaf' if is_leaf else 'internal'}): "
-            f"file={file_content_tokens:,}, input={llm_input_tokens:,}, output={answer_tokens:,}"
+            f"file={file_content_tokens:,}, input={llm_input_tokens:,}, output={answer_tokens:,}, "
+            f"followup={followup_output_tokens:,}"
         )
 
         return {
             "file_content_tokens": file_content_tokens,
             "llm_input_tokens": llm_input_tokens,
             "answer_tokens": answer_tokens,
+            "followup_output_tokens": followup_output_tokens,
         }
 
     def _get_next_node_id(self) -> int:
