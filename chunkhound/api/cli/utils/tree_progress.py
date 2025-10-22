@@ -9,6 +9,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, TextIO
 
+from chunkhound.utils.tree_formatter import build_tree_prefix
+
 
 @dataclass
 class ProgressEvent:
@@ -70,31 +72,6 @@ class TreeProgressDisplay:
         # Right-align within 9-char width for column alignment
         return f"+{timestamp:7.1f}s"
 
-    def _build_tree_prefix(self, depth: int, is_last: bool = False) -> str:
-        """Build tree prefix with box-drawing characters.
-
-        Args:
-            depth: Node depth level
-            is_last: Whether this is the last child at this level
-
-        Returns:
-            Tree prefix string with proper indentation
-        """
-        if depth == 0:
-            return ""
-
-        # Build prefix based on depth
-        prefix_parts = []
-        for i in range(depth - 1):
-            prefix_parts.append("│   ")
-
-        # Add connector for current level
-        if is_last:
-            prefix_parts.append("└── ")
-        else:
-            prefix_parts.append("├── ")
-
-        return "".join(prefix_parts)
 
     def _get_event_symbol(self, event_type: str) -> str:
         """Get visual symbol for event type.
@@ -203,7 +180,7 @@ class TreeProgressDisplay:
 
             # Determine indentation based on depth
             depth = event.depth if event.depth is not None else 0
-            tree_prefix = self._build_tree_prefix(depth) if depth > 0 else ""
+            tree_prefix = build_tree_prefix(depth) if depth > 0 else ""
 
             # Format line: [timestamp] prefix symbol message (metadata)
             line = f"[{timestamp_str}] {tree_prefix}{symbol} {event.message}{metadata_str}\n"
