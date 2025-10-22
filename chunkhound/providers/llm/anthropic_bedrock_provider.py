@@ -289,6 +289,24 @@ class AnthropicBedrockProvider(LLMProvider):
             content = response_body["content"][0]["text"]
             stop_reason = response_body.get("stop_reason")
 
+            # Validate content is not empty
+            if not content or not content.strip():
+                logger.error(
+                    f"Anthropic Bedrock returned empty content "
+                    f"(stop_reason={stop_reason}, tokens={input_tokens + output_tokens})"
+                )
+                raise RuntimeError(
+                    f"LLM returned empty response (stop_reason={stop_reason}). "
+                    "This may indicate a content filter, API error, or model refusal."
+                )
+
+            # Warn on unexpected stop_reason
+            if stop_reason not in ("end_turn", "max_tokens", "stop_sequence"):
+                logger.warning(
+                    f"Unexpected stop_reason: {stop_reason} "
+                    f"(content_length={len(content)})"
+                )
+
             return LLMResponse(
                 content=content,
                 tokens_used=input_tokens + output_tokens,

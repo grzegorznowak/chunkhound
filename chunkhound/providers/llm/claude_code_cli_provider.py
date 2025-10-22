@@ -271,6 +271,17 @@ class ClaudeCodeCLIProvider(LLMProvider):
         try:
             content = await self._run_cli_command(prompt, system, max_completion_tokens, timeout)
 
+            # Validate content is not empty
+            if not content or not content.strip():
+                logger.error(
+                    "Claude Code CLI returned empty output "
+                    f"(prompt_length={len(prompt)})"
+                )
+                raise RuntimeError(
+                    "LLM returned empty response from Claude Code CLI. "
+                    "This may indicate a CLI error, authentication issue, or model refusal."
+                )
+
             # Track usage (estimates since CLI doesn't return token counts)
             self._requests_made += 1
             prompt_tokens = self.estimate_tokens(prompt)
@@ -333,6 +344,13 @@ Respond with JSON only, no additional text."""
             content = await self._run_cli_command(
                 structured_prompt, system, max_completion_tokens, timeout
             )
+
+            # Validate content is not empty
+            if not content or not content.strip():
+                logger.error("Claude Code CLI structured completion returned empty output")
+                raise RuntimeError(
+                    "LLM structured completion returned empty response from Claude Code CLI"
+                )
 
             # Track usage
             self._requests_made += 1

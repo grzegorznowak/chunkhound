@@ -109,9 +109,59 @@ class OpenAILLMProvider(LLMProvider):
                 self._completion_tokens += response.usage.completion_tokens
                 self._tokens_used += response.usage.total_tokens
 
-            content = response.choices[0].message.content or ""
+            # Extract response metadata
+            content = response.choices[0].message.content
             tokens = response.usage.total_tokens if response.usage else 0
             finish_reason = response.choices[0].finish_reason
+
+            # Validate content is not None or empty
+            if content is None:
+                logger.error(
+                    f"OpenAI returned None content (finish_reason={finish_reason}, "
+                    f"tokens={tokens})"
+                )
+                raise RuntimeError(
+                    f"LLM returned empty response (finish_reason={finish_reason}). "
+                    "This may indicate a content filter, API error, or model refusal."
+                )
+
+            if not content.strip():
+                logger.warning(
+                    f"OpenAI returned empty content (finish_reason={finish_reason}, "
+                    f"tokens={tokens})"
+                )
+                raise RuntimeError(
+                    f"LLM returned empty response (finish_reason={finish_reason}). "
+                    "This may indicate a content filter, API error, or model refusal."
+                )
+
+            # Reject truncated responses (finish_reason="length")
+            if finish_reason == "length":
+                usage_info = ""
+                if response.usage:
+                    usage_info = (
+                        f" (prompt={response.usage.prompt_tokens:,}, "
+                        f"completion={response.usage.completion_tokens:,})"
+                    )
+
+                raise RuntimeError(
+                    f"LLM response truncated - token limit exceeded{usage_info}. "
+                    f"For reasoning models (GPT-5, Gemini 2.5), this indicates "
+                    f"insufficient max_completion_tokens. Current limit: {max_completion_tokens:,} tokens. "
+                    f"Consider increasing OUTPUT_TOKENS_WITH_REASONING in deep_research_service.py."
+                )
+
+            # Warn on other unexpected finish_reason
+            if finish_reason not in ("stop",):
+                logger.warning(
+                    f"Unexpected finish_reason: {finish_reason} "
+                    f"(content_length={len(content)})"
+                )
+                if finish_reason == "content_filter":
+                    raise RuntimeError(
+                        "LLM response blocked by content filter. "
+                        "Try rephrasing your query or adjusting the prompt."
+                    )
 
             return LLMResponse(
                 content=content,
@@ -177,7 +227,35 @@ class OpenAILLMProvider(LLMProvider):
                 self._completion_tokens += response.usage.completion_tokens
                 self._tokens_used += response.usage.total_tokens
 
-            content = response.choices[0].message.content or "{}"
+            content = response.choices[0].message.content
+            finish_reason = response.choices[0].finish_reason
+
+            # Reject truncated responses (finish_reason="length")
+            if finish_reason == "length":
+                usage_info = ""
+                if response.usage:
+                    usage_info = (
+                        f" (prompt={response.usage.prompt_tokens:,}, "
+                        f"completion={response.usage.completion_tokens:,})"
+                    )
+
+                raise RuntimeError(
+                    f"LLM structured completion truncated - token limit exceeded{usage_info}. "
+                    f"This indicates insufficient max_completion_tokens for the structured output. "
+                    f"Consider increasing the token limit or reducing input context."
+                )
+
+            # Validate content is not None or empty
+            if content is None or not content.strip():
+                logger.error(
+                    f"OpenAI structured completion returned empty content "
+                    f"(finish_reason={finish_reason})"
+                )
+                raise RuntimeError(
+                    f"LLM structured completion returned empty response "
+                    f"(finish_reason={finish_reason})"
+                )
+
             parsed = json.loads(content)
 
             return parsed
