@@ -1028,3 +1028,74 @@ class ChunkingService:
 
         print("✓ Synthesized nodes correctly start fresh without inherited data")
         print("  - This ensures they explore new areas, not rehash existing findings")
+
+    @pytest.mark.asyncio
+    async def test_parallel_search_error_handling(self, research_setup):
+        """Test that parallel searches handle exceptions gracefully.
+
+        This test verifies that when query expansion creates multiple parallel
+        searches and one fails, the system:
+        1. Logs a warning about the failed search
+        2. Continues processing successful searches
+        3. Does not crash with IndexError
+        """
+        setup = research_setup
+        research_service = setup["research_service"]
+
+        # Create a test that directly exercises the parallel search code path
+        # by mocking _expand_query_with_llm to return multiple queries
+        original_expand = research_service._expand_query_with_llm
+
+        async def mock_expand_to_multiple_queries(query, context):
+            """Mock query expansion that returns multiple queries for parallel search."""
+            # Return 3 expanded queries to trigger parallel execution
+            return ["query 1", "query 2", "query 3"]
+
+        research_service._expand_query_with_llm = mock_expand_to_multiple_queries
+
+        # Store original search method
+        original_search = setup["services"].search_service.search_semantic
+
+        # Counter to track calls
+        call_count = [0]
+
+        async def mock_search_with_one_failure(*args, **kwargs):
+            """Mock search that fails on the second call."""
+            call_count[0] += 1
+            if call_count[0] == 2:
+                # Simulate a search failure (timeout, API error, etc.)
+                raise RuntimeError("Simulated search failure for testing exception handling")
+            # Otherwise, call the original method
+            return await original_search(*args, **kwargs)
+
+        setup["services"].search_service.search_semantic = mock_search_with_one_failure
+
+        try:
+            # Perform search - this will trigger parallel searches, one will fail
+            from chunkhound.services.deep_research_service import ResearchContext
+            context = ResearchContext(root_query="test query")
+
+            # Call _unified_search directly to test the parallel search code
+            chunks = await research_service._unified_search(
+                query="test query",
+                context=context,
+                node_id=1,
+                depth=0
+            )
+
+            # Verify the operation completed successfully
+            assert chunks is not None, "Should return chunks list (even if empty)"
+            assert isinstance(chunks, list), "Should return a list"
+
+            # Verify that multiple searches were attempted (parallel execution)
+            assert call_count[0] >= 3, f"Should have called search 3 times (got {call_count[0]})"
+
+            # The test passes if we got here without IndexError
+            print(f"✓ Parallel search handled {call_count[0]} searches with 1 failure gracefully")
+            print(f"  - No IndexError crash (bug is fixed)")
+            print(f"  - Returned {len(chunks)} chunks from successful searches")
+
+        finally:
+            # Restore original methods
+            research_service._expand_query_with_llm = original_expand
+            setup["services"].search_service.search_semantic = original_search

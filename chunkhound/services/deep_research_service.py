@@ -93,6 +93,11 @@ REQUIRE_CITATIONS = True  # Validate file:line format
 ENABLE_SMART_BOUNDARIES = True  # Expand to natural code boundaries (functions/classes)
 MAX_BOUNDARY_EXPANSION_LINES = 300  # Maximum lines to expand for complete functions
 
+# File-level reranking for synthesis budget allocation
+# Prevents file diversity collapse where deep BFS exploration causes score accumulation in few files
+MAX_CHUNKS_PER_FILE_REPR = 5  # Top chunks to include in file representative document for reranking
+MAX_TOKENS_PER_FILE_REPR = 2000  # Token limit for file representative document
+
 
 @dataclass
 class BFSNode:
@@ -345,8 +350,8 @@ class DeepResearchService:
 
         # Manage token budget for single-pass synthesis
         prioritized_chunks, budgeted_files, budget_info = (
-            self._manage_token_budget_for_synthesis(
-                aggregated["chunks"], aggregated["files"], depth
+            await self._manage_token_budget_for_synthesis(
+                aggregated["chunks"], aggregated["files"], query, depth
             )
         )
 
@@ -765,11 +770,19 @@ Requirements:
                 )
                 for expanded_q in expanded_queries
             ]
-            search_results = await asyncio.gather(*search_tasks)
+            search_results = await asyncio.gather(*search_tasks, return_exceptions=True)
 
             # Unify results: deduplicate by chunk_id (same pattern as semantic+regex unification)
             semantic_map = {}
-            for results, _ in search_results:
+            for result in search_results:
+                if isinstance(result, Exception):
+                    logger.warning(f"Semantic search failed during query expansion: {result}")
+                    continue
+                # Validate tuple structure before unpacking
+                if not isinstance(result, tuple) or len(result) != 2:
+                    logger.error(f"Unexpected search result structure: {type(result)}, skipping")
+                    continue
+                results, _ = result
                 for chunk in results:
                     chunk_id = chunk.get("chunk_id") or chunk.get("id")
                     if chunk_id and chunk_id not in semantic_map:
@@ -777,7 +790,7 @@ Requirements:
 
             semantic_results = list(semantic_map.values())
             logger.debug(
-                f"Unified {sum(len(r[0]) for r in search_results)} results from {len(expanded_queries)} searches -> {len(semantic_results)} unique chunks"
+                f"Unified {sum(len(r[0]) if not isinstance(r, Exception) else 0 for r in search_results)} results from {len(expanded_queries)} searches -> {len(semantic_results)} unique chunks"
             )
 
             # Emit search results event
@@ -1937,18 +1950,24 @@ Generate your synthesized questions now (minimum 1, maximum {target_count})."""
             "stats": stats,
         }
 
-    def _manage_token_budget_for_synthesis(
-        self, chunks: list[dict[str, Any]], files: dict[str, str], depth: str = "shallow"
+    async def _manage_token_budget_for_synthesis(
+        self,
+        chunks: list[dict[str, Any]],
+        files: dict[str, str],
+        root_query: str,
+        depth: str = "shallow"
     ) -> tuple[list[dict[str, Any]], dict[str, str], dict[str, Any]]:
         """Manage token budget to fit within SINGLE_PASS_MAX_TOKENS limit.
 
-        Prioritizes files by chunk scores from multi-hop semantic search.
-        If total exceeds budget, includes full files for high-priority items
-        and snippets for lower-priority.
+        Prioritizes files using reranking when available to ensure diverse,
+        relevant file selection. Falls back to accumulated chunk scores if
+        reranking fails. This prevents file diversity collapse where deep
+        exploration causes score accumulation in few files.
 
         Args:
             chunks: All chunks from BFS traversal
             files: All file contents from BFS traversal
+            root_query: Original research query (for reranking files)
             depth: Research depth mode - affects output token allocation
 
         Returns:
@@ -1977,22 +1996,96 @@ Generate your synthesized questions now (minimum 1, maximum {target_count})."""
             chunks, key=lambda c: c.get("score", 0.0), reverse=True
         )
 
-        # Build file priority map based on chunk scores
-        file_priorities: dict[str, float] = {}
+        # Build file-to-chunks mapping
         file_to_chunks: dict[str, list[dict[str, Any]]] = {}
-
         for chunk in sorted_chunks:
             file_path = chunk.get("file_path", "")
             if file_path:
-                if file_path not in file_priorities:
-                    file_priorities[file_path] = 0.0
+                if file_path not in file_to_chunks:
                     file_to_chunks[file_path] = []
-
-                # Accumulate scores for this file
-                file_priorities[file_path] += chunk.get("score", 0.0)
                 file_to_chunks[file_path].append(chunk)
 
-        # Sort files by priority
+        # Create file representative documents for reranking
+        # This prevents file diversity collapse where files explored at multiple
+        # BFS depths accumulate exponentially higher scores
+        file_paths = []
+        file_documents = []
+
+        for file_path, file_chunks in file_to_chunks.items():
+            # Sort chunks by score and take top N chunks (configured by constant)
+            sorted_file_chunks = sorted(
+                file_chunks, key=lambda c: c.get("score", 0.0), reverse=True
+            )
+            top_chunks = sorted_file_chunks[:MAX_CHUNKS_PER_FILE_REPR]
+
+            # Build representative document
+            repr_parts = []
+            for chunk in top_chunks:
+                start_line = chunk.get("start_line", 1)
+                end_line = chunk.get("end_line", 1)
+                content = chunk.get("content", "")
+                repr_parts.append(f"Lines {start_line}-{end_line}:\n{content}")
+
+            document = f"{file_path}\n\n" + "\n\n".join(repr_parts)
+
+            # Truncate to token limit
+            if llm.estimate_tokens(document) > MAX_TOKENS_PER_FILE_REPR:
+                chars_to_include = MAX_TOKENS_PER_FILE_REPR * 4
+                document = document[:chars_to_include]
+
+            file_paths.append(file_path)
+            file_documents.append(document)
+
+        # Rerank files by relevance to root query
+        # This ensures file priority is based on relevance to original query,
+        # not accumulated scores from multi-level BFS exploration
+        await self._emit_event(
+            "synthesis_rerank",
+            f"Reranking {len(file_documents)} files by relevance"
+        )
+        embedding_provider = self._embedding_manager.get_provider()
+
+        # Check provider batch limits (providers handle batch splitting automatically)
+        max_batch = embedding_provider.get_max_rerank_batch_size()
+        if len(file_documents) > max_batch:
+            logger.info(
+                f"Reranking {len(file_documents)} files will be automatically split into "
+                f"batches of {max_batch} (provider: {embedding_provider.name})"
+            )
+
+        # Initialize file priorities dict (populated by either reranking or fallback)
+        file_priorities: dict[str, float] = {}
+
+        # Try reranking with fallback to chunk score accumulation
+        try:
+            rerank_results = await embedding_provider.rerank(
+                query=root_query,
+                documents=file_documents,
+                top_k=None
+            )
+        except Exception as e:
+            logger.warning(
+                f"File reranking failed ({type(e).__name__}: {e}), "
+                f"falling back to accumulated chunk scores"
+            )
+            logger.debug(f"Reranking failure traceback: {e}", exc_info=True)
+
+            # Fallback: Use accumulated chunk scores (original behavior before reranking)
+            for file_path, file_chunks in file_to_chunks.items():
+                file_priorities[file_path] = sum(c.get("score", 0.0) for c in file_chunks)
+
+            logger.info(f"Using chunk score fallback for {len(file_priorities)} files")
+        else:
+            # Build priority map from rerank scores
+            # Process results outside try block - let IndexError fail loudly if provider returns bad data
+            for result in rerank_results:
+                file_path = file_paths[result.index]
+                file_priorities[file_path] = result.score
+
+            logger.info(f"Reranked {len(file_priorities)} files for synthesis budget allocation")
+
+        # Sort files by priority score (highest first)
+        # Works for both reranking and fallback paths
         sorted_files = sorted(
             file_priorities.items(), key=lambda x: x[1], reverse=True
         )

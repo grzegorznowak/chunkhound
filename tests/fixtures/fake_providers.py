@@ -352,6 +352,10 @@ class FakeEmbeddingProvider:
         """Get maximum documents per batch."""
         return 1000
 
+    def get_max_rerank_batch_size(self) -> int:
+        """Get maximum documents per batch for reranking operations."""
+        return 1000
+
     def get_recommended_concurrency(self) -> int:
         """Get recommended concurrency."""
         return 10
