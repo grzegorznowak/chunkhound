@@ -41,9 +41,33 @@ class LLMConfig(BaseSettings):
     )
 
     # Provider Selection
-    provider: Literal["openai", "ollama", "claude-code-cli", "anthropic-bedrock"] = Field(
-        default="openai", description="LLM provider (openai, ollama, claude-code-cli, anthropic-bedrock)"
+    provider: Literal[
+        "openai",
+        "ollama",
+        "claude-code-cli",
+        "anthropic-bedrock",
+        "codex-cli",
+    ] = Field(
+        default="openai",
+        description="Default LLM provider for both roles (utility, synthesis)",
     )
+
+    # Optional per-role overrides (utility vs synthesis)
+    utility_provider: Literal[
+        "openai",
+        "ollama",
+        "claude-code-cli",
+        "anthropic-bedrock",
+        "codex-cli",
+    ] | None = Field(default=None, description="Override provider for utility ops")
+
+    synthesis_provider: Literal[
+        "openai",
+        "ollama",
+        "claude-code-cli",
+        "anthropic-bedrock",
+        "codex-cli",
+    ] | None = Field(default=None, description="Override provider for synthesis ops")
 
     # Model Configuration (dual-model architecture)
     utility_model: str = Field(
@@ -110,8 +134,11 @@ class LLMConfig(BaseSettings):
         # Get default models if not specified
         utility_default, synthesis_default = self.get_default_models()
 
+        # Resolve providers per-role
+        resolved_utility_provider = self.utility_provider or self.provider
+        resolved_synthesis_provider = self.synthesis_provider or self.provider
+
         base_config = {
-            "provider": self.provider,
             "timeout": self.timeout,
             "max_retries": self.max_retries,
         }
@@ -132,12 +159,14 @@ class LLMConfig(BaseSettings):
 
         # Build utility config
         utility_config = base_config.copy()
+        utility_config["provider"] = resolved_utility_provider
         utility_config["model"] = self.utility_model or utility_default
 
         # Build synthesis config
         synthesis_config = base_config.copy()
+        synthesis_config["provider"] = resolved_synthesis_provider
         synthesis_config["model"] = self.synthesis_model or synthesis_default
-
+        
         return utility_config, synthesis_config
 
     def get_default_models(self) -> tuple[str, str]:
@@ -158,6 +187,9 @@ class LLMConfig(BaseSettings):
         elif self.provider == "claude-code-cli":
             # Claude Code CLI: Haiku 4.5 for utility, Sonnet 4.5 for synthesis
             return ("claude-3-5-haiku-20241022", "claude-sonnet-4-5-20250929")
+        elif self.provider == "codex-cli":
+            # Codex CLI: nominal label; require explicit model if desired
+            return ("codex", "codex")
         else:
             return ("gpt-5-nano", "gpt-5")
 
@@ -168,7 +200,13 @@ class LLMConfig(BaseSettings):
         Returns:
             True if provider is properly configured
         """
-        if self.provider in ("ollama", "claude-code-cli", "anthropic-bedrock"):
+        resolved_utility_provider = self.utility_provider or self.provider
+        resolved_synthesis_provider = self.synthesis_provider or self.provider
+        no_key_required = {"ollama", "claude-code-cli", "anthropic-bedrock", "codex-cli"}
+        if (
+            resolved_utility_provider in no_key_required
+            and resolved_synthesis_provider in no_key_required
+        ):
             # Ollama and Claude Code CLI don't require API key
             # Claude Code CLI uses subscription-based authentication
             # Anthropic Bedrock uses AWS credentials
@@ -187,7 +225,7 @@ class LLMConfig(BaseSettings):
         missing = []
 
         if (
-            self.provider not in ("ollama", "claude-code-cli", "anthropic-bedrock")
+            self.provider not in ("ollama", "claude-code-cli", "anthropic-bedrock", "codex-cli")
             and not self.api_key
         ):
             missing.append("api_key (set CHUNKHOUND_LLM_API_KEY)")
@@ -219,8 +257,38 @@ class LLMConfig(BaseSettings):
 
         parser.add_argument(
             "--llm-provider",
-            choices=["openai", "ollama", "claude-code-cli", "anthropic-bedrock"],
-            help="LLM provider (default: openai)",
+            choices=[
+                "openai",
+                "ollama",
+                "claude-code-cli",
+                "anthropic-bedrock",
+                "codex-cli",
+            ],
+            help="Default LLM provider for both roles",
+        )
+
+        parser.add_argument(
+            "--llm-utility-provider",
+            choices=[
+                "openai",
+                "ollama",
+                "claude-code-cli",
+                "anthropic-bedrock",
+                "codex-cli",
+            ],
+            help="Override LLM provider for utility operations",
+        )
+
+        parser.add_argument(
+            "--llm-synthesis-provider",
+            choices=[
+                "openai",
+                "ollama",
+                "claude-code-cli",
+                "anthropic-bedrock",
+                "codex-cli",
+            ],
+            help="Override LLM provider for synthesis operations",
         )
 
         parser.add_argument(
@@ -244,6 +312,10 @@ class LLMConfig(BaseSettings):
             config["base_url"] = base_url
         if provider := os.getenv("CHUNKHOUND_LLM_PROVIDER"):
             config["provider"] = provider
+        if u_provider := os.getenv("CHUNKHOUND_LLM_UTILITY_PROVIDER"):
+            config["utility_provider"] = u_provider
+        if s_provider := os.getenv("CHUNKHOUND_LLM_SYNTHESIS_PROVIDER"):
+            config["synthesis_provider"] = s_provider
         if utility_model := os.getenv("CHUNKHOUND_LLM_UTILITY_MODEL"):
             config["utility_model"] = utility_model
         if synthesis_model := os.getenv("CHUNKHOUND_LLM_SYNTHESIS_MODEL"):
@@ -270,6 +342,10 @@ class LLMConfig(BaseSettings):
             overrides["base_url"] = args.llm_base_url
         if hasattr(args, "llm_provider") and args.llm_provider:
             overrides["provider"] = args.llm_provider
+        if hasattr(args, "llm_utility_provider") and args.llm_utility_provider:
+            overrides["utility_provider"] = args.llm_utility_provider
+        if hasattr(args, "llm_synthesis_provider") and args.llm_synthesis_provider:
+            overrides["synthesis_provider"] = args.llm_synthesis_provider
         if hasattr(args, "llm_bedrock_region") and args.llm_bedrock_region:
             overrides["bedrock_region"] = args.llm_bedrock_region
         if hasattr(args, "llm_aws_profile") and args.llm_aws_profile:

@@ -6,6 +6,7 @@ from loguru import logger
 
 from chunkhound.interfaces.llm_provider import LLMProvider
 from chunkhound.providers.llm.anthropic_bedrock_provider import AnthropicBedrockProvider
+from chunkhound.providers.llm.codex_cli_provider import CodexCLIProvider
 from chunkhound.providers.llm.claude_code_cli_provider import ClaudeCodeCLIProvider
 from chunkhound.providers.llm.openai_llm_provider import OpenAILLMProvider
 
@@ -23,6 +24,7 @@ class LLMManager:
         "openai": OpenAILLMProvider,
         "claude-code-cli": ClaudeCodeCLIProvider,
         "anthropic-bedrock": AnthropicBedrockProvider,
+        "codex-cli": CodexCLIProvider,
     }
 
     def __init__(

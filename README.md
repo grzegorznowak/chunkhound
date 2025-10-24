@@ -75,6 +75,42 @@ chunkhound index
 
 **For configuration, IDE setup, and advanced usage, see the [documentation](https://chunkhound.github.io).**
 
+## Codex CLI Synthesis (Advanced)
+
+ChunkHound can use the Codex CLI as the synthesis LLM for deep research. This lets you reuse your local Codex agent configuration while ChunkHound handles retrieval and context assembly.
+
+- Prerequisites: Codex CLI installed and authenticated. Authentication is discovered from your `CODEX_HOME` (defaults to `~/.codex`).
+- ChunkHound never prints Codex output directly to MCP stdout; results are returned via tool responses.
+
+Run MCP stdio with Codex for synthesis:
+
+```bash
+uv run chunkhound mcp . --stdio \
+  --llm-synthesis-provider codex-cli \
+  --llm-synthesis-model codex
+```
+
+Use Codex for the research CLI:
+
+```bash
+chunkhound research "How does indexing deduplicate chunks?" \
+  --llm-synthesis-provider codex-cli \
+  --llm-synthesis-model codex
+```
+
+Implementation notes:
+- The provider shells out to `codex exec` and captures output. It never writes to stdout from within the MCP server process.
+- A temporary overlay `CODEX_HOME` is created per call to disable history persistence and remove any `mcp_servers` entries; this overlay is cleaned up after each request.
+- By default, prompts are sent via stdin (privacy-first) rather than argv. Set `CHUNKHOUND_CODEX_STDIN_FIRST=0` to revert to legacy small-argv behavior.
+- Environment variables:
+  - `CHUNKHOUND_CODEX_BIN` — path to the `codex` binary (default: `codex` on PATH)
+  - `CHUNKHOUND_CODEX_ARG_LIMIT` — max characters to pass via argv before falling back to stdin (default: 200000)
+  - `CHUNKHOUND_CODEX_COPY_ALL` — set to `1` to copy entire `CODEX_HOME` into the overlay (default: minimal selective copy of likely auth/session files only)
+  - `CHUNKHOUND_CODEX_MAX_COPY_BYTES` — max size to copy for single files during minimal copy (default: 1,000,000 bytes)
+  - `CHUNKHOUND_CODEX_LOG_MAX_ERR` — max characters of stderr included in error messages (default: 800; secrets are redacted)
+
+If Codex is unavailable or unauthenticated, ChunkHound’s other providers (OpenAI, Ollama, Claude Code CLI, Bedrock) remain available.
+
 ## Real-Time Indexing
 
 **Automatic File Watching**: MCP servers monitor your codebase and update the index automatically as you edit files. No manual re-indexing required.
