@@ -87,6 +87,11 @@ class LLMManager:
                 # boto3.Session expects 'profile_name' parameter
                 provider_kwargs["profile_name"] = config["aws_profile"]
 
+            if provider_name == "codex-cli":
+                effort = config.get("reasoning_effort")
+                if effort:
+                    provider_kwargs["reasoning_effort"] = effort
+
             provider = provider_class(**provider_kwargs)
             return provider
         except Exception as e:

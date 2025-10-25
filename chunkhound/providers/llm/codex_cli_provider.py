@@ -43,10 +43,12 @@ class CodexCLIProvider(LLMProvider):
         base_url: str | None = None,  # Unused
         timeout: int = 60,
         max_retries: int = 3,
+        reasoning_effort: str | None = None,
     ) -> None:
         self._model = model
         self._timeout = timeout
         self._max_retries = max_retries
+        self._reasoning_effort = self._resolve_reasoning_effort(reasoning_effort)
 
         # Usage accounting (estimates)
         self._requests_made = 0
@@ -68,7 +70,75 @@ class CodexCLIProvider(LLMProvider):
         default = Path.home() / ".codex"
         return default if default.exists() else None
 
-    def _build_overlay_home(self) -> str:
+    def _resolve_model_name(self, requested: str | None) -> str:
+        """Resolve requested model name to Codex CLI model identifier."""
+        env_override = os.getenv("CHUNKHOUND_CODEX_DEFAULT_MODEL")
+        default_model = env_override.strip() if env_override else "gpt-5-codex"
+
+        if not requested:
+            return default_model
+
+        model_name = requested.strip()
+        if not model_name or model_name.lower() == "codex":
+            return default_model
+
+        return model_name
+
+    def _resolve_reasoning_effort(self, requested: str | None) -> str:
+        """Resolve reasoning effort override."""
+        env_override = os.getenv("CHUNKHOUND_CODEX_REASONING_EFFORT")
+        candidate = requested or env_override
+        allowed = {"minimal", "low", "medium", "high"}
+
+        if not candidate:
+            return "low"
+
+        effort = candidate.strip().lower()
+        if effort not in allowed:
+            logger.warning(
+                "Unknown Codex reasoning effort '%s'; falling back to 'low'", candidate
+            )
+            return "low"
+        return effort
+
+    def _copy_minimal_codex_state(self, base: Path, dest: Path) -> None:
+        """Copy minimal auth/session state into destination CODEX_HOME."""
+        copy_all = os.getenv("CHUNKHOUND_CODEX_COPY_ALL", "0") == "1"
+        max_bytes = int(os.getenv("CHUNKHOUND_CODEX_MAX_COPY_BYTES", "1000000"))
+
+        def _should_copy_dir(name: str) -> bool:
+            n = name.lower()
+            if copy_all:
+                return True
+            # Likely auth/session state we may need
+            return n in {"sessions", "session", "auth", "profiles", "state"}
+
+        def _should_copy_file(p: Path) -> bool:
+            if copy_all:
+                return True
+            if p.name.lower() == "config.toml":
+                return False  # we write our own config below
+            if p.suffix.lower() in {".json", ".toml", ".ini"}:
+                try:
+                    return p.stat().st_size <= max_bytes
+                except Exception:
+                    return False
+            return False
+
+        for item in base.iterdir():
+            dest_path = dest / item.name
+            try:
+                if item.is_dir():
+                    if _should_copy_dir(item.name):
+                        shutil.copytree(item, dest_path, dirs_exist_ok=False)
+                else:
+                    if _should_copy_file(item):
+                        shutil.copy2(item, dest_path)
+            except Exception:
+                # Best-effort copy; skip unreadable items
+                pass
+
+    def _build_overlay_home(self, model_override: str | None = None) -> str:
         """Create an overlay CODEX_HOME inheriting auth but overriding config.
 
         - Copies the base CODEX_HOME (if it exists) to a temp dir
@@ -78,54 +148,22 @@ class CodexCLIProvider(LLMProvider):
         """
         overlay = Path(tempfile.mkdtemp(prefix="chunkhound-codex-overlay-"))
         base = self._get_base_codex_home()
+        model_name = self._resolve_model_name(model_override or self._model)
         try:
             if base and base.exists():
-                copy_all = os.getenv("CHUNKHOUND_CODEX_COPY_ALL", "0") == "1"
-                max_bytes = int(os.getenv("CHUNKHOUND_CODEX_MAX_COPY_BYTES", "1000000"))
-
-                def _should_copy_dir(name: str) -> bool:
-                    n = name.lower()
-                    if copy_all:
-                        return True
-                    # Likely auth/session state we may need
-                    return n in {"sessions", "session", "auth", "profiles", "state"}
-
-                def _should_copy_file(p: Path) -> bool:
-                    if copy_all:
-                        return True
-                    if p.name.lower() == "config.toml":
-                        return False  # we write our own config below
-                    if p.suffix.lower() in {".json", ".toml", ".ini"}:
-                        try:
-                            return p.stat().st_size <= max_bytes
-                        except Exception:
-                            return False
-                    return False
-
-                # Minimal selective copy
-                for item in base.iterdir():
-                    dest = overlay / item.name
-                    try:
-                        if item.is_dir():
-                            if _should_copy_dir(item.name):
-                                shutil.copytree(item, dest, dirs_exist_ok=False)
-                        else:
-                            if _should_copy_file(item):
-                                shutil.copy2(item, dest)
-                    except Exception:
-                        # Best-effort copy; skip items we cannot read/copy
-                        pass
+                self._copy_minimal_codex_state(base, overlay)
 
             # Write our minimal config.toml ensuring no MCP and no history
             config_path = overlay / "config.toml"
             # Many Codex builds expect top-level `model` keys (not a [model] table)
-            cfg = (
-                "[history]\n"
-                "persistence = \"none\"\n\n"
-                "model = \"gpt-5-codex\"\n"
-                "model_reasoning_effort = \"low\"\n"
-            )
-            config_path.write_text(cfg, encoding="utf-8")
+            cfg_lines = [
+                "[history]",
+                'persistence = "none"',
+                "",
+                f'model = "{model_name}"',
+                f'model_reasoning_effort = "{self._reasoning_effort}"',
+            ]
+            config_path.write_text("\n".join(cfg_lines) + "\n", encoding="utf-8")
         except Exception as e:
             logger.warning(f"Failed to build Codex overlay home: {e}")
         return str(overlay)
@@ -158,15 +196,43 @@ class CodexCLIProvider(LLMProvider):
     ) -> str:
         """Run `codex exec` and capture stdout with robust fallbacks."""
         binary = os.getenv("CHUNKHOUND_CODEX_BIN", "codex")
-        # Build overlay CODEX_HOME inheriting auth but with safe config
-        overlay_home = self._build_overlay_home()
-
-        if model:
-            # Model preference is already in overlay config; keep CLI override minimal for compatibility
-            pass
+        overlay_home: str | None = None
+        config_file_path: str | None = None
+        extra_args: list[str] = []
 
         env = os.environ.copy()
+        effective_model = self._resolve_model_name(model or self._model)
+
+        # Helper to forward selected env keys
+        def _forward_env(keys: list[str]) -> None:
+            for k in keys:
+                v = os.environ.get(k)
+                if v is not None:
+                    env[k] = v
+
+        auth_keys = [s.strip() for s in os.getenv(
+            "CHUNKHOUND_CODEX_AUTH_ENV",
+            "OPENAI_API_KEY,CODEX_API_KEY,ANTHROPIC_API_KEY,BEARER_TOKEN",
+        ).split(",") if s.strip()]
+        passthrough_keys = [s.strip() for s in os.getenv(
+            "CHUNKHOUND_CODEX_PASSTHROUGH_ENV",
+            "",
+        ).split(",") if s.strip()]
+
+        overlay_home = self._build_overlay_home(effective_model)
         env["CODEX_HOME"] = overlay_home
+        config_file_path = str(Path(overlay_home) / "config.toml")
+
+        override_mode = os.getenv("CHUNKHOUND_CODEX_CONFIG_OVERRIDE", "env").strip().lower()
+        if config_file_path:
+            if override_mode == "flag":
+                flag = os.getenv("CHUNKHOUND_CODEX_CONFIG_FLAG", "--config")
+                extra_args += [flag, config_file_path]
+            else:
+                cfg_key = os.getenv("CHUNKHOUND_CODEX_CONFIG_ENV", "CODEX_CONFIG")
+                env[cfg_key] = config_file_path
+
+        _forward_env(auth_keys + passthrough_keys)
 
         request_timeout = timeout if timeout is not None else self._timeout
 
@@ -189,6 +255,7 @@ class CodexCLIProvider(LLMProvider):
                             binary,
                             "exec",
                             "-",
+                            *extra_args,
                             *( ["--skip-git-repo-check"] if add_skip_git else [] ),
                             cwd=cwd,
                             stdin=asyncio.subprocess.PIPE,
@@ -209,6 +276,7 @@ class CodexCLIProvider(LLMProvider):
                             binary,
                             "exec",
                             content,
+                            *extra_args,
                             *( ["--skip-git-repo-check"] if add_skip_git else [] ),
                             cwd=cwd,
                             stdout=asyncio.subprocess.PIPE,
@@ -279,7 +347,7 @@ class CodexCLIProvider(LLMProvider):
                     pass
 
         finally:
-            # Cleanup overlay home regardless of success or failure
+            # Cleanup temporary resources regardless of success or failure
             try:
                 if overlay_home and Path(overlay_home).exists():
                     shutil.rmtree(overlay_home, ignore_errors=True)

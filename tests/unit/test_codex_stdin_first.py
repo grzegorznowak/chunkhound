@@ -39,19 +39,19 @@ class _DummyProc:
 async def test_codex_stdin_is_default(monkeypatch, tmp_path: Path):
     """By default, provider should use stdin (argument '-' after 'exec')."""
     from chunkhound.providers.llm.codex_cli_provider import CodexCLIProvider
-
     # Force availability
     monkeypatch.setattr(CodexCLIProvider, "_codex_available", lambda self: True, raising=True)
 
     # Deterministic overlay path
     overlay_dir = tmp_path / "overlay-home"
     overlay_dir.mkdir(parents=True, exist_ok=True)
-    monkeypatch.setattr(
-        CodexCLIProvider,
-        "_build_overlay_home",
-        lambda self: str(overlay_dir),
-        raising=True,
-    )
+    requested_model = {}
+
+    def _fake_overlay_home(self, model_override=None):
+        requested_model["value"] = model_override
+        return str(overlay_dir)
+
+    monkeypatch.setattr(CodexCLIProvider, "_build_overlay_home", _fake_overlay_home, raising=True)
 
     captured_args = {}
 
@@ -76,4 +76,4 @@ async def test_codex_stdin_is_default(monkeypatch, tmp_path: Path):
 
     # Ensure overlay is cleaned
     assert not overlay_dir.exists(), "overlay CODEX_HOME should be removed after run"
-
+    assert requested_model.get("value") == "gpt-5-codex"

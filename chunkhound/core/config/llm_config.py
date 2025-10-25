@@ -30,6 +30,9 @@ class LLMConfig(BaseSettings):
         CHUNKHOUND_LLM_SYNTHESIS_MODEL=gpt-5
         CHUNKHOUND_LLM_BASE_URL=https://api.openai.com/v1
         CHUNKHOUND_LLM_PROVIDER=openai
+        CHUNKHOUND_LLM_CODEX_REASONING_EFFORT=medium
+        CHUNKHOUND_LLM_CODEX_REASONING_EFFORT_UTILITY=low
+        CHUNKHOUND_LLM_CODEX_REASONING_EFFORT_SYNTHESIS=high
     """
 
     model_config = SettingsConfigDict(
@@ -80,6 +83,19 @@ class LLMConfig(BaseSettings):
         description="Model for final synthesis (large context analysis)",
     )
 
+    codex_reasoning_effort: Literal["minimal", "low", "medium", "high"] | None = Field(
+        default=None,
+        description="Default Codex CLI reasoning effort (Responses API thinking level)",
+    )
+    codex_reasoning_effort_utility: Literal["minimal", "low", "medium", "high"] | None = Field(
+        default=None,
+        description="Codex CLI reasoning effort override for utility-stage operations",
+    )
+    codex_reasoning_effort_synthesis: Literal["minimal", "low", "medium", "high"] | None = Field(
+        default=None,
+        description="Codex CLI reasoning effort override for synthesis-stage operations",
+    )
+
     api_key: SecretStr | None = Field(
         default=None, description="API key for authentication (provider-specific)"
     )
@@ -124,6 +140,20 @@ class LLMConfig(BaseSettings):
 
         return v
 
+    @field_validator(
+        "codex_reasoning_effort",
+        "codex_reasoning_effort_utility",
+        "codex_reasoning_effort_synthesis",
+        mode="before",
+    )
+    def normalize_codex_effort(cls, v: str | None) -> str | None:  # noqa: N805
+        if v is None:
+            return v
+        if isinstance(v, str):
+            return v.strip().lower()
+        return v
+
+
     def get_provider_configs(self) -> tuple[dict[str, Any], dict[str, Any]]:
         """
         Get provider-specific configuration dictionaries for utility and synthesis models.
@@ -166,7 +196,23 @@ class LLMConfig(BaseSettings):
         synthesis_config = base_config.copy()
         synthesis_config["provider"] = resolved_synthesis_provider
         synthesis_config["model"] = self.synthesis_model or synthesis_default
-        
+
+        def _codex_effort_for(role: str) -> str | None:
+            default_effort = self.codex_reasoning_effort
+            if role == "utility":
+                return self.codex_reasoning_effort_utility or default_effort
+            if role == "synthesis":
+                return self.codex_reasoning_effort_synthesis or default_effort
+            return default_effort
+
+        utility_effort = _codex_effort_for("utility")
+        if resolved_utility_provider == "codex-cli" and utility_effort:
+            utility_config["reasoning_effort"] = utility_effort
+
+        synthesis_effort = _codex_effort_for("synthesis")
+        if resolved_synthesis_provider == "codex-cli" and synthesis_effort:
+            synthesis_config["reasoning_effort"] = synthesis_effort
+
         return utility_config, synthesis_config
 
     def get_default_models(self) -> tuple[str, str]:
@@ -292,6 +338,24 @@ class LLMConfig(BaseSettings):
         )
 
         parser.add_argument(
+            "--llm-codex-reasoning-effort",
+            choices=["minimal", "low", "medium", "high"],
+            help="Codex CLI reasoning effort (thinking depth) when using codex-cli provider",
+        )
+
+        parser.add_argument(
+            "--llm-codex-reasoning-effort-utility",
+            choices=["minimal", "low", "medium", "high"],
+            help="Utility-stage Codex reasoning effort override",
+        )
+
+        parser.add_argument(
+            "--llm-codex-reasoning-effort-synthesis",
+            choices=["minimal", "low", "medium", "high"],
+            help="Synthesis-stage Codex reasoning effort override",
+        )
+
+        parser.add_argument(
             "--llm-bedrock-region",
             help="AWS region for Bedrock provider (uses AWS_REGION if not specified)",
         )
@@ -324,6 +388,12 @@ class LLMConfig(BaseSettings):
             config["bedrock_region"] = bedrock_region
         if aws_profile := os.getenv("CHUNKHOUND_LLM_AWS_PROFILE"):
             config["aws_profile"] = aws_profile
+        if codex_effort := os.getenv("CHUNKHOUND_LLM_CODEX_REASONING_EFFORT"):
+            config["codex_reasoning_effort"] = codex_effort.strip().lower()
+        if codex_effort_util := os.getenv("CHUNKHOUND_LLM_CODEX_REASONING_EFFORT_UTILITY"):
+            config["codex_reasoning_effort_utility"] = codex_effort_util.strip().lower()
+        if codex_effort_syn := os.getenv("CHUNKHOUND_LLM_CODEX_REASONING_EFFORT_SYNTHESIS"):
+            config["codex_reasoning_effort_synthesis"] = codex_effort_syn.strip().lower()
 
         return config
 
@@ -346,6 +416,12 @@ class LLMConfig(BaseSettings):
             overrides["utility_provider"] = args.llm_utility_provider
         if hasattr(args, "llm_synthesis_provider") and args.llm_synthesis_provider:
             overrides["synthesis_provider"] = args.llm_synthesis_provider
+        if hasattr(args, "llm_codex_reasoning_effort") and args.llm_codex_reasoning_effort:
+            overrides["codex_reasoning_effort"] = args.llm_codex_reasoning_effort
+        if hasattr(args, "llm_codex_reasoning_effort_utility") and args.llm_codex_reasoning_effort_utility:
+            overrides["codex_reasoning_effort_utility"] = args.llm_codex_reasoning_effort_utility
+        if hasattr(args, "llm_codex_reasoning_effort_synthesis") and args.llm_codex_reasoning_effort_synthesis:
+            overrides["codex_reasoning_effort_synthesis"] = args.llm_codex_reasoning_effort_synthesis
         if hasattr(args, "llm_bedrock_region") and args.llm_bedrock_region:
             overrides["bedrock_region"] = args.llm_bedrock_region
         if hasattr(args, "llm_aws_profile") and args.llm_aws_profile:

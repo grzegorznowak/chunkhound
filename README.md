@@ -100,13 +100,22 @@ chunkhound research "How does indexing deduplicate chunks?" \
 
 Implementation notes:
 - The provider shells out to `codex exec` and captures output. It never writes to stdout from within the MCP server process.
-- A temporary overlay `CODEX_HOME` is created per call to disable history persistence and remove any `mcp_servers` entries; this overlay is cleaned up after each request.
-- By default, prompts are sent via stdin (privacy-first) rather than argv. Set `CHUNKHOUND_CODEX_STDIN_FIRST=0` to revert to legacy small-argv behavior.
+- Each Codex run uses a sandboxed `CODEX_HOME`. ChunkHound copies only auth/session files, writes a fresh no-history/no-MCP `config.toml`, and points Codex at that sandbox so nothing from your primary agent config leaks in. The symbolic model name `codex` resolves to the Codex CLI default (`gpt-5-codex`) unless overridden.
+- Pass an explicit Codex CLI model via `--llm-synthesis-model` (for example `gpt-5-codex-pro`) to switch variants; all overlay modes honor the requested model.
+- Control the Codex reasoning effort with `--llm-codex-reasoning-effort` (`minimal` | `low` | `medium` | `high`) or `CHUNKHOUND_LLM_CODEX_REASONING_EFFORT=high` to change the Responses API “thinking” depth used during synthesis. Use `--llm-codex-reasoning-effort-utility` / `--llm-codex-reasoning-effort-synthesis` (or the `CHUNKHOUND_LLM_CODEX_REASONING_EFFORT_UTILITY` / `CHUNKHOUND_LLM_CODEX_REASONING_EFFORT_SYNTHESIS` env vars) for stage-specific overrides.
+- Prompts are sent via stdin (privacy-first) rather than argv by default. Set `CHUNKHOUND_CODEX_STDIN_FIRST=0` to prefer argv for short prompts.
 - Environment variables:
+  - `CHUNKHOUND_CODEX_CONFIG_OVERRIDE` — `env` (default) uses `CODEX_CONFIG`; `flag` adds `--config <path>`
+  - `CHUNKHOUND_CODEX_CONFIG_ENV` — env key for config path (default: `CODEX_CONFIG`)
+  - `CHUNKHOUND_CODEX_CONFIG_FLAG` — config flag name when using `flag` override (default: `--config`)
+  - `CHUNKHOUND_CODEX_DEFAULT_MODEL` — fallback Codex CLI model when config/model is `codex` (default: `gpt-5-codex`)
+  - `CHUNKHOUND_CODEX_REASONING_EFFORT` — reasoning effort written to temp config (`minimal`, `low`, `medium`, `high`; default: `low`)
+  - `CHUNKHOUND_CODEX_AUTH_ENV` — comma-list of auth envs to forward (default: `OPENAI_API_KEY,CODEX_API_KEY,ANTHROPIC_API_KEY,BEARER_TOKEN`)
+  - `CHUNKHOUND_CODEX_PASSTHROUGH_ENV` — comma-list of additional envs to forward
   - `CHUNKHOUND_CODEX_BIN` — path to the `codex` binary (default: `codex` on PATH)
   - `CHUNKHOUND_CODEX_ARG_LIMIT` — max characters to pass via argv before falling back to stdin (default: 200000)
-  - `CHUNKHOUND_CODEX_COPY_ALL` — set to `1` to copy entire `CODEX_HOME` into the overlay (default: minimal selective copy of likely auth/session files only)
-  - `CHUNKHOUND_CODEX_MAX_COPY_BYTES` — max size to copy for single files during minimal copy (default: 1,000,000 bytes)
+  - `CHUNKHOUND_CODEX_COPY_ALL` — copy entire `CODEX_HOME` in overlay mode (default: minimal selective copy)
+  - `CHUNKHOUND_CODEX_MAX_COPY_BYTES` — per-file copy cap in overlay mode (default: 1,000,000 bytes)
   - `CHUNKHOUND_CODEX_LOG_MAX_ERR` — max characters of stderr included in error messages (default: 800; secrets are redacted)
 
 If Codex is unavailable or unauthenticated, ChunkHound’s other providers (OpenAI, Ollama, Claude Code CLI, Bedrock) remain available.

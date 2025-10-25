@@ -47,7 +47,6 @@ async def test_codex_overlay_cleanup(monkeypatch, tmp_path: Path):
     be removed regardless of success.
     """
     from chunkhound.providers.llm.codex_cli_provider import CodexCLIProvider
-
     # Force provider to consider Codex available
     monkeypatch.setattr(CodexCLIProvider, "_codex_available", lambda self: True, raising=True)
 
@@ -56,12 +55,13 @@ async def test_codex_overlay_cleanup(monkeypatch, tmp_path: Path):
     overlay_dir.mkdir(parents=True, exist_ok=True)
 
     # Monkeypatch build to return our overlay path
-    monkeypatch.setattr(
-        CodexCLIProvider,
-        "_build_overlay_home",
-        lambda self: str(overlay_dir),
-        raising=True,
-    )
+    requested_model = {}
+
+    def _fake_overlay_home(self, model_override=None):
+        requested_model["value"] = model_override
+        return str(overlay_dir)
+
+    monkeypatch.setattr(CodexCLIProvider, "_build_overlay_home", _fake_overlay_home, raising=True)
 
     # Stub out subprocess creation to avoid calling real codex
     async def _fake_create_subprocess_exec(*args, **kwargs):  # noqa: ANN001
@@ -80,4 +80,4 @@ async def test_codex_overlay_cleanup(monkeypatch, tmp_path: Path):
 
     # Overlay should be cleaned up by provider
     assert not overlay_dir.exists(), "overlay CODEX_HOME was not cleaned up"
-
+    assert requested_model.get("value") == "gpt-5-codex"
