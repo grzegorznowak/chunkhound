@@ -1,11 +1,11 @@
 """Deep Research Service for ChunkHound - BFS-based semantic exploration."""
 
 import asyncio
-import math
+import re
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 
@@ -13,6 +13,7 @@ from chunkhound.database_factory import DatabaseServices
 from chunkhound.embeddings import EmbeddingManager
 from chunkhound.llm_manager import LLMManager
 from chunkhound.services import prompts
+from chunkhound.services.clustering_service import ClusterGroup, ClusteringService
 
 if TYPE_CHECKING:
     from chunkhound.api.cli.utils.tree_progress import TreeProgressDisplay
@@ -120,6 +121,14 @@ SYNTHESIS_INPUT_TOKENS_LARGE = 150_000  # Large repos (>= 1M LOC)
 
 # Output control
 REQUIRE_CITATIONS = True  # Validate file:line format
+
+# Map-reduce synthesis constants
+MAX_TOKENS_PER_CLUSTER = 30_000  # Token budget per cluster for parallel synthesis
+CLUSTER_OUTPUT_TOKEN_BUDGET = 15_000  # Max output tokens per cluster summary
+
+# Pre-compiled regex patterns for citation processing
+_CITATION_PATTERN = re.compile(r"\[\d+\]")  # Matches [N] citations
+_CITATION_SEQUENCE_PATTERN = re.compile(r"(?:\[\d+\])+")  # Matches sequences like [1][2][3]
 
 # Smart boundary detection for context-aware file reading
 ENABLE_SMART_BOUNDARIES = True  # Expand to natural code boundaries (functions/classes)
@@ -398,14 +407,68 @@ class DeepResearchService:
             input_tokens_used=budget_info["used_tokens"],
         )
 
-        # Single-pass synthesis with all data
-        answer = await self._single_pass_synthesis(
-            root_query=query,
-            chunks=prioritized_chunks,
-            files=budgeted_files,
-            context=context,
-            synthesis_budgets=synthesis_budgets,
+        # Cluster sources for map-reduce synthesis
+        cluster_groups, cluster_metadata = await self._cluster_sources_for_synthesis(
+            prioritized_chunks, budgeted_files, synthesis_budgets
         )
+
+        # If only 1 cluster, use single-pass (no benefit from map-reduce)
+        if cluster_metadata["num_clusters"] == 1:
+            logger.info("Single cluster detected - using single-pass synthesis")
+            answer = await self._single_pass_synthesis(
+                root_query=query,
+                chunks=prioritized_chunks,
+                files=budgeted_files,
+                context=context,
+                synthesis_budgets=synthesis_budgets,
+            )
+        else:
+            # Map-reduce synthesis with parallel execution
+            logger.info(
+                f"Multiple clusters detected - using map-reduce synthesis with "
+                f"{cluster_metadata['num_clusters']} clusters"
+            )
+
+            # Get provider concurrency limit
+            synthesis_provider = self._llm_manager.get_synthesis_provider()
+            max_concurrency = synthesis_provider.get_synthesis_concurrency()
+            logger.info(f"Using concurrency limit: {max_concurrency}")
+
+            # Map step: Synthesize each cluster in parallel
+            await self._emit_event(
+                "synthesis_map",
+                f"Synthesizing {cluster_metadata['num_clusters']} clusters in parallel "
+                f"(concurrency={max_concurrency})",
+            )
+
+            semaphore = asyncio.Semaphore(max_concurrency)
+
+            async def map_with_semaphore(cluster: ClusterGroup) -> dict[str, Any]:
+                async with semaphore:
+                    return await self._map_synthesis_on_cluster(
+                        cluster, query, prioritized_chunks, synthesis_budgets
+                    )
+
+            map_tasks = [map_with_semaphore(cluster) for cluster in cluster_groups]
+            cluster_results = await asyncio.gather(*map_tasks)
+
+            logger.info(
+                f"Map step complete: {len(cluster_results)} cluster summaries generated"
+            )
+
+            # Reduce step: Combine cluster summaries
+            await self._emit_event(
+                "synthesis_reduce",
+                f"Combining {len(cluster_results)} cluster summaries into final answer",
+            )
+
+            answer = await self._reduce_synthesis(
+                query,
+                cluster_results,
+                prioritized_chunks,
+                budgeted_files,
+                synthesis_budgets,
+            )
 
         # Emit validating event
         await self._emit_event("synthesis_validate", "Validating output quality")
@@ -415,7 +478,7 @@ class DeepResearchService:
         target_tokens = llm.estimate_tokens(answer)
         answer, quality_warnings = self._validate_output_quality(answer, target_tokens)
         if quality_warnings:
-            logger.warning(f"Quality issues detected:\n" + "\n".join(quality_warnings))
+            logger.warning("Quality issues detected:\n" + "\n".join(quality_warnings))
 
         # Validate citations in answer
         answer = self._validate_citations(answer, root.chunks)
@@ -434,7 +497,7 @@ class DeepResearchService:
         # Emit completion event
         await self._emit_event(
             "main_complete",
-            f"Deep research complete",
+            "Deep research complete",
             depth_reached=metadata["depth_reached"],
             nodes_explored=metadata["nodes_explored"],
             chunks_analyzed=metadata["chunks_analyzed"],
@@ -566,7 +629,7 @@ class DeepResearchService:
             )
             await self._emit_event(
                 "node_complete",
-                f"Complete (leaf at max depth)",
+                "Complete (leaf at max depth)",
                 node_id=node.node_id,
                 depth=depth,
                 files=len(file_contents),
@@ -628,7 +691,7 @@ class DeepResearchService:
         # Emit node completion
         await self._emit_event(
             "node_complete",
-            f"Complete",
+            "Complete",
             node_id=node.node_id,
             depth=depth,
             files=len(file_contents),
@@ -1423,7 +1486,7 @@ class DeepResearchService:
             else:
                 path = base_dir / file_path
 
-            with open(path, "r", encoding="utf-8", errors="replace") as f:
+            with open(path, encoding="utf-8", errors="replace") as f:
                 lines = f.readlines()
         except Exception as e:
             logger.debug(f"Could not re-read file for expansion: {file_path}: {e}")
@@ -2272,8 +2335,8 @@ class DeepResearchService:
 
         Args:
             root_query: Original research query
-            chunks: Prioritized chunks from BFS traversal
-            files: Budgeted file contents
+            chunks: All chunks from BFS traversal (will be filtered to match budgeted files)
+            files: Budgeted file contents (subset within token limits)
             context: Research context
             synthesis_budgets: Dynamic budgets based on repository size
 
@@ -2283,9 +2346,15 @@ class DeepResearchService:
         # Use output token budget from dynamic calculation
         max_output_tokens = synthesis_budgets["output_tokens"]
 
+        # Filter chunks to only include those from budgeted files
+        # This ensures consistency between reference map, citations, and footer
+        original_chunk_count = len(chunks)
+        budgeted_chunks = self._filter_chunks_to_files(chunks, files)
+
         logger.info(
-            f"Starting single-pass synthesis with {len(files)} files, {len(chunks)} chunks "
-            f"(output_limit={max_output_tokens:,})"
+            f"Starting single-pass synthesis with {len(files)} files, "
+            f"{len(budgeted_chunks)} chunks (filtered from {original_chunk_count} total, "
+            f"output_limit={max_output_tokens:,})"
         )
 
         llm = self._llm_manager.get_synthesis_provider()
@@ -2294,12 +2363,12 @@ class DeepResearchService:
         # This should never happen due to earlier validations, but catch it just in case
         if not files:
             logger.error(
-                f"Synthesis called with empty files dict despite {len(chunks)} chunks. "
+                f"Synthesis called with empty files dict despite {original_chunk_count} chunks. "
                 "This indicates a bug in aggregation or budget management."
             )
             raise RuntimeError(
                 f"Cannot synthesize answer: no code context available. "
-                f"Found {len(chunks)} chunks but received 0 files for synthesis. "
+                f"Found {original_chunk_count} chunks but received 0 files for synthesis. "
                 f"This is a bug - earlier validation should have caught this. "
                 f"Check aggregation and budget management logs."
             )
@@ -2309,7 +2378,7 @@ class DeepResearchService:
 
         # Group chunks by file for better presentation
         chunks_by_file: dict[str, list[dict[str, Any]]] = {}
-        for chunk in chunks:
+        for chunk in budgeted_chunks:
             file_path = chunk.get("file_path", "unknown")
             if file_path not in chunks_by_file:
                 chunks_by_file[file_path] = []
@@ -2348,6 +2417,10 @@ class DeepResearchService:
 
         code_context = "\n\n".join(code_sections)
 
+        # Build file reference map for numbered citations
+        file_reference_map = self._build_file_reference_map(budgeted_chunks, files)
+        reference_table = self._format_reference_table(file_reference_map)
+
         # Build output guidance with fixed 25k token budget
         # Output budget is always 25k (includes reasoning + actual output)
         output_guidance = (
@@ -2360,7 +2433,9 @@ class DeepResearchService:
         system = prompts.SYNTHESIS_SYSTEM_BUILDER(output_guidance)
 
         prompt = prompts.SYNTHESIS_USER.format(
-            root_query=root_query, code_context=code_context
+            root_query=root_query,
+            reference_table=reference_table,
+            code_context=code_context,
         )
 
         logger.info(
@@ -2401,7 +2476,7 @@ class DeepResearchService:
 
         # Append sources footer with file and chunk information
         try:
-            footer = self._build_sources_footer(chunks, files)
+            footer = self._build_sources_footer(budgeted_chunks, files, file_reference_map)
             if footer:
                 answer = f"{answer}\n\n{footer}"
         except Exception as e:
@@ -2411,6 +2486,324 @@ class DeepResearchService:
 
         logger.info(
             f"Single-pass synthesis complete: {llm.estimate_tokens(answer):,} tokens generated"
+        )
+
+        return answer
+
+    async def _cluster_sources_for_synthesis(
+        self,
+        chunks: list[dict[str, Any]],
+        files: dict[str, str],
+        synthesis_budgets: dict[str, int],
+    ) -> tuple[list[ClusterGroup], dict[str, int]]:
+        """Cluster files into token-bounded groups for map-reduce synthesis.
+
+        Args:
+            chunks: Prioritized chunks from BFS traversal
+            files: Budgeted file contents
+            synthesis_budgets: Dynamic budgets based on repository size
+
+        Returns:
+            Tuple of (cluster_groups, metadata)
+        """
+        logger.info(f"Clustering {len(files)} files for map-reduce synthesis")
+
+        # Initialize clustering service
+        embedding_provider = self._embedding_manager.get_provider()
+        llm_provider = self._llm_manager.get_synthesis_provider()
+        clustering_service = ClusteringService(
+            embedding_provider=embedding_provider,  # type: ignore[arg-type]
+            llm_provider=llm_provider,
+            max_tokens_per_cluster=MAX_TOKENS_PER_CLUSTER,
+        )
+
+        # Cluster the files
+        cluster_groups, metadata = await clustering_service.cluster_files(files)
+
+        logger.info(
+            f"Clustered into {metadata['num_clusters']} groups, "
+            f"avg {metadata['avg_tokens_per_cluster']:,} tokens/cluster"
+        )
+
+        return cluster_groups, metadata
+
+    async def _map_synthesis_on_cluster(
+        self,
+        cluster: ClusterGroup,
+        root_query: str,
+        chunks: list[dict[str, Any]],
+        synthesis_budgets: dict[str, int],
+    ) -> dict[str, Any]:
+        """Synthesize partial answer for one cluster of files.
+
+        Args:
+            cluster: Cluster group with files to synthesize
+            root_query: Original research query
+            chunks: All chunks (will be filtered to cluster files)
+            synthesis_budgets: Dynamic budgets based on repository size
+
+        Returns:
+            Dictionary with:
+                - cluster_id: int
+                - summary: str (synthesized content for this cluster)
+                - sources: list[dict] (files and chunks used)
+        """
+        # Filter chunks to only those in this cluster's files
+        # This ensures consistency between reference map, citations, and cluster content
+        original_chunk_count = len(chunks)
+        cluster_chunks = self._filter_chunks_to_files(chunks, cluster.files_content)
+
+        logger.debug(
+            f"Synthesizing cluster {cluster.cluster_id} "
+            f"({len(cluster.file_paths)} files, {len(cluster_chunks)} chunks filtered from {original_chunk_count}, "
+            f"{cluster.total_tokens:,} tokens)"
+        )
+
+        llm = self._llm_manager.get_synthesis_provider()
+
+        # Build code context for this cluster (same logic as single-pass)
+        code_sections = []
+        chunks_by_file: dict[str, list[dict[str, Any]]] = {}
+        for chunk in cluster_chunks:
+            file_path = chunk.get("file_path", "unknown")
+            if file_path not in chunks_by_file:
+                chunks_by_file[file_path] = []
+            chunks_by_file[file_path].append(chunk)
+
+        for file_path, content in cluster.files_content.items():
+            if file_path in chunks_by_file:
+                file_chunks = chunks_by_file[file_path]
+                sorted_chunks = sorted(
+                    file_chunks, key=lambda c: c.get("start_line", 0)
+                )
+                chunk_sections = []
+                for chunk in sorted_chunks:
+                    start_line = chunk.get("start_line", "?")
+                    end_line = chunk.get("end_line", "?")
+                    chunk_code = chunk.get("content", "")
+                    chunk_sections.append(
+                        f"# Lines {start_line}-{end_line}\n{chunk_code}"
+                    )
+                file_content = "\n\n".join(chunk_sections)
+            else:
+                file_content = content
+
+            code_sections.append(
+                f"### {file_path}\n{'=' * 80}\n{file_content}\n{'=' * 80}"
+            )
+
+        code_context = "\n\n".join(code_sections)
+
+        # Build file reference map for numbered citations (cluster-specific)
+        cluster_files = cluster.files_content
+        file_reference_map = self._build_file_reference_map(cluster_chunks, cluster_files)
+        reference_table = self._format_reference_table(file_reference_map)
+
+        # Build cluster-specific synthesis prompt
+        # Use smaller output budget per cluster (will be combined in reduce step)
+        cluster_output_tokens = min(
+            CLUSTER_OUTPUT_TOKEN_BUDGET, synthesis_budgets["output_tokens"] // 2
+        )
+
+        system = f"""You are analyzing a subset of code files as part of a larger codebase analysis.
+
+Focus on:
+1. Key architectural patterns and components in these files
+2. Important implementation details and relationships
+3. How these files contribute to answering the query
+
+{prompts.CITATION_REQUIREMENTS}
+
+Be thorough but concise - your analysis will be combined with other clusters.
+Target output: ~{cluster_output_tokens:,} tokens (includes reasoning)."""
+
+        prompt = f"""Query: {root_query}
+
+{reference_table}
+
+Analyze the following code files and provide insights relevant to the query above:
+
+{code_context}
+
+Provide a comprehensive analysis focusing on the query."""
+
+        logger.debug(
+            f"Calling LLM for cluster {cluster.cluster_id} synthesis "
+            f"(max_completion_tokens={cluster_output_tokens:,}, "
+            f"timeout={SINGLE_PASS_TIMEOUT_SECONDS}s)"
+        )
+
+        response = await llm.complete(
+            prompt,
+            system=system,
+            max_completion_tokens=cluster_output_tokens,
+            timeout=SINGLE_PASS_TIMEOUT_SECONDS,
+        )
+
+        # Build sources list for this cluster
+        sources = []
+        for chunk in cluster_chunks:
+            sources.append(
+                {
+                    "file_path": chunk.get("file_path"),
+                    "start_line": chunk.get("start_line"),
+                    "end_line": chunk.get("end_line"),
+                }
+            )
+
+        logger.debug(
+            f"Cluster {cluster.cluster_id} synthesis complete: "
+            f"{llm.estimate_tokens(response.content):,} tokens generated"
+        )
+
+        return {
+            "cluster_id": cluster.cluster_id,
+            "summary": response.content,
+            "sources": sources,
+            "file_paths": cluster.file_paths,
+            "file_reference_map": file_reference_map,
+        }
+
+    async def _reduce_synthesis(
+        self,
+        root_query: str,
+        cluster_results: list[dict[str, Any]],
+        all_chunks: list[dict[str, Any]],
+        all_files: dict[str, str],
+        synthesis_budgets: dict[str, int],
+    ) -> str:
+        """Combine cluster summaries into final answer.
+
+        Args:
+            root_query: Original research query
+            cluster_results: Results from map step (cluster summaries)
+            all_chunks: All chunks from clusters (will be filtered to match synthesized files)
+            all_files: All files that were synthesized across clusters
+            synthesis_budgets: Dynamic budgets based on repository size
+
+        Returns:
+            Final synthesized answer with sources footer
+        """
+        # Filter chunks to only include those from synthesized files
+        # This ensures consistency between reference map, citations, and footer
+        original_chunk_count = len(all_chunks)
+        budgeted_chunks = self._filter_chunks_to_files(all_chunks, all_files)
+
+        logger.info(
+            f"Reducing {len(cluster_results)} cluster summaries into final answer "
+            f"({len(budgeted_chunks)} chunks filtered from {original_chunk_count})"
+        )
+
+        llm = self._llm_manager.get_synthesis_provider()
+        max_output_tokens = synthesis_budgets["output_tokens"]
+
+        # Build global file reference map for all clusters
+        file_reference_map = self._build_file_reference_map(budgeted_chunks, all_files)
+        reference_table = self._format_reference_table(file_reference_map)
+
+        # Remap cluster-local citations to global reference numbers
+        logger.info("Remapping cluster-local citations to global references")
+        for result in cluster_results:
+            cluster_file_map = result["file_reference_map"]
+            original_summary = result["summary"]
+            remapped_summary = self._remap_cluster_citations(
+                original_summary, cluster_file_map, file_reference_map
+            )
+            result["summary"] = remapped_summary
+
+        # Combine all cluster summaries (now with global references)
+        cluster_summaries = []
+        for i, result in enumerate(cluster_results, 1):
+            summary = result["summary"]
+            file_paths = result["file_paths"]
+            files = ", ".join(file_paths[:5])  # Show first 5 files
+            if len(file_paths) > 5:
+                remaining = len(file_paths) - 5
+                files += f", ... (+{remaining} more)"
+
+            cluster_summaries.append(
+                f"## Cluster {i} Analysis\n**Files**: {files}\n\n{summary}"
+            )
+
+        combined_summaries = "\n\n" + "=" * 80 + "\n\n".join(cluster_summaries)
+
+        # Build reduce prompt
+        system = f"""You are synthesizing multiple partial analyses into a comprehensive final answer.
+
+Your task:
+1. Integrate insights from all cluster analyses
+2. Eliminate redundancy and contradictions
+3. Organize information coherently
+4. Maintain focus on the original query
+5. PRESERVE ALL reference number citations [N] from cluster analyses
+   - Citation numbers have already been remapped to global references
+   - Do NOT generate new citations (you don't have access to code)
+   - DO preserve existing [N] citations when combining insights
+   - Maintain citation density throughout the integrated answer
+
+Target output: ~{max_output_tokens:,} tokens (includes reasoning)."""
+
+        prompt = f"""Query: {root_query}
+
+{reference_table}
+
+You have been provided with analyses of different code clusters.
+Synthesize these into a comprehensive, well-organized answer to the query.
+
+NOTE: All citation numbers [N] in the cluster analyses have been remapped to match the global Source References table above. Simply preserve these citations as you integrate the analyses.
+
+{combined_summaries}
+
+Provide a complete, integrated analysis that addresses the original query."""
+
+        logger.debug(
+            f"Calling LLM for reduce synthesis "
+            f"(max_completion_tokens={max_output_tokens:,})"
+        )
+
+        response = await llm.complete(
+            prompt,
+            system=system,
+            max_completion_tokens=max_output_tokens,
+            timeout=SINGLE_PASS_TIMEOUT_SECONDS,  # type: ignore[call-arg]
+        )
+
+        answer = response.content
+
+        # Validate minimum length
+        MIN_SYNTHESIS_LENGTH = 100
+        answer_length = len(answer.strip()) if answer else 0
+
+        if answer_length < MIN_SYNTHESIS_LENGTH:
+            logger.error(
+                f"Reduce synthesis returned suspiciously short answer: {answer_length} chars"
+            )
+            raise RuntimeError(
+                f"LLM reduce synthesis failed: generated only {answer_length} characters "
+                f"(minimum: {MIN_SYNTHESIS_LENGTH}). finish_reason={response.finish_reason}."
+            )
+
+        # Validate citation references are valid
+        invalid_citations = self._validate_citation_references(answer, file_reference_map)
+        if invalid_citations:
+            logger.warning(
+                f"Found {len(invalid_citations)} invalid citation references after reduce: "
+                f"{invalid_citations[:10]}"
+                + (f" ... and {len(invalid_citations) - 10} more" if len(invalid_citations) > 10 else "")
+            )
+
+        # Append sources footer (aggregate all sources from all clusters)
+        try:
+            footer = self._build_sources_footer(budgeted_chunks, all_files, file_reference_map)
+            if footer:
+                answer = f"{answer}\n\n{footer}"
+        except Exception as e:
+            logger.warning(
+                f"Failed to generate sources footer: {e}. Continuing without footer."
+            )
+
+        logger.info(
+            f"Reduce synthesis complete: {llm.estimate_tokens(answer):,} tokens generated"
         )
 
         return answer
@@ -2499,9 +2892,7 @@ class DeepResearchService:
                 logger.warning(f"Output quality issue: contains '{pattern}'")
 
         # Check 2: Citation density (should have reasonable citations)
-        import re
-
-        citations = re.findall(r"[\w/]+\.\w+:\d+", answer)
+        citations = _CITATION_PATTERN.findall(answer)
         citation_count = len(citations)
         answer_tokens = llm.estimate_tokens(answer)
 
@@ -2545,7 +2936,7 @@ class DeepResearchService:
         return answer, warnings
 
     def _validate_citations(self, answer: str, chunks: list[dict[str, Any]]) -> str:
-        """Ensure answer contains file:line citations.
+        """Ensure answer contains numbered reference citations.
 
         Args:
             answer: Answer text to validate
@@ -2557,11 +2948,8 @@ class DeepResearchService:
         if not REQUIRE_CITATIONS:
             return answer
 
-        import re
-
-        # Check for citation pattern: filename.ext:123 or filename.ext:123-456
-        citation_pattern = r"[\w/]+\.\w+:\d+(?:-\d+)?"
-        citations = re.findall(citation_pattern, answer)
+        # Check for citation pattern: [N] where N is a reference number
+        citations = _CITATION_PATTERN.findall(answer)
 
         answer_length = len(answer.strip())
         answer_lines = answer.count("\n") + 1
@@ -2594,11 +2982,11 @@ class DeepResearchService:
             elif answer_length < 200:
                 logger.warning(
                     f"LLM answer suspiciously short ({answer_length} chars) and missing "
-                    f"file:line citations in analysis body"
+                    f"reference citations [N] in analysis body"
                 )
             else:
                 logger.warning(
-                    f"LLM answer missing file:line citations in analysis body "
+                    f"LLM answer missing reference citations [N] in analysis body "
                     f"(answer_length={answer_length} chars, {answer_lines} lines). "
                     f"Check if prompt citation examples are being followed."
                 )
@@ -2609,10 +2997,259 @@ class DeepResearchService:
                 f"({citation_count} total citations). Consider reviewing prompt emphasis."
             )
 
+        # Sort citation sequences for improved readability
+        answer = self._sort_citation_sequences(answer)
+
         return answer
 
-    def _build_sources_footer(
+    def _sort_citation_sequences(self, text: str) -> str:
+        """Sort inline citation sequences in ascending numerical order.
+
+        Transforms sequences like [11][2][1][5] into [1][2][5][11] for improved
+        readability. Only sorts consecutive citations - isolated citations and
+        citations separated by text remain in their original positions.
+
+        Args:
+            text: Text containing citation sequences
+
+        Returns:
+            Text with sorted citation sequences
+
+        Examples:
+            >>> _sort_citation_sequences("Algorithm [11][2][1] uses BFS")
+            "Algorithm [1][2][11] uses BFS"
+
+            >>> _sort_citation_sequences("Timeout [5] and threshold [3][1][2]")
+            "Timeout [5] and threshold [1][2][3]"
+        """
+
+        def sort_sequence(match):
+            """Extract numbers, sort numerically, and reconstruct."""
+            sequence = match.group(0)
+            numbers = re.findall(r"\d+", sequence)
+            sorted_numbers = sorted(int(n) for n in numbers)
+            return "".join(f"[{n}]" for n in sorted_numbers)
+
+        return _CITATION_SEQUENCE_PATTERN.sub(sort_sequence, text)
+
+    def _filter_chunks_to_files(
+        self,
+        chunks: list[dict[str, Any]],
+        files: dict[str, str],
+    ) -> list[dict[str, Any]]:
+        """Filter chunks to only include those from specified files.
+
+        Ensures consistency between reference map, citations, and footer by
+        only including chunks from files that were actually synthesized.
+
+        Args:
+            chunks: List of all chunks from BFS traversal
+            files: Dictionary of files used in synthesis
+
+        Returns:
+            Filtered list of chunks matching files dict
+
+        Examples:
+            >>> chunks = [
+            ...     {"file_path": "src/main.py", "content": "..."},
+            ...     {"file_path": "tests/test.py", "content": "..."},
+            ...     {"file_path": "docs/readme.md", "content": "..."},
+            ... ]
+            >>> files = {"src/main.py": "...", "tests/test.py": "..."}
+            >>> filtered = service._filter_chunks_to_files(chunks, files)
+            >>> len(filtered)
+            2
+        """
+        return [c for c in chunks if c.get("file_path") in files]
+
+    def _build_file_reference_map(
         self, chunks: list[dict[str, Any]], files: dict[str, str]
+    ) -> dict[str, int]:
+        """Build mapping of file paths to reference numbers.
+
+        Assigns sequential numbers to unique files in alphabetical order
+        for deterministic, consistent numbering across synthesis steps.
+
+        IMPORTANT: chunks must be pre-filtered to only include files present
+        in the files dict. This ensures consistent numbering without gaps.
+
+        Args:
+            chunks: List of chunks (must be pre-filtered to match files dict)
+            files: Dictionary of files used in synthesis
+
+        Returns:
+            Dictionary mapping file_path -> reference number (1-indexed)
+
+        Examples:
+            >>> files = {"src/main.py": "...", "tests/test.py": "..."}
+            >>> chunks = []  # Empty or pre-filtered to match files
+            >>> ref_map = service._build_file_reference_map(chunks, files)
+            >>> ref_map
+            {"src/main.py": 1, "tests/test.py": 2}
+        """
+        # Extract unique file paths from files dict
+        # NOTE: chunks must be pre-filtered to only include files in the files dict
+        # to ensure consistency between reference map, citations, and footer display
+        file_paths = set(files.keys())
+
+        # Sort alphabetically for deterministic numbering
+        sorted_files = sorted(file_paths)
+
+        # Assign sequential numbers (1-indexed)
+        return {file_path: idx + 1 for idx, file_path in enumerate(sorted_files)}
+
+    def _format_reference_table(self, file_reference_map: dict[str, int]) -> str:
+        """Format file reference mapping as markdown table for LLM prompt.
+
+        Args:
+            file_reference_map: Dictionary mapping file_path -> reference number
+
+        Returns:
+            Formatted markdown table showing reference numbers
+
+        Examples:
+            >>> ref_map = {"src/main.py": 1, "tests/test.py": 2}
+            >>> table = service._format_reference_table(ref_map)
+            >>> print(table)
+            ## Source References
+
+            Use these reference numbers for citations:
+
+            [1] src/main.py
+            [2] tests/test.py
+        """
+        if not file_reference_map:
+            return ""
+
+        # Sort by reference number
+        sorted_refs = sorted(file_reference_map.items(), key=lambda x: x[1])
+
+        # Build table
+        lines = [
+            "## Source References",
+            "",
+            "Use these reference numbers for citations:",
+            "",
+        ]
+
+        for file_path, ref_num in sorted_refs:
+            lines.append(f"[{ref_num}] {file_path}")
+
+        return "\n".join(lines)
+
+    def _remap_cluster_citations(
+        self,
+        cluster_summary: str,
+        cluster_file_map: dict[str, int],
+        global_file_map: dict[str, int],
+    ) -> str:
+        """Remap cluster-local [N] citations to global reference numbers.
+
+        Programmatically rewrites all [N] citations in the cluster summary to use
+        global reference numbers instead of cluster-local numbers. This ensures
+        consistent citations when combining multiple cluster summaries.
+
+        Algorithm:
+        1. Build reverse lookup: cluster_ref_num -> file_path
+        2. For each file, get its global reference number
+        3. Replace all [cluster_N] with [global_N] in the summary text
+
+        Args:
+            cluster_summary: Text with cluster-local [N] citations
+            cluster_file_map: Mapping from file_path -> cluster-local reference number
+            global_file_map: Mapping from file_path -> global reference number
+
+        Returns:
+            Summary text with remapped citations using global numbers
+
+        Examples:
+            >>> # Cluster 1 has: src/main.py=[1], tests/test.py=[2]
+            >>> # Global has: src/main.py=[5], tests/test.py=[8]
+            >>> cluster_summary = "Algorithm [1] calls helper [2]"
+            >>> remapped = service._remap_cluster_citations(
+            ...     cluster_summary,
+            ...     {"src/main.py": 1, "tests/test.py": 2},
+            ...     {"src/main.py": 5, "tests/test.py": 8}
+            ... )
+            >>> remapped
+            "Algorithm [5] calls helper [8]"
+        """
+        # Build reverse lookup: cluster number -> file path
+        cluster_num_to_file = {num: path for path, num in cluster_file_map.items()}
+
+        # Build remapping table: cluster number -> global number
+        remapping = {}
+        for cluster_num, file_path in cluster_num_to_file.items():
+            if file_path in global_file_map:
+                global_num = global_file_map[file_path]
+                remapping[cluster_num] = global_num
+            else:
+                logger.warning(
+                    f"File {file_path} in cluster map but not in global map - "
+                    f"citation [{cluster_num}] will not be remapped"
+                )
+
+        # Replace citations in order from highest to lowest number
+        # This prevents issues like replacing [1] before [11] (which would break [11])
+        remapped_summary = cluster_summary
+        for cluster_num in sorted(remapping.keys(), reverse=True):
+            global_num = remapping[cluster_num]
+            # Replace [cluster_num] with [global_num]
+            # Use word boundaries to avoid replacing [1] in [11]
+            old_citation = f"[{cluster_num}]"
+            new_citation = f"[{global_num}]"
+            remapped_summary = remapped_summary.replace(old_citation, new_citation)
+
+        logger.debug(
+            f"Remapped {len(remapping)} citation references in cluster summary"
+        )
+
+        return remapped_summary
+
+    def _validate_citation_references(
+        self, text: str, file_reference_map: dict[str, int]
+    ) -> list[int]:
+        """Validate that all [N] citations exist in the file reference map.
+
+        Checks that every citation [N] in the text corresponds to a valid
+        file reference number. Invalid citations indicate bugs in remapping
+        or LLM-generated citations.
+
+        Args:
+            text: Text containing [N] citations
+            file_reference_map: Valid reference numbers (file_path -> number)
+
+        Returns:
+            List of invalid reference numbers (citations that don't exist in map)
+
+        Examples:
+            >>> text = "Algorithm [1] uses [2] but also [999]"
+            >>> ref_map = {"src/main.py": 1, "tests/test.py": 2}
+            >>> invalid = service._validate_citation_references(text, ref_map)
+            >>> invalid
+            [999]
+        """
+        # Extract all valid reference numbers from the map
+        valid_refs = set(file_reference_map.values())
+
+        # Find all [N] citations in text
+        citations = _CITATION_PATTERN.findall(text)
+
+        # Extract numbers from citations
+        invalid_refs = []
+        for citation in citations:
+            # Extract number from [N]
+            num = int(citation[1:-1])  # Remove [ and ]
+            if num not in valid_refs:
+                invalid_refs.append(num)
+
+        return sorted(set(invalid_refs))  # Return unique sorted list
+
+    def _build_sources_footer(
+        self,
+        chunks: list[dict[str, Any]],
+        files: dict[str, str],
+        file_reference_map: dict[str, int] | None = None,
     ) -> str:
         """Build footer section with source file and chunk information.
 
@@ -2698,6 +3335,11 @@ class DeepResearchService:
                 # Build connector
                 connector = "└── " if is_last else "├── "
                 display_name = node.name
+
+                # Add reference number for files (if map provided)
+                if node.is_file and file_reference_map and node.full_path in file_reference_map:
+                    ref_num = file_reference_map[node.full_path]
+                    display_name = f"[{ref_num}] {display_name}"
 
                 # Add / suffix for directories
                 if not node.is_file and node.children:
