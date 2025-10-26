@@ -5,20 +5,23 @@ import math
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal, TYPE_CHECKING
+from typing import Any, TYPE_CHECKING
 
 from loguru import logger
 
 from chunkhound.database_factory import DatabaseServices
 from chunkhound.embeddings import EmbeddingManager
 from chunkhound.llm_manager import LLMManager
+from chunkhound.services import prompts
 
 if TYPE_CHECKING:
     from chunkhound.api.cli.utils.tree_progress import TreeProgressDisplay
 
 # Constants
 RELEVANCE_THRESHOLD = 0.5  # Lower threshold for better recall, reranking will filter
-NODE_SIMILARITY_THRESHOLD = 0.2  # Reserved for future similarity-based deduplication (currently uses LLM)
+NODE_SIMILARITY_THRESHOLD = (
+    0.2  # Reserved for future similarity-based deduplication (currently uses LLM)
+)
 MAX_FOLLOWUP_QUESTIONS = 3
 MAX_SYMBOLS_TO_SEARCH = 5  # Top N symbols to search via regex (from spec)
 QUERY_EXPANSION_ENABLED = True  # Enable LLM-powered query expansion for better recall
@@ -28,12 +31,12 @@ NUM_LLM_EXPANDED_QUERIES = 2  # LLM generates 2 queries, we prepend original = 3
 ENABLE_ADAPTIVE_BUDGETS = True  # Enable depth-based adaptive budgets
 
 # File content budget range (input: what LLM sees for code)
-FILE_CONTENT_TOKENS_MIN = 10_000    # Root nodes (synthesizing, need less raw code)
-FILE_CONTENT_TOKENS_MAX = 50_000    # Leaf nodes (analyzing, need full implementations)
+FILE_CONTENT_TOKENS_MIN = 10_000  # Root nodes (synthesizing, need less raw code)
+FILE_CONTENT_TOKENS_MAX = 50_000  # Leaf nodes (analyzing, need full implementations)
 
 # LLM total input budget range (query + context + code)
-LLM_INPUT_TOKENS_MIN = 15_000       # Root nodes
-LLM_INPUT_TOKENS_MAX = 60_000       # Leaf nodes
+LLM_INPUT_TOKENS_MIN = 15_000  # Root nodes
+LLM_INPUT_TOKENS_MAX = 60_000  # Leaf nodes
 
 # Leaf answer output budget (what LLM generates at leaves)
 # NOTE: Reduced from 30k to balance cost vs quality. If you observe:
@@ -41,28 +44,44 @@ LLM_INPUT_TOKENS_MAX = 60_000       # Leaf nodes
 #   - Theoretical placeholders ("provide exact values")
 #   - Incomplete analysis of complex components
 # Consider increasing these values. Quality validation warnings will indicate budget pressure.
-LEAF_ANSWER_TOKENS_BASE = 18_000    # Base budget for leaf nodes (was 30k, reduced for cost)
-LEAF_ANSWER_TOKENS_BONUS = 3_000    # Additional tokens for deeper leaves (was 5k, reduced for cost)
+LEAF_ANSWER_TOKENS_BASE = (
+    18_000  # Base budget for leaf nodes (was 30k, reduced for cost)
+)
+LEAF_ANSWER_TOKENS_BONUS = (
+    3_000  # Additional tokens for deeper leaves (was 5k, reduced for cost)
+)
 
 # Internal synthesis output budget (what LLM generates at internal nodes)
 # NOTE: Reduced from 17.5k/32k to balance cost vs quality. If root synthesis appears rushed or
 # omits critical architectural details, consider increasing INTERNAL_ROOT_TARGET.
-INTERNAL_ROOT_TARGET = 11_000       # Root synthesis target (was 17.5k, reduced for cost)
-INTERNAL_MAX_TOKENS = 19_000        # Maximum for deep internal nodes (was 32k, reduced for cost)
+INTERNAL_ROOT_TARGET = 11_000  # Root synthesis target (was 17.5k, reduced for cost)
+INTERNAL_MAX_TOKENS = (
+    19_000  # Maximum for deep internal nodes (was 32k, reduced for cost)
+)
 
 # Follow-up question generation output budget (what LLM generates for follow-up questions)
 # NOTE: High budgets needed for reasoning models (o1/o3/GPT-5) which use internal "thinking" tokens
 # WHY: Reasoning models consume 5-15k tokens for internal reasoning before producing 100-500 tokens of output
 # The actual generated questions are concise, but the model needs reasoning budget to evaluate relevance
-FOLLOWUP_OUTPUT_TOKENS_MIN = 8_000   # Root/shallow nodes: simpler questions, less reasoning needed
-FOLLOWUP_OUTPUT_TOKENS_MAX = 15_000  # Deep nodes: complex synthesis requires more reasoning depth
+FOLLOWUP_OUTPUT_TOKENS_MIN = (
+    8_000  # Root/shallow nodes: simpler questions, less reasoning needed
+)
+FOLLOWUP_OUTPUT_TOKENS_MAX = (
+    15_000  # Deep nodes: complex synthesis requires more reasoning depth
+)
 
 # Utility operation output budgets (for reasoning models like o1/o3/GPT-5)
 # These operations use utility provider and don't vary by depth
 # WHY: Each utility operation produces small output but requires reasoning budget for quality
-QUERY_EXPANSION_TOKENS = 10_000      # Generate 2 queries (~200 output + ~8k reasoning to ensure diversity)
-QUESTION_SYNTHESIS_TOKENS = 15_000   # Synthesize to 1-3 questions (~500 output + ~12k reasoning for quality)
-QUESTION_FILTERING_TOKENS = 5_000    # Filter by relevance (~50 output + ~4k reasoning for accuracy)
+QUERY_EXPANSION_TOKENS = (
+    10_000  # Generate 2 queries (~200 output + ~8k reasoning to ensure diversity)
+)
+QUESTION_SYNTHESIS_TOKENS = (
+    15_000  # Synthesize to 1-3 questions (~500 output + ~12k reasoning for quality)
+)
+QUESTION_FILTERING_TOKENS = (
+    5_000  # Filter by relevance (~50 output + ~4k reasoning for accuracy)
+)
 
 # Legacy constants (used when ENABLE_ADAPTIVE_BUDGETS = False)
 TOKEN_BUDGET_PER_FILE = 4000
@@ -73,18 +92,31 @@ MAX_LEAF_ANSWER_TOKENS = 400
 MAX_SYNTHESIS_TOKENS = 600
 
 # Single-pass synthesis constants (new architecture)
-SINGLE_PASS_MAX_TOKENS = 150_000  # Total budget for single-pass synthesis (input + output)
-OUTPUT_TOKENS_WITH_REASONING = 30_000  # Fixed token limit (18k output + 12k reasoning buffer for GPT-5/Gemini 2.5)
+SINGLE_PASS_MAX_TOKENS = (
+    150_000  # Total budget for single-pass synthesis (input + output)
+)
+OUTPUT_TOKENS_WITH_REASONING = 30_000  # Fixed output budget for reasoning models (18k output + 12k reasoning buffer)
 SINGLE_PASS_OVERHEAD_TOKENS = 5_000  # Prompt template and overhead
 SINGLE_PASS_TIMEOUT_SECONDS = 600  # 10 minutes timeout for large synthesis calls
-# Available for code/chunks: 150k - 30k - 5k = 115k tokens
+# Available for code/chunks: Scales dynamically with repo size (30k-150k input tokens)
 
-# Target output lengths (controlled via prompt instructions, not API token limits)
-# WHY: Both modes use OUTPUT_TOKENS_WITH_REASONING (30k) for API, but prompts guide output length
+# Target output length (controlled via prompt instructions, not API token limits)
+# WHY: OUTPUT_TOKENS_WITH_REASONING is FIXED at 30k for all queries (reasoning models need this)
 # This allows reasoning models to use thinking tokens while producing appropriately sized output
-SHALLOW_TARGET_WORDS = 1_500    # Concise insights for shallow mode (~2k tokens) - daily use
-SHALLOW_TARGET_TOKENS = 10_000  # Target for shallow: quick, focused answers
-DEEP_TARGET_TOKENS = 20_000     # Target for deep: comprehensive, detailed analysis
+# NOTE: Only INPUT budget scales dynamically based on repository size, output is fixed
+TARGET_OUTPUT_TOKENS = 15_000  # Default target for standard research outputs
+
+# Synthesis budget calculation (repository size scaling)
+CHUNKS_TO_LOC_ESTIMATE = 20  # Rough estimation: 1 chunk ≈ 20 lines of code
+LOC_THRESHOLD_TINY = 10_000  # Very small repos
+LOC_THRESHOLD_SMALL = 100_000  # Small repos
+LOC_THRESHOLD_MEDIUM = 1_000_000  # Medium repos
+# Large repos: >= 1M LOC
+
+SYNTHESIS_INPUT_TOKENS_TINY = 30_000  # Very small repos (< 10k LOC)
+SYNTHESIS_INPUT_TOKENS_SMALL = 50_000  # Small repos (< 100k LOC)
+SYNTHESIS_INPUT_TOKENS_MEDIUM = 80_000  # Medium repos (< 1M LOC)
+SYNTHESIS_INPUT_TOKENS_LARGE = 150_000  # Large repos (>= 1M LOC)
 
 # Output control
 REQUIRE_CITATIONS = True  # Validate file:line format
@@ -95,7 +127,9 @@ MAX_BOUNDARY_EXPANSION_LINES = 300  # Maximum lines to expand for complete funct
 
 # File-level reranking for synthesis budget allocation
 # Prevents file diversity collapse where deep BFS exploration causes score accumulation in few files
-MAX_CHUNKS_PER_FILE_REPR = 5  # Top chunks to include in file representative document for reranking
+MAX_CHUNKS_PER_FILE_REPR = (
+    5  # Top chunks to include in file representative document for reranking
+)
 MAX_TOKENS_PER_FILE_REPR = 2000  # Token limit for file representative document
 
 
@@ -108,11 +142,17 @@ class BFSNode:
     depth: int = 0
     children: list["BFSNode"] = field(default_factory=list)
     chunks: list[dict[str, Any]] = field(default_factory=list)
-    file_contents: dict[str, str] = field(default_factory=dict)  # Full file contents for synthesis
+    file_contents: dict[str, str] = field(
+        default_factory=dict
+    )  # Full file contents for synthesis
     answer: str | None = None
     node_id: int = 0
-    unanswered_aspects: list[str] = field(default_factory=list)  # Questions we couldn't answer
-    token_budgets: dict[str, int] = field(default_factory=dict)  # Adaptive token budgets for this node
+    unanswered_aspects: list[str] = field(
+        default_factory=list
+    )  # Questions we couldn't answer
+    token_budgets: dict[str, int] = field(
+        default_factory=dict
+    )  # Adaptive token budgets for this node
     task_id: int | None = None  # Progress task ID for TUI display
 
     # Termination tracking
@@ -156,8 +196,12 @@ class DeepResearchService:
         self._tool_name = tool_name
         self._node_counter = 0
         self.progress = progress  # Store progress instance for event emission
-        self._progress_lock: asyncio.Lock | None = None  # Lazy init for concurrent progress updates
-        self._progress_lock_init = threading.Lock()  # Thread-safe guard for lock creation
+        self._progress_lock: asyncio.Lock | None = (
+            None  # Lazy init for concurrent progress updates
+        )
+        self._progress_lock_init = (
+            threading.Lock()
+        )  # Thread-safe guard for lock creation
 
     async def _ensure_progress_lock(self) -> None:
         """Ensure progress lock exists (must be called in async event loop context).
@@ -203,55 +247,40 @@ class DeepResearchService:
                 metadata=metadata,
             )
 
-    async def deep_research(self, query: str, depth: Literal["shallow", "deep"] = "shallow") -> dict[str, Any]:
+    async def deep_research(self, query: str) -> dict[str, Any]:
         """Perform deep research on a query.
 
-        Removed user-facing follow-up suggestions from output for cleaner responses.
-        Internal BFS exploration still generates follow-ups to drive multi-level search.
+        Uses fixed BFS depth (max_depth=1) with dynamic synthesis budgets that scale
+        based on repository size. Empirical evidence shows shallow exploration with
+        comprehensive synthesis outperforms deep BFS traversal.
 
         Args:
             query: Research question to investigate
-            depth: Research depth mode controlling exploration breadth and output detail:
-                - "shallow" (default): Quick insights for daily use
-                  * BFS max_depth=1 (2 levels: root query + immediate follow-ups)
-                  * Output limited to 10k tokens (plus sources footer)
-                  * Faster responses, lower API costs
-                  * Good for: quick lookups, focused questions, day-to-day development
-                - "deep": Comprehensive architectural analysis
-                  * BFS max_depth adaptive (2-4 levels based on repository size)
-                  * Output up to 20k tokens (plus sources footer)
-                  * Thorough exploration, higher API costs
-                  * Good for: architecture reviews, complex debugging, unfamiliar codebases
 
         Returns:
-            Dictionary with answer and metadata (no follow_up_suggestions)
-
-        Raises:
-            ValueError: If depth is not "shallow" or "deep"
+            Dictionary with answer and metadata
         """
-        # Validate depth parameter
-        if depth not in ("shallow", "deep"):
-            raise ValueError(f"Invalid depth '{depth}'. Must be 'shallow' or 'deep'")
-
-        logger.info(f"Starting deep research for query: '{query}' (depth={depth})")
+        logger.info(f"Starting deep research for query: '{query}'")
 
         # Emit main start event
         await self._emit_event("main_start", f"Starting deep research: {query[:60]}...")
 
-        # Calculate max depth based on repository size
-        max_depth = self._calculate_max_depth(depth=depth)
-        logger.info(f"Max depth for this repository: {max_depth} (depth={depth})")
+        # Fixed max depth (empirically proven optimal)
+        max_depth = 1
+        logger.info(f"Using max_depth={max_depth} (fixed)")
 
-        # Emit mode info for user awareness
-        mode_label = "shallow (quick insights)" if depth == "shallow" else "deep (comprehensive)"
-        target = f"~{SHALLOW_TARGET_TOKENS//1000}k tokens" if depth == "shallow" else f"~{DEEP_TARGET_TOKENS//1000}k tokens"
-        await self._emit_event(
-            "main_info",
-            f"Mode: {mode_label}, max_depth: {max_depth}, target: {target}"
+        # Calculate dynamic synthesis budgets based on repository size
+        stats = self._db_services.provider.get_stats()
+        synthesis_budgets = self._calculate_synthesis_budgets(stats)
+        logger.info(
+            f"Synthesis budgets: input={synthesis_budgets['input_tokens']:,}, output={synthesis_budgets['output_tokens']:,}"
         )
 
-        # Emit depth info event
-        await self._emit_event("main_info", f"Max depth: {max_depth}", max_depth=max_depth)
+        # Emit configuration info
+        await self._emit_event(
+            "main_info",
+            f"Max depth: {max_depth}, synthesis budget: {synthesis_budgets['total_tokens'] // 1000}k tokens",
+        )
 
         # Initialize BFS graph with root node
         root = BFSNode(query=query, depth=0, node_id=self._get_next_node_id())
@@ -302,7 +331,9 @@ class DeepResearchService:
 
             # Process all nodes concurrently
             node_tasks = [
-                self._process_bfs_node(node, node_ctx, depth, global_explored_data, max_depth)
+                self._process_bfs_node(
+                    node, node_ctx, depth, global_explored_data, max_depth
+                )
                 for node, node_ctx in node_contexts
             ]
             children_lists = await asyncio.gather(*node_tasks, return_exceptions=True)
@@ -349,18 +380,22 @@ class DeepResearchService:
         aggregated = self._aggregate_all_findings(root)
 
         # Manage token budget for single-pass synthesis
-        prioritized_chunks, budgeted_files, budget_info = (
-            await self._manage_token_budget_for_synthesis(
-                aggregated["chunks"], aggregated["files"], query, depth
-            )
+        (
+            prioritized_chunks,
+            budgeted_files,
+            budget_info,
+        ) = await self._manage_token_budget_for_synthesis(
+            aggregated["chunks"], aggregated["files"], query, synthesis_budgets
         )
 
         # Emit synthesizing event
         await self._emit_event(
             "synthesis_start",
-            "Synthesizing final answer",
+            f"Synthesizing final answer (input: {budget_info['used_tokens']:,}/{budget_info['available_tokens']:,} tokens, {budget_info['utilization']})",
             chunks=len(prioritized_chunks),
             files=len(budgeted_files),
+            input_tokens_budget=budget_info["available_tokens"],
+            input_tokens_used=budget_info["used_tokens"],
         )
 
         # Single-pass synthesis with all data
@@ -369,7 +404,7 @@ class DeepResearchService:
             chunks=prioritized_chunks,
             files=budgeted_files,
             context=context,
-            depth=depth,
+            synthesis_budgets=synthesis_budgets,
         )
 
         # Emit validating event
@@ -451,7 +486,9 @@ class DeepResearchService:
         search_query = self._build_search_query(node.query, context)
 
         # Step 2-6: Run unified search (semantic + symbol extraction + regex)
-        chunks = await self._unified_search(search_query, context, node_id=node.node_id, depth=depth)
+        chunks = await self._unified_search(
+            search_query, context, node_id=node.node_id, depth=depth
+        )
         node.chunks = chunks
 
         if not chunks:
@@ -466,7 +503,9 @@ class DeepResearchService:
             return []
 
         # Step 8: Read files with adaptive token budget
-        await self._emit_event("read_files", "Reading files", node_id=node.node_id, depth=depth)
+        await self._emit_event(
+            "read_files", "Reading files", node_id=node.node_id, depth=depth
+        )
 
         file_contents = await self._read_files_with_budget(
             chunks, max_tokens=node.token_budgets["file_content_tokens"]
@@ -475,7 +514,9 @@ class DeepResearchService:
 
         # Emit file reading results
         llm = self._llm_manager.get_utility_provider()
-        total_tokens = sum(llm.estimate_tokens(content) for content in file_contents.values())
+        total_tokens = sum(
+            llm.estimate_tokens(content) for content in file_contents.values()
+        )
         await self._emit_event(
             "read_files_complete",
             f"Read {len(file_contents)} files",
@@ -487,7 +528,9 @@ class DeepResearchService:
 
         # Step 8.5: Check for new information (termination rule)
         # Uses global explored data to detect duplicates across entire BFS graph, not just ancestors
-        has_new_info, dedup_stats = self._detect_new_information(node, chunks, global_explored_data)
+        has_new_info, dedup_stats = self._detect_new_information(
+            node, chunks, global_explored_data
+        )
         node.new_chunk_count = dedup_stats["new_chunks"]
         node.duplicate_chunk_count = dedup_stats["duplicate_chunks"]
 
@@ -503,7 +546,7 @@ class DeepResearchService:
                 "No new information found",
                 node_id=node.node_id,
                 depth=depth,
-                duplicates=dedup_stats['duplicate_chunks'],
+                duplicates=dedup_stats["duplicate_chunks"],
             )
             return []  # No children
 
@@ -532,7 +575,12 @@ class DeepResearchService:
             )
             return []
 
-        await self._emit_event("llm_followup", "Generating follow-up questions", node_id=node.node_id, depth=depth)
+        await self._emit_event(
+            "llm_followup",
+            "Generating follow-up questions",
+            node_id=node.node_id,
+            depth=depth,
+        )
 
         follow_ups = await self._generate_follow_up_questions(
             node.query,
@@ -547,7 +595,9 @@ class DeepResearchService:
 
         # Emit follow-up generation results
         if follow_ups:
-            questions_preview = "; ".join(q[:40] + "..." if len(q) > 40 else q for q in follow_ups[:2])
+            questions_preview = "; ".join(
+                q[:40] + "..." if len(q) > 40 else q for q in follow_ups[:2]
+            )
             await self._emit_event(
                 "llm_followup_complete",
                 f"Generated {len(follow_ups)} follow-ups",
@@ -610,7 +660,11 @@ class DeepResearchService:
 
         # For child nodes: prioritize current query, add minimal parent context
         # Take last 1-2 ancestors (not more to avoid redundancy)
-        parent_context = context.ancestors[-2:] if len(context.ancestors) >= 2 else context.ancestors[-1:]
+        parent_context = (
+            context.ancestors[-2:]
+            if len(context.ancestors) >= 2
+            else context.ancestors[-1:]
+        )
         context_str = " → ".join(parent_context)
 
         # Current query FIRST (position bias optimization), then context
@@ -640,15 +694,15 @@ class DeepResearchService:
                 "queries": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": f"Array of exactly {NUM_LLM_EXPANDED_QUERIES} expanded search queries (semantically complete sentences)"
+                    "description": f"Array of exactly {NUM_LLM_EXPANDED_QUERIES} expanded search queries (semantically complete sentences)",
                 }
             },
             "required": ["queries"],
-            "additionalProperties": False
+            "additionalProperties": False,
         }
 
         # Simplified system prompt per GPT-5-Nano best practices
-        system = """Generate diverse code search queries for semantic embedding systems."""
+        system = prompts.QUERY_EXPANSION_SYSTEM
 
         # Build context string
         context_str = ""
@@ -657,24 +711,12 @@ class DeepResearchService:
             context_str = f"\nPrior: {ancestor_path}"
 
         # Optimized prompt for semantic diversity
-        prompt = f"""Query: {query}
-Context: {context.root_query}{context_str}
-
-Generate {NUM_LLM_EXPANDED_QUERIES} semantically diverse search queries for code retrieval:
-
-1. Rephrase using synonyms and alternative perspectives
-   - Use different words with same meaning (e.g., "implement" → "build/create", "authentication" → "login/verification")
-   - Ask from a different angle while preserving intent
-
-2. Implementation-focused natural language
-   - Target code elements: "Find classes that...", "What functions handle..."
-   - Mention specific code concepts (services, handlers, middleware, etc.)
-
-Requirements:
-- COMPLETE SENTENCES only - no keyword lists, no pseudo-code
-- Each query must be self-contained and semantically rich
-- Different semantic angles of the same question
-- Concise (1-2 sentences max per query)"""
+        prompt = prompts.QUERY_EXPANSION_USER.format(
+            query=query,
+            context_root_query=context.root_query,
+            context_str=context_str,
+            num_queries=NUM_LLM_EXPANDED_QUERIES,
+        )
 
         logger.debug(
             f"Query expansion budget: {QUERY_EXPANSION_TOKENS:,} tokens (model: {llm.model})"
@@ -685,7 +727,7 @@ Requirements:
                 prompt=prompt,
                 json_schema=schema,
                 system=system,
-                max_completion_tokens=QUERY_EXPANSION_TOKENS
+                max_completion_tokens=QUERY_EXPANSION_TOKENS,
             )
 
             expanded = result.get("queries", [])
@@ -704,7 +746,9 @@ Requirements:
             # Original query goes first for position bias in embedding models
             final_queries = [query] + expanded[:NUM_LLM_EXPANDED_QUERIES]
 
-            logger.debug(f"Expanded query into {len(final_queries)} variations: {final_queries}")
+            logger.debug(
+                f"Expanded query into {len(final_queries)} variations: {final_queries}"
+            )
             return final_queries
 
         except Exception as e:
@@ -712,7 +756,11 @@ Requirements:
             return [query]
 
     async def _unified_search(
-        self, query: str, context: ResearchContext, node_id: int | None = None, depth: int | None = None
+        self,
+        query: str,
+        context: ResearchContext,
+        node_id: int | None = None,
+        depth: int | None = None,
     ) -> list[dict[str, Any]]:
         """Perform unified semantic + symbol-based regex search (Steps 2-6).
 
@@ -742,15 +790,19 @@ Requirements:
         if QUERY_EXPANSION_ENABLED:
             # Expand query into multiple diverse perspectives
             logger.debug("Step 2a: Expanding query for diverse semantic search")
-            await self._emit_event("query_expand", "Expanding query", node_id=node_id, depth=depth)
+            await self._emit_event(
+                "query_expand", "Expanding query", node_id=node_id, depth=depth
+            )
 
             expanded_queries = await self._expand_query_with_llm(query, context)
             logger.debug(
-                f"Query expansion: 1 original + {len(expanded_queries)-1} LLM-generated = {len(expanded_queries)} total: {expanded_queries}"
+                f"Query expansion: 1 original + {len(expanded_queries) - 1} LLM-generated = {len(expanded_queries)} total: {expanded_queries}"
             )
 
             # Emit expanded queries event
-            queries_preview = " | ".join(q[:40] + "..." if len(q) > 40 else q for q in expanded_queries[:3])
+            queries_preview = " | ".join(
+                q[:40] + "..." if len(q) > 40 else q for q in expanded_queries[:3]
+            )
             await self._emit_event(
                 "query_expand_complete",
                 f"Expanded to {len(expanded_queries)} queries",
@@ -760,7 +812,9 @@ Requirements:
             )
 
             # Run all semantic searches in parallel
-            logger.debug(f"Step 2b: Running {len(expanded_queries)} parallel semantic searches")
+            logger.debug(
+                f"Step 2b: Running {len(expanded_queries)} parallel semantic searches"
+            )
             search_tasks = [
                 search_service.search_semantic(
                     query=expanded_q,
@@ -776,11 +830,15 @@ Requirements:
             semantic_map = {}
             for result in search_results:
                 if isinstance(result, Exception):
-                    logger.warning(f"Semantic search failed during query expansion: {result}")
+                    logger.warning(
+                        f"Semantic search failed during query expansion: {result}"
+                    )
                     continue
                 # Validate tuple structure before unpacking
                 if not isinstance(result, tuple) or len(result) != 2:
-                    logger.error(f"Unexpected search result structure: {type(result)}, skipping")
+                    logger.error(
+                        f"Unexpected search result structure: {type(result)}, skipping"
+                    )
                     continue
                 results, _ = result
                 for chunk in results:
@@ -803,8 +861,15 @@ Requirements:
             )
         else:
             # Original single-query approach (fallback)
-            logger.debug(f"Step 2: Running multi-hop semantic search for query: '{query}'")
-            await self._emit_event("search_semantic", "Searching semantically", node_id=node_id, depth=depth)
+            logger.debug(
+                f"Step 2: Running multi-hop semantic search for query: '{query}'"
+            )
+            await self._emit_event(
+                "search_semantic",
+                "Searching semantically",
+                node_id=node_id,
+                depth=depth,
+            )
 
             semantic_results, _ = await search_service.search_semantic(
                 query=query,
@@ -828,13 +893,17 @@ Requirements:
         if semantic_results:
             # Step 3: Extract symbols from semantic results
             logger.debug("Step 3: Extracting symbols from semantic results")
-            await self._emit_event("extract_symbols", "Extracting symbols", node_id=node_id, depth=depth)
+            await self._emit_event(
+                "extract_symbols", "Extracting symbols", node_id=node_id, depth=depth
+            )
 
             symbols = await self._extract_symbols_from_chunks(semantic_results)
 
             if symbols:
                 # Step 4: Select top symbols (already in relevance order from reranked semantic results)
-                logger.debug(f"Step 4: Selecting top {MAX_SYMBOLS_TO_SEARCH} symbols from {len(symbols)} extracted symbols")
+                logger.debug(
+                    f"Step 4: Selecting top {MAX_SYMBOLS_TO_SEARCH} symbols from {len(symbols)} extracted symbols"
+                )
                 top_symbols = symbols[:MAX_SYMBOLS_TO_SEARCH]
 
                 # Emit symbol extraction results
@@ -854,7 +923,12 @@ Requirements:
                     logger.debug(
                         f"Step 5: Running regex search for {len(top_symbols)} top symbols"
                     )
-                    await self._emit_event("search_regex", "Running regex search", node_id=node_id, depth=depth)
+                    await self._emit_event(
+                        "search_regex",
+                        "Running regex search",
+                        node_id=node_id,
+                        depth=depth,
+                    )
 
                     regex_results = await self._search_by_symbols(top_symbols)
 
@@ -1246,8 +1320,10 @@ Requirements:
                         end_line = chunk.get("end_line", 1)
 
                         # Use smart boundary detection to expand to complete functions/classes
-                        expanded_start, expanded_end = self._expand_to_natural_boundaries(
-                            lines, start_line, end_line, chunk, file_path
+                        expanded_start, expanded_end = (
+                            self._expand_to_natural_boundaries(
+                                lines, start_line, end_line, chunk, file_path
+                            )
                         )
 
                         # Store expanded range in chunk for later deduplication
@@ -1273,7 +1349,9 @@ Requirements:
                         remaining_tokens = budget_limit - total_tokens
                         if remaining_tokens > 500:
                             chars_to_include = remaining_tokens * 4
-                            file_contents[file_path] = combined_chunks[:chars_to_include]
+                            file_contents[file_path] = combined_chunks[
+                                :chars_to_include
+                            ]
                             total_tokens = budget_limit
                         break
 
@@ -1395,7 +1473,9 @@ Requirements:
             "chunk_ranges": chunk_ranges,
         }
 
-    def _update_global_explored_data(self, global_explored_data: dict[str, Any], node: BFSNode) -> None:
+    def _update_global_explored_data(
+        self, global_explored_data: dict[str, Any], node: BFSNode
+    ) -> None:
         """Update global explored data with discoveries from a single node.
 
         This allows sibling nodes and future nodes to detect duplicates across the entire BFS graph,
@@ -1415,11 +1495,15 @@ Requirements:
             file_path = chunk.get("file_path")
             if file_path:
                 expanded_range = self._get_chunk_expanded_range(chunk)
-                global_explored_data["chunk_ranges"].setdefault(file_path, []).append(expanded_range)
+                global_explored_data["chunk_ranges"].setdefault(file_path, []).append(
+                    expanded_range
+                )
                 # Store chunk for building exploration gist
                 global_explored_data["chunks"].append(chunk)
 
-    def _build_exploration_gist(self, global_explored_data: dict[str, Any]) -> str | None:
+    def _build_exploration_gist(
+        self, global_explored_data: dict[str, Any]
+    ) -> str | None:
         """Build markdown tree view of explored files and chunks.
 
         Uses the same format as the final synthesis sources footer for consistency.
@@ -1436,7 +1520,9 @@ Requirements:
             return None  # No exploration yet - skip gist section entirely
 
         # Extract unique files from chunks (we don't need content, just the list)
-        files = {chunk.get("file_path"): "" for chunk in chunks if chunk.get("file_path")}
+        files = {
+            chunk.get("file_path"): "" for chunk in chunks if chunk.get("file_path")
+        }
 
         if not files:
             return None
@@ -1509,7 +1595,14 @@ Requirements:
         """
         if not node.parent:
             # Root node always has new info
-            return (True, {"new_chunks": len(chunks), "duplicate_chunks": 0, "total_chunks": len(chunks)})
+            return (
+                True,
+                {
+                    "new_chunks": len(chunks),
+                    "duplicate_chunks": 0,
+                    "total_chunks": len(chunks),
+                },
+            )
 
         if not chunks:
             # No chunks at all
@@ -1523,7 +1616,9 @@ Requirements:
             # Get expanded range (from stored data or re-compute)
             expanded_range = self._get_chunk_expanded_range(chunk)
 
-            is_duplicate = self._is_chunk_duplicate(chunk, expanded_range, global_explored_data)
+            is_duplicate = self._is_chunk_duplicate(
+                chunk, expanded_range, global_explored_data
+            )
 
             if is_duplicate:
                 duplicate_count += 1
@@ -1583,15 +1678,15 @@ Requirements:
                 "questions": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": f"Array of 0-{MAX_FOLLOWUP_QUESTIONS} follow-up questions"
+                    "description": f"Array of 0-{MAX_FOLLOWUP_QUESTIONS} follow-up questions",
                 }
             },
             "required": ["questions"],
-            "additionalProperties": False
+            "additionalProperties": False,
         }
 
         # Simplified system prompt per GPT-5-Nano best practices
-        system = """Generate follow-up questions to deepen code understanding."""
+        system = prompts.FOLLOWUP_GENERATION_SYSTEM
 
         # Build code context from file contents
         # Note: files already limited by _read_files_with_budget
@@ -1637,30 +1732,32 @@ Requirements:
         exploration_gist = self._build_exploration_gist(global_explored_data)
 
         # Build common prompt sections
-        gist_section = f"""Already explored:
+        gist_section = (
+            f"""Already explored:
 {exploration_gist}
 
-""" if exploration_gist else ""
+"""
+            if exploration_gist
+            else ""
+        )
 
-        target_instruction = "NEW code elements (not in explored files above)" if exploration_gist else "specific code elements found"
+        target_instruction = (
+            "NEW code elements (not in explored files above)"
+            if exploration_gist
+            else "specific code elements found"
+        )
 
         # Construct prompt with conditional gist section
-        prompt = f"""{gist_section}Root: {context.root_query}
-Current: {query}
-Context: {" -> ".join(context.ancestors)}
-
-Code:
-{code_section}
-
-Chunks:
-{chunks_preview}
-
-Generate 0-{MAX_FOLLOWUP_QUESTIONS} follow-up questions about {target_instruction}. Focus on:
-1. Component interactions
-2. Data/control flow
-3. Dependencies
-
-Use exact function/class/file names. If code fully answers the question, return fewer questions or empty array."""
+        prompt = prompts.FOLLOWUP_GENERATION_USER.format(
+            gist_section=gist_section,
+            root_query=context.root_query,
+            query=query,
+            ancestors=" -> ".join(context.ancestors),
+            code_section=code_section,
+            chunks_preview=chunks_preview,
+            max_questions=MAX_FOLLOWUP_QUESTIONS,
+            target_instruction=target_instruction,
+        )
 
         # Calculate adaptive output budget (scales 3k → 8k with depth)
         depth_ratio = depth / max(max_depth, 1)
@@ -1678,7 +1775,7 @@ Use exact function/class/file names. If code fully answers the question, return 
                 prompt=prompt,
                 json_schema=schema,
                 system=system,
-                max_completion_tokens=max_output_tokens
+                max_completion_tokens=max_output_tokens,
             )
 
             questions = result.get("questions", [])
@@ -1695,7 +1792,9 @@ Use exact function/class/file names. If code fully answers the question, return 
             return valid_questions[:MAX_FOLLOWUP_QUESTIONS]
 
         except Exception as e:
-            logger.warning(f"Follow-up question generation failed: {e}, returning empty list")
+            logger.warning(
+                f"Follow-up question generation failed: {e}, returning empty list"
+            )
             return []
 
     async def _synthesize_questions(
@@ -1720,9 +1819,12 @@ Use exact function/class/file names. If code fully answers the question, return 
 
         # Quality pre-filtering: Remove low-quality questions before synthesis
         filtered_nodes = [
-            node for node in nodes
+            node
+            for node in nodes
             if len(node.query.strip()) > 10  # Minimum length
-            and not node.query.lower().strip().startswith(("what is ", "is there ", "does "))  # Avoid simple yes/no
+            and not node.query.lower()
+            .strip()
+            .startswith(("what is ", "is there ", "does "))  # Avoid simple yes/no
         ]
 
         # If filtering reduced below target, skip synthesis
@@ -1754,40 +1856,26 @@ Use exact function/class/file names. If code fully answers the question, return 
             "properties": {
                 "reasoning": {
                     "type": "string",
-                    "description": "Brief explanation of synthesis strategy and why these questions explore different unexplored aspects"
+                    "description": "Brief explanation of synthesis strategy and why these questions explore different unexplored aspects",
                 },
                 "questions": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": f"Array of 1 to {target_count} synthesized research questions, each exploring a distinct aspect"
-                }
+                    "description": f"Array of 1 to {target_count} synthesized research questions, each exploring a distinct aspect",
+                },
             },
             "required": ["reasoning", "questions"],
-            "additionalProperties": False
+            "additionalProperties": False,
         }
 
         # Direct, unambiguous prompt optimized for GPT-5-Nano instruction adherence
-        system = """Synthesize research questions to explore unexplored aspects of the codebase."""
+        system = prompts.QUESTION_SYNTHESIS_SYSTEM
 
-        prompt = f"""TASK: Synthesize research questions to explore distinct unexplored aspects.
-
-ROOT QUERY: {context.root_query}
-
-INPUT QUESTIONS TO SYNTHESIZE:
-{questions_str}
-
-REQUIREMENTS:
-- You MUST return at least 1 synthesized question (returning zero is not acceptable)
-- You MAY return up to {target_count} questions if there are that many distinct aspects to explore
-- Each question must explore a DISTINCT architectural aspect not fully covered by the inputs
-- Questions must be specific and reference concrete code elements (function/class/file names where relevant)
-- Focus on architectural angles: component interactions, implementation details, error handling, performance, testing
-
-EXAMPLE:
-Input: "How is data validated?", "Where is validation defined?", "What validation rules exist?"
-Output: {{"reasoning": "Input questions cover validation details but miss architecture and error flow. Synthesizing broader questions.", "questions": ["What is the complete validation architecture from input to storage?", "How do validation errors propagate and get handled throughout the system?"]}}
-
-Generate your synthesized questions now (minimum 1, maximum {target_count})."""
+        prompt = prompts.QUESTION_SYNTHESIS_USER.format(
+            root_query=context.root_query,
+            questions_str=questions_str,
+            target_count=target_count,
+        )
 
         logger.debug(
             f"Question synthesis budget: {QUESTION_SYNTHESIS_TOKENS:,} tokens (model: {llm.model})"
@@ -1798,7 +1886,7 @@ Generate your synthesized questions now (minimum 1, maximum {target_count})."""
                 prompt=prompt,
                 json_schema=schema,
                 system=system,
-                max_completion_tokens=QUESTION_SYNTHESIS_TOKENS
+                max_completion_tokens=QUESTION_SYNTHESIS_TOKENS,
             )
 
             reasoning = result.get("reasoning", "")
@@ -1830,7 +1918,9 @@ Generate your synthesized questions now (minimum 1, maximum {target_count})."""
                 synthesized_nodes.append(node)
 
             if not synthesized_nodes:
-                logger.warning("All synthesized questions were empty, falling back to first N nodes")
+                logger.warning(
+                    "All synthesized questions were empty, falling back to first N nodes"
+                )
                 return nodes[:target_count]
 
             logger.info(
@@ -1840,7 +1930,9 @@ Generate your synthesized questions now (minimum 1, maximum {target_count})."""
             return synthesized_nodes
 
         except Exception as e:
-            logger.warning(f"Question synthesis failed: {e}, falling back to first N nodes")
+            logger.warning(
+                f"Question synthesis failed: {e}, falling back to first N nodes"
+            )
             return nodes[:target_count]
 
     def _aggregate_all_findings(self, root: BFSNode) -> dict[str, Any]:
@@ -1883,7 +1975,9 @@ Generate your synthesized questions now (minimum 1, maximum {target_count})."""
         for node in all_nodes:
             # Detect data loss: node has chunks but no file_contents
             if node.chunks and not node.file_contents:
-                query_preview = node.query[:50] + "..." if len(node.query) > 50 else node.query
+                query_preview = (
+                    node.query[:50] + "..." if len(node.query) > 50 else node.query
+                )
                 nodes_with_data_loss.append(query_preview)
 
             for file_path, content in node.file_contents.items():
@@ -1904,7 +1998,11 @@ Generate your synthesized questions now (minimum 1, maximum {target_count})."""
                 f"{len(nodes_with_data_loss)} nodes had chunks but empty file_contents. "
                 f"This indicates file reading failed for all nodes - check token budgets and file paths. "
                 f"Failed queries: {', '.join(nodes_with_data_loss[:5])}"
-                + (f" and {len(nodes_with_data_loss) - 5} more" if len(nodes_with_data_loss) > 5 else "")
+                + (
+                    f" and {len(nodes_with_data_loss) - 5} more"
+                    if len(nodes_with_data_loss) > 5
+                    else ""
+                )
             )
 
         # WARN: If SOME nodes lost data (partial data loss), log warning but continue
@@ -1914,7 +2012,11 @@ Generate your synthesized questions now (minimum 1, maximum {target_count})."""
                 f"found chunks but failed to read files. "
                 f"Synthesis will proceed with {len(files_map)} files from successful nodes. "
                 f"Failed queries: {', '.join(nodes_with_data_loss[:3])}"
-                + (f" and {len(nodes_with_data_loss) - 3} more" if len(nodes_with_data_loss) > 3 else "")
+                + (
+                    f" and {len(nodes_with_data_loss) - 3} more"
+                    if len(nodes_with_data_loss) > 3
+                    else ""
+                )
             )
 
         # Calculate statistics
@@ -1928,14 +2030,10 @@ Generate your synthesized questions now (minimum 1, maximum {target_count})."""
             "total_chunks_found": total_chunks_found,
             "total_files_found": total_files_found,
             "deduplication_ratio_chunks": (
-                f"{total_chunks_found / len(chunks_map):.2f}x"
-                if chunks_map
-                else "N/A"
+                f"{total_chunks_found / len(chunks_map):.2f}x" if chunks_map else "N/A"
             ),
             "deduplication_ratio_files": (
-                f"{total_files_found / len(files_map):.2f}x"
-                if files_map
-                else "N/A"
+                f"{total_files_found / len(files_map):.2f}x" if files_map else "N/A"
             ),
         }
 
@@ -1955,9 +2053,9 @@ Generate your synthesized questions now (minimum 1, maximum {target_count})."""
         chunks: list[dict[str, Any]],
         files: dict[str, str],
         root_query: str,
-        depth: str = "shallow"
+        synthesis_budgets: dict[str, int],
     ) -> tuple[list[dict[str, Any]], dict[str, str], dict[str, Any]]:
-        """Manage token budget to fit within SINGLE_PASS_MAX_TOKENS limit.
+        """Manage token budget to fit within synthesis budget limit.
 
         Prioritizes files using reranking when available to ensure diverse,
         relevant file selection. Falls back to accumulated chunk scores if
@@ -1968,33 +2066,25 @@ Generate your synthesized questions now (minimum 1, maximum {target_count})."""
             chunks: All chunks from BFS traversal
             files: All file contents from BFS traversal
             root_query: Original research query (for reranking files)
-            depth: Research depth mode - affects output token allocation
+            synthesis_budgets: Dynamic budgets based on repository size
 
         Returns:
             Tuple of (prioritized_chunks, budgeted_files, budget_info)
         """
         llm = self._llm_manager.get_utility_provider()
 
-        # Use fixed output token budget (sufficient for reasoning models)
-        # Actual output length is controlled by prompt instructions, not token limits
-        output_tokens = OUTPUT_TOKENS_WITH_REASONING
+        # Use output token budget from dynamic calculation
+        output_tokens = synthesis_budgets["output_tokens"]
 
-        # Calculate available tokens for code content
-        # Total budget - output budget - overhead = input budget
-        available_tokens = (
-            SINGLE_PASS_MAX_TOKENS
-            - output_tokens
-            - SINGLE_PASS_OVERHEAD_TOKENS
-        )
+        # Get available tokens for code content from synthesis budgets
+        available_tokens = synthesis_budgets["input_tokens"]
 
         logger.info(
             f"Managing token budget: {available_tokens:,} tokens available for code content"
         )
 
         # Sort chunks by score from multi-hop semantic search (highest first)
-        sorted_chunks = sorted(
-            chunks, key=lambda c: c.get("score", 0.0), reverse=True
-        )
+        sorted_chunks = sorted(chunks, key=lambda c: c.get("score", 0.0), reverse=True)
 
         # Build file-to-chunks mapping
         file_to_chunks: dict[str, list[dict[str, Any]]] = {}
@@ -2040,8 +2130,7 @@ Generate your synthesized questions now (minimum 1, maximum {target_count})."""
         # This ensures file priority is based on relevance to original query,
         # not accumulated scores from multi-level BFS exploration
         await self._emit_event(
-            "synthesis_rerank",
-            f"Reranking {len(file_documents)} files by relevance"
+            "synthesis_rerank", f"Reranking {len(file_documents)} files by relevance"
         )
         embedding_provider = self._embedding_manager.get_provider()
 
@@ -2059,9 +2148,7 @@ Generate your synthesized questions now (minimum 1, maximum {target_count})."""
         # Try reranking with fallback to chunk score accumulation
         try:
             rerank_results = await embedding_provider.rerank(
-                query=root_query,
-                documents=file_documents,
-                top_k=None
+                query=root_query, documents=file_documents, top_k=None
             )
         except Exception as e:
             logger.warning(
@@ -2072,7 +2159,9 @@ Generate your synthesized questions now (minimum 1, maximum {target_count})."""
 
             # Fallback: Use accumulated chunk scores (original behavior before reranking)
             for file_path, file_chunks in file_to_chunks.items():
-                file_priorities[file_path] = sum(c.get("score", 0.0) for c in file_chunks)
+                file_priorities[file_path] = sum(
+                    c.get("score", 0.0) for c in file_chunks
+                )
 
             logger.info(f"Using chunk score fallback for {len(file_priorities)} files")
         else:
@@ -2082,13 +2171,13 @@ Generate your synthesized questions now (minimum 1, maximum {target_count})."""
                 file_path = file_paths[result.index]
                 file_priorities[file_path] = result.score
 
-            logger.info(f"Reranked {len(file_priorities)} files for synthesis budget allocation")
+            logger.info(
+                f"Reranked {len(file_priorities)} files for synthesis budget allocation"
+            )
 
         # Sort files by priority score (highest first)
         # Works for both reranking and fallback paths
-        sorted_files = sorted(
-            file_priorities.items(), key=lambda x: x[1], reverse=True
-        )
+        sorted_files = sorted(file_priorities.items(), key=lambda x: x[1], reverse=True)
 
         # Build budgeted file contents
         budgeted_files: dict[str, str] = {}
@@ -2168,7 +2257,7 @@ Generate your synthesized questions now (minimum 1, maximum {target_count})."""
         chunks: list[dict[str, Any]],
         files: dict[str, str],
         context: ResearchContext,
-        depth: str = "shallow",
+        synthesis_budgets: dict[str, int],
     ) -> str:
         """Perform single-pass synthesis with all aggregated data.
 
@@ -2178,7 +2267,7 @@ Generate your synthesized questions now (minimum 1, maximum {target_count})."""
         Token Budget:
             - The max_output_tokens limit applies only to the LLM-generated content
             - A sources footer is appended AFTER synthesis (outside the token budget)
-            - Total output = LLM content (10k/20k tokens) + sources footer (~100-500 tokens)
+            - Total output = LLM content + sources footer (~100-500 tokens)
             - Footer size scales with number of files/chunks analyzed
 
         Args:
@@ -2186,19 +2275,17 @@ Generate your synthesized questions now (minimum 1, maximum {target_count})."""
             chunks: Prioritized chunks from BFS traversal
             files: Budgeted file contents
             context: Research context
-            depth: Research depth mode - "shallow" for quick insights (10k tokens),
-                "deep" for comprehensive analysis (20k tokens)
+            synthesis_budgets: Dynamic budgets based on repository size
 
         Returns:
             Synthesized answer from single LLM call with appended sources footer
         """
-        # Use fixed token limit (sufficient for reasoning models)
-        # Actual output length controlled by prompt instructions
-        max_output_tokens = OUTPUT_TOKENS_WITH_REASONING
+        # Use output token budget from dynamic calculation
+        max_output_tokens = synthesis_budgets["output_tokens"]
 
         logger.info(
             f"Starting single-pass synthesis with {len(files)} files, {len(chunks)} chunks "
-            f"(depth={depth}, token_limit={max_output_tokens:,})"
+            f"(output_limit={max_output_tokens:,})"
         )
 
         llm = self._llm_manager.get_synthesis_provider()
@@ -2230,161 +2317,51 @@ Generate your synthesized questions now (minimum 1, maximum {target_count})."""
 
         # Build sections from files (already budgeted)
         for file_path, content in files.items():
-            # Get line ranges for this file's chunks if available
+            # If we have chunks for this file, build content with individual line markers
             if file_path in chunks_by_file:
                 file_chunks = chunks_by_file[file_path]
-                start_line = min(c.get("start_line", 1) for c in file_chunks)
-                end_line = max(c.get("end_line", 1) for c in file_chunks)
-                line_range = f":{start_line}-{end_line}"
+                # Sort chunks by start_line for logical ordering
+                sorted_chunks = sorted(
+                    file_chunks, key=lambda c: c.get("start_line", 0)
+                )
+
+                # Build content with line markers for each chunk
+                chunk_sections = []
+                for chunk in sorted_chunks:
+                    start_line = chunk.get("start_line", "?")
+                    end_line = chunk.get("end_line", "?")
+                    chunk_code = chunk.get("code", "")
+
+                    # Add line marker before chunk code
+                    chunk_sections.append(
+                        f"# Lines {start_line}-{end_line}\n{chunk_code}"
+                    )
+
+                file_content = "\n\n".join(chunk_sections)
             else:
-                line_range = ""
+                # No chunks for this file, use full content from budget
+                file_content = content
 
             code_sections.append(
-                f"### {file_path}{line_range}\n"
-                f"{'=' * 80}\n"
-                f"{content}\n"
-                f"{'=' * 80}"
+                f"### {file_path}\n{'=' * 80}\n{file_content}\n{'=' * 80}"
             )
 
         code_context = "\n\n".join(code_sections)
 
-        # Build output guidance based on research depth
-        if depth == "shallow":
-            output_guidance = (
-                f"**Target Output:** Provide a concise, focused analysis of approximately "
-                f"{SHALLOW_TARGET_WORDS:,} words (~{SHALLOW_TARGET_TOKENS:,} tokens). "
-                f"Prioritize key insights and essential architectural understanding. "
-                f"Be direct and to-the-point while maintaining technical accuracy."
-            )
-        else:  # deep
-            output_guidance = (
-                f"**Target Output:** Provide a comprehensive, detailed analysis of approximately "
-                f"{DEEP_TARGET_TOKENS:,} tokens. Cover all relevant architectural layers, "
-                f"component interactions, and implementation details with thorough explanations."
-            )
+        # Build output guidance with fixed 25k token budget
+        # Output budget is always 25k (includes reasoning + actual output)
+        output_guidance = (
+            f"**Target Output:** Provide a thorough and detailed analysis of approximately "
+            f"{max_output_tokens:,} tokens (includes reasoning). Focus on all relevant "
+            f"architectural layers, patterns, and implementation details with technical accuracy."
+        )
 
         # Build comprehensive synthesis prompt (adapted from Code Expert methodology)
-        system = f"""You are an expert code researcher with deep experience across all software domains. Your mission is comprehensive code analysis - synthesizing the complete codebase picture to answer the research question with full architectural understanding.
+        system = prompts.SYNTHESIS_SYSTEM_BUILDER(output_guidance)
 
-**Context:**
-You have access to the COMPLETE set of code discovered during BFS exploration. This is not a discovery phase - all relevant code has been found and is provided to you. Your task is to synthesize this complete picture into a comprehensive answer. Start with the architectural big picture, then provide detailed component analysis.
-
-{output_guidance}
-
-**Analysis Methodology:**
-
-0. **System Architecture** (ANALYZE FIRST)
-   Identify the architectural style (monolithic, microservices, layered, hexagonal, event-driven, etc.). Map major subsystems and their high-level relationships. Identify architectural layers, boundaries, and abstraction levels. Document core design principles that span multiple components. Extract the big-picture organization before diving into individual components.
-
-1. **Structure & Organization**
-   Map the directory layout and module organization. Identify component responsibilities and boundaries. Document key design decisions observed in the code. Explain the "why" behind the organization when evident from the code.
-
-2. **Component Analysis**
-   For each relevant component:
-   - **Purpose**: What it does and why (based on code, not speculation)
-   - **Location**: Files and directories with line numbers
-   - **Key Elements**: Classes/functions with signatures (file:line refs)
-   - **Dependencies**: What it uses and what uses it
-   - **Patterns**: Design patterns and conventions observed
-   - **Critical Sections**: Important logic with specific citations
-   - **Algorithms & Formulas**: Core algorithms, mathematical expressions, and computational logic with step-by-step descriptions or pseudocode
-
-3. **Data & Control Flow**
-   Trace how data moves through relevant components. Document execution paths and state management. Include concrete values: buffer sizes, timeouts, limits, thresholds. Show transformations with actual data types. Map async/sync boundaries and concurrency patterns.
-
-4. **Patterns & Conventions**
-   Identify consistent patterns across the codebase. Document coding standards observed. Recognize architectural decisions and trade-offs. Find reusable components and utilities. Note error handling and edge case strategies.
-
-5. **Integration Points**
-   Document APIs, external systems, and configurations. Show how components collaborate with exact method signatures. Include parameter types, return values, and data formats. Map coordination mechanisms and shared resources.
-
-**CRITICAL: NO VAGUE LANGUAGE**
-NEVER use imprecise measurements. Instead, extract exact values from code:
-- ❌ "around 100" → ✅ "exactly 127" (from constant MAX_ITEMS)
-- ❌ "several files" → ✅ "5 configuration files"
-- ❌ "many seconds" → ✅ "30-second timeout"
-- ❌ "approximately 1MB" → ✅ "1,048,576 bytes (DEFAULT_BUFFER_SIZE)"
-- ❌ "hundreds of entries" → ✅ "247 cache entries"
-- ❌ "uses a sorting algorithm" → ✅ "implements quicksort with median-of-three pivot selection (sort.py:145-178)"
-- ❌ "calculates the score" → ✅ "score = (relevance × 0.7) + (recency × 0.3), normalized to [0,1] range (scorer.py:89)"
-
-FORBIDDEN TERMS: around, approximately, roughly, about, several, many, few, some, various, multiple, numerous, hundreds of, thousands of
-
-REQUIRED: Cite the exact constant, variable, or code location for every numeric value.
-
-**Output Format:**
-```
-## Overview
-[Direct answer to the query with system purpose and design approach]
-
-## System Architecture
-[Architectural style and patterns, high-level design approach, core architectural principles, system-level organization]
-
-## Component Relationships
-[Major component interactions, dependency graph, data/event flow between subsystems, architectural boundaries, collaboration patterns]
-
-## Structure & Organization
-[Directory layout, module organization, key design decisions observed]
-
-## Component Analysis
-[For each major component:]
-
-**[Component Name]**
-- **Purpose**: [What it does and why]
-- **Location**: [Files with line numbers]
-- **Key Elements**: [Classes/functions with file:line refs]
-- **Dependencies**: [What it uses/what uses it]
-- **Patterns**: [Design patterns observed]
-- **Critical Sections**: [Important logic with citations]
-- **Algorithms & Formulas**: [Core algorithms, calculations, formulas with step descriptions]
-
-## Data & Control Flow
-[How data moves through components, execution paths, state management]
-
-## Patterns & Conventions
-[Consistent patterns, coding standards, architectural decisions]
-
-## Integration Points
-[APIs, configurations, external systems, collaboration mechanisms]
-
-## Key Findings
-[Direct answers to the research question with evidence]
-```
-
-**Quality Principles:**
-- Always provide specific file paths and line numbers (file.py:123 format)
-- Explain the 'why' behind code organization when evident
-- **PRECISION REQUIREMENT**: Extract EXACT numeric values from code
-  - Find constants, literals, configuration values with their names
-  - Never use approximations: "around", "approximately", "roughly", "about"
-  - Never use vague quantities: "several", "many", "few", "various", "multiple", "numerous"
-  - Never use order-of-magnitude: "hundreds of", "thousands of"
-  - Example: "timeout=30 (DEFAULT_TIMEOUT at config.py:15)" not "around 30 seconds"
-- Document HOW things work, not just that they exist
-- Include actual error messages, log formats, constants with values
-- State complexity (O() notation) and performance characteristics
-- Focus on actionable insights for developers
-- Connect all findings back to the research question
-- Work only with provided code - no speculation beyond what code shows
-- Every technical claim must have a citation
-
-**Remember:**
-- You have the COMPLETE picture - all relevant code is provided
-- Leverage this complete view to provide thorough architectural understanding
-- Answer the specific research question with full context
-- Be direct and confident - state facts from the code
-- Focus on what developers need to know to work with this codebase"""
-
-        prompt = f"""Question: {root_query}
-
-Complete Code Context:
-{code_context}
-
-Provide a comprehensive analysis that answers the question using ALL the code provided.
-Focus on complete architectural understanding - you have the full picture.
-
-CRITICAL REMINDER: Use EXACT values from code - never "around", "approximately", "several", "many", etc.
-Extract specific constants, counts, and measurements with their variable names and locations."""
+        prompt = prompts.SYNTHESIS_USER.format(
+            root_query=root_query, code_context=code_context
+        )
 
         logger.info(
             f"Calling LLM for single-pass synthesis "
@@ -2429,8 +2406,7 @@ Extract specific constants, counts, and measurements with their variable names a
                 answer = f"{answer}\n\n{footer}"
         except Exception as e:
             logger.warning(
-                f"Failed to generate sources footer: {e}. "
-                "Continuing without footer."
+                f"Failed to generate sources footer: {e}. Continuing without footer."
             )
 
         logger.info(
@@ -2474,16 +2450,20 @@ Extract specific constants, counts, and measurements with their variable names a
             filtered = re.sub(pattern, "", filtered, flags=re.IGNORECASE | re.MULTILINE)
 
         # Remove excessive newlines left by removals (max 2 consecutive newlines)
-        filtered = re.sub(r'\n{3,}', '\n\n', filtered)
+        filtered = re.sub(r"\n{3,}", "\n\n", filtered)
 
         # Log if we actually filtered anything
         if filtered != text:
             chars_removed = len(text) - len(filtered)
-            logger.debug(f"Verbosity filter removed {chars_removed} chars of meta-commentary")
+            logger.debug(
+                f"Verbosity filter removed {chars_removed} chars of meta-commentary"
+            )
 
         return filtered
 
-    def _validate_output_quality(self, answer: str, target_tokens: int) -> tuple[str, list[str]]:
+    def _validate_output_quality(
+        self, answer: str, target_tokens: int
+    ) -> tuple[str, list[str]]:
         """Validate output quality for conciseness and actionability.
 
         Args:
@@ -2507,7 +2487,7 @@ Extract specific constants, counts, and measurements with their variable names a
             "provide the actual",
             "should specify",
             "need to determine",
-            "requires clarification"
+            "requires clarification",
         ]
 
         for pattern in theoretical_patterns:
@@ -2520,7 +2500,8 @@ Extract specific constants, counts, and measurements with their variable names a
 
         # Check 2: Citation density (should have reasonable citations)
         import re
-        citations = re.findall(r'[\w/]+\.\w+:\d+', answer)
+
+        citations = re.findall(r"[\w/]+\.\w+:\d+", answer)
         citation_count = len(citations)
         answer_tokens = llm.estimate_tokens(answer)
 
@@ -2529,7 +2510,9 @@ Extract specific constants, counts, and measurements with their variable names a
                 f"QUALITY: Low citation density ({citation_count} citations in {answer_tokens} tokens). "
                 "Output may lack concrete code references."
             )
-            logger.warning(f"Low citation density: {citation_count} citations in {answer_tokens} tokens")
+            logger.warning(
+                f"Low citation density: {citation_count} citations in {answer_tokens} tokens"
+            )
 
         # Check 3: Excessive length
         if answer_tokens > target_tokens * 1.5:
@@ -2537,14 +2520,16 @@ Extract specific constants, counts, and measurements with their variable names a
                 f"QUALITY: Output is verbose ({answer_tokens:,} tokens vs {target_tokens:,} target). "
                 "May need tighter prompting."
             )
-            logger.warning(f"Verbose output: {answer_tokens:,} tokens (target: {target_tokens:,})")
+            logger.warning(
+                f"Verbose output: {answer_tokens:,} tokens (target: {target_tokens:,})"
+            )
 
         # Check 4: Vague measurements (should use exact numbers)
         vague_patterns = [
-            r'\b(several|many|few|some|various|multiple|numerous)\s+(seconds|minutes|items|entries|elements|chunks)',
-            r'\b(around|approximately|roughly|about)\s+\d+',
-            r'\bhundreds of\b',
-            r'\bthousands of\b',
+            r"\b(several|many|few|some|various|multiple|numerous)\s+(seconds|minutes|items|entries|elements|chunks)",
+            r"\b(around|approximately|roughly|about)\s+\d+",
+            r"\bhundreds of\b",
+            r"\bthousands of\b",
         ]
 
         for pattern in vague_patterns:
@@ -2575,13 +2560,31 @@ Extract specific constants, counts, and measurements with their variable names a
         import re
 
         # Check for citation pattern: filename.ext:123 or filename.ext:123-456
-        citation_pattern = r'[\w/]+\.\w+:\d+(?:-\d+)?'
+        citation_pattern = r"[\w/]+\.\w+:\d+(?:-\d+)?"
         citations = re.findall(citation_pattern, answer)
+
+        answer_length = len(answer.strip())
+        answer_lines = answer.count("\n") + 1
+        citation_count = len(citations)
+
+        # Calculate citation density (citations per 100 lines of analysis)
+        citation_density = (
+            (citation_count / answer_lines * 100) if answer_lines > 0 else 0
+        )
+
+        # Log citation metrics
+        logger.info(
+            f"Citation metrics: {citation_count} citations found in {answer_length:,} chars "
+            f"({answer_lines} lines), density={citation_density:.1f} citations/100 lines"
+        )
+
+        # Sample citations for debugging (show first 3)
+        if citations:
+            sample_citations = citations[:3]
+            logger.debug(f"Sample citations: {', '.join(sample_citations)}")
 
         if not citations and chunks:
             # Answer missing inline citations - footer provides separate comprehensive listing
-            answer_length = len(answer.strip())
-
             # Enhanced warning with context
             if answer_length == 0:
                 logger.warning(
@@ -2596,8 +2599,15 @@ Extract specific constants, counts, and measurements with their variable names a
             else:
                 logger.warning(
                     f"LLM answer missing file:line citations in analysis body "
-                    f"(answer_length={answer_length} chars)"
+                    f"(answer_length={answer_length} chars, {answer_lines} lines). "
+                    f"Check if prompt citation examples are being followed."
                 )
+        elif citations and citation_density < 1.0:
+            # Has some citations but density is low
+            logger.warning(
+                f"Low citation density: {citation_density:.1f} citations/100 lines "
+                f"({citation_count} total citations). Consider reviewing prompt emphasis."
+            )
 
         return answer
 
@@ -2634,7 +2644,7 @@ Extract specific constants, counts, and measurements with their variable names a
             ├── src/
             │	└── main.py (2 chunks: L10-25, L50-75)
             └── tests/
-            	└── test.py (1 chunks: L5-15)
+                └── test.py (1 chunks: L5-15)
         """
         if not files and not chunks:
             return ""
@@ -2703,7 +2713,9 @@ Extract specific constants, counts, and measurements with their variable names a
 
                         # Get line ranges
                         ranges = []
-                        for chunk in sorted(file_chunks, key=lambda c: c.get("start_line", 0)):
+                        for chunk in sorted(
+                            file_chunks, key=lambda c: c.get("start_line", 0)
+                        ):
                             start = chunk.get("start_line", "?")
                             end = chunk.get("end_line", "?")
                             ranges.append(f"L{start}-{end}")
@@ -2712,7 +2724,9 @@ Extract specific constants, counts, and measurements with their variable names a
                         if len(ranges) <= 3:
                             range_str = ", ".join(ranges)
                         else:
-                            range_str = f"{', '.join(ranges[:3])}, +{len(ranges) - 3} more"
+                            range_str = (
+                                f"{', '.join(ranges[:3])}, +{len(ranges) - 3} more"
+                            )
 
                         line += f" ({chunk_count} chunks: {range_str})"
                     else:
@@ -2764,30 +2778,25 @@ Extract specific constants, counts, and measurements with their variable names a
 
         llm = self._llm_manager.get_utility_provider()
 
-        questions_str = "\n".join(f"{i+1}. {q}" for i, q in enumerate(questions))
+        questions_str = "\n".join(f"{i + 1}. {q}" for i, q in enumerate(questions))
 
-        system = """You are filtering research questions for architectural relevance."""
+        system = prompts.QUESTION_FILTERING_SYSTEM
 
-        prompt = f"""Root Query: {root_query}
-Current Question: {current_query}
-
-Candidate Follow-ups:
-{questions_str}
-
-Select the questions that:
-1. Help understand system architecture (component interactions, data flow)
-2. Are directly related to code elements already found
-3. Deepen understanding of the ROOT query (not tangents)
-
-Return ONLY the question numbers (comma-separated, e.g., "1,3") for the most relevant questions.
-Maximum {MAX_FOLLOWUP_QUESTIONS} questions."""
+        prompt = prompts.QUESTION_FILTERING_USER.format(
+            root_query=root_query,
+            current_query=current_query,
+            questions_str=questions_str,
+            max_questions=MAX_FOLLOWUP_QUESTIONS,
+        )
 
         logger.debug(
             f"Question filtering budget: {QUESTION_FILTERING_TOKENS:,} tokens (model: {llm.model})"
         )
 
         try:
-            response = await llm.complete(prompt, system=system, max_completion_tokens=QUESTION_FILTERING_TOKENS)
+            response = await llm.complete(
+                prompt, system=system, max_completion_tokens=QUESTION_FILTERING_TOKENS
+            )
             # Parse selected indices
             selected = [
                 int(n.strip()) - 1
@@ -2806,37 +2815,54 @@ Maximum {MAX_FOLLOWUP_QUESTIONS} questions."""
 
         return questions[:MAX_FOLLOWUP_QUESTIONS]
 
-    def _calculate_max_depth(self, depth: str = "shallow") -> int:
-        """Calculate max depth based on repository size.
+    def _calculate_synthesis_budgets(
+        self, repo_stats: dict[str, Any]
+    ) -> dict[str, int]:
+        """Calculate synthesis token budgets based on repository size.
+
+        Output budget is FIXED at 30k tokens for reasoning models (includes thinking + output).
+        Only INPUT budget scales with repo size from small repos (~65k total) to large repos
+        (~185k total) using piecewise linear brackets with diminishing returns.
 
         Args:
-            depth: Research depth mode - "shallow" for quick insights, "deep" for comprehensive analysis
+            repo_stats: Repository statistics from get_stats() including chunk count
 
         Returns:
-            Max depth for BFS traversal (zero-based: 0=root only, 1=root+children, etc)
+            Dictionary with input_tokens, output_tokens, overhead_tokens, total_tokens
         """
-        # In shallow mode, always use depth 1 (2 levels: root + children)
-        if depth == "shallow":
-            return 1
+        total_chunks = repo_stats.get("chunks", 0)
 
-        # Deep mode: adaptive based on repository size
-        # Get total LOC from database
-        stats = self._db_services.provider.get_stats()
-        total_chunks = stats.get("chunks", 0)
+        # Estimate LOC from chunk count
+        estimated_loc = total_chunks * CHUNKS_TO_LOC_ESTIMATE
 
-        # Rough estimation: 1 chunk ≈ 20 LOC
-        estimated_loc = total_chunks * 20
-
-        if estimated_loc < 100_000:
-            return 3
-        elif estimated_loc < 1_000_000:
-            return 4
-        elif estimated_loc < 10_000_000:
-            return 5
+        # Scale INPUT budget based on repository size (piecewise linear brackets with diminishing returns)
+        if estimated_loc < LOC_THRESHOLD_TINY:
+            # Very small repos: minimal input context
+            input_tokens = SYNTHESIS_INPUT_TOKENS_TINY
+        elif estimated_loc < LOC_THRESHOLD_SMALL:
+            # Small repos: moderate input context
+            input_tokens = SYNTHESIS_INPUT_TOKENS_SMALL
+        elif estimated_loc < LOC_THRESHOLD_MEDIUM:
+            # Medium repos: standard input context
+            input_tokens = SYNTHESIS_INPUT_TOKENS_MEDIUM
         else:
-            # Each order of magnitude adds +1
-            magnitude = math.log10(estimated_loc)
-            return int(3 + (magnitude - 5))
+            # Large repos (>= 1M LOC): maximum input context
+            input_tokens = SYNTHESIS_INPUT_TOKENS_LARGE
+
+        overhead_tokens = SINGLE_PASS_OVERHEAD_TOKENS
+        total_tokens = input_tokens + OUTPUT_TOKENS_WITH_REASONING + overhead_tokens
+
+        logger.debug(
+            f"Synthesis budgets for ~{estimated_loc:,} LOC: "
+            f"input={input_tokens:,}, output={OUTPUT_TOKENS_WITH_REASONING:,}, total={total_tokens:,}"
+        )
+
+        return {
+            "input_tokens": input_tokens,
+            "output_tokens": OUTPUT_TOKENS_WITH_REASONING,
+            "overhead_tokens": overhead_tokens,
+            "total_tokens": total_tokens,
+        }
 
     def _get_adaptive_token_budgets(
         self, depth: int, max_depth: int, is_leaf: bool
