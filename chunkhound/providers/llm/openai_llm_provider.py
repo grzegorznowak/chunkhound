@@ -311,3 +311,11 @@ class OpenAILLMProvider(LLMProvider):
             "prompt_tokens": self._prompt_tokens,
             "completion_tokens": self._completion_tokens,
         }
+
+    def get_synthesis_concurrency(self) -> int:
+        """Get recommended concurrency for parallel synthesis operations.
+
+        Returns:
+            3 for OpenAI (conservative default based on tier limits)
+        """
+        return 3

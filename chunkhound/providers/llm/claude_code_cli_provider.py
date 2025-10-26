@@ -453,3 +453,11 @@ Respond with JSON only, no additional text."""
             "prompt_tokens_estimated": self._estimated_prompt_tokens,
             "completion_tokens_estimated": self._estimated_completion_tokens,
         }
+
+    def get_synthesis_concurrency(self) -> int:
+        """Get recommended concurrency for parallel synthesis operations.
+
+        Returns:
+            1 for Claude Code CLI (sequential to avoid overwhelming the CLI)
+        """
+        return 1

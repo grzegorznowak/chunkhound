@@ -131,3 +131,14 @@ class LLMProvider(ABC):
             Usage stats dictionary
         """
         ...
+
+    def get_synthesis_concurrency(self) -> int:
+        """
+        Get recommended concurrency for parallel synthesis operations.
+
+        Returns:
+            Number of concurrent synthesis tasks this provider can handle.
+            Used for map-reduce synthesis to execute cluster summaries in parallel.
+            Default implementations return provider-specific values based on rate limits.
+        """
+        return 3  # Conservative default
