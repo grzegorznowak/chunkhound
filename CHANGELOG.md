@@ -33,6 +33,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Vue.js Single File Component (SFC) support with specialized parsing for template, script, and style sections
 - Cross-reference tracking between Vue template elements and script definitions for enhanced semantic understanding
 - Vue template directive and event handler parsing with full metadata extraction
+- RapidYAML is now bundled as a core dependency; YAML parsing uses the native bindings by default (set `CHUNKHOUND_YAML_ENGINE=tree` to revert to the legacy parser)
 
 ### Enhanced
 - Embedding performance settings (`batch_size`, `timeout`, `max_concurrent_batches`) are now documented as user-configurable via `.chunkhound.json` and environment variables for custom endpoints like Ollama

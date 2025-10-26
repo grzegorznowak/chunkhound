@@ -12,6 +12,7 @@ complexity and ensure better error handling during startup.
 """
 
 import logging
+import os
 from pathlib import Path
 from typing import Any
 
@@ -49,6 +50,7 @@ from chunkhound.parsers.mappings import (
     YamlMapping,
     ZigMapping,
 )
+from chunkhound.interfaces.language_parser import LanguageParser
 from chunkhound.parsers.mappings.base import BaseMapping
 from chunkhound.parsers.universal_engine import SetupError, TreeSitterEngine
 from chunkhound.parsers.universal_parser import CASTConfig, UniversalParser
@@ -599,13 +601,13 @@ class ParserFactory:
             default_cast_config: Default cAST configuration for all parsers
         """
         self.default_cast_config = default_cast_config or CASTConfig()
-        self._parser_cache: dict[Language, UniversalParser] = {}
+        self._parser_cache: dict[tuple[Language, str], LanguageParser] = {}
 
     def create_parser(
         self,
         language: Language,
         cast_config: CASTConfig | None = None,
-    ) -> UniversalParser:
+    ) -> LanguageParser:
         """Create a universal parser for the specified language.
 
         Args:
@@ -626,7 +628,7 @@ class ParserFactory:
             return VueParser(cast_config)
 
         # Use cache to avoid recreating parsers
-        cache_key = language
+        cache_key = self._cache_key(language)
         if cache_key in self._parser_cache:
             return self._parser_cache[cache_key]
 
@@ -652,14 +654,16 @@ class ParserFactory:
 
         # Import TreeSitterEngine here to avoid circular imports
 
+        parser: UniversalParser
+
         # Special handling for text and PDF files (no tree-sitter required)
         if language in (Language.TEXT, Language.PDF):
             # Text and PDF mappings don't need tree-sitter engine
             mapping = config.mapping_class()
-            # For text and PDF files, we'll handle this specially in the parser
-            parser = UniversalParser(None, mapping, cast_config)  # type: ignore
-            self._parser_cache[cache_key] = parser
-            return parser
+            parser = UniversalParser(None, mapping, cast_config)  # type: ignore[arg-type]
+            wrapped = self._maybe_wrap_yaml_parser(language, parser)
+            self._parser_cache[cache_key] = wrapped
+            return wrapped
 
         if not config.available:
             raise SetupError(
@@ -680,11 +684,13 @@ class ParserFactory:
             mapping = config.mapping_class()
 
             # Create parser
-            parser = UniversalParser(
+            universal_parser = UniversalParser(
                 engine,
                 mapping,
                 cast_config,
             )
+
+            parser = self._maybe_wrap_yaml_parser(language, universal_parser)
 
             # Cache for future use
             self._parser_cache[cache_key] = parser
@@ -703,7 +709,7 @@ class ParserFactory:
 
     def create_parser_for_file(
         self, file_path: Path, cast_config: CASTConfig | None = None
-    ) -> UniversalParser:
+    ) -> LanguageParser:
         """Create a parser appropriate for the given file.
 
         Args:
@@ -711,7 +717,7 @@ class ParserFactory:
             cast_config: Optional cAST configuration
 
         Returns:
-            UniversalParser instance appropriate for the file
+            LanguageParser instance appropriate for the file
 
         Raises:
             SetupError: If the required tree-sitter module is not available
@@ -737,6 +743,25 @@ class ParserFactory:
         from chunkhound.core.detection import detect_language
 
         return detect_language(file_path)
+
+    def _maybe_wrap_yaml_parser(
+        self, language: Language, parser: UniversalParser
+    ) -> LanguageParser:
+        """Wrap YAML parser with RapidYAML implementation when available."""
+        if language != Language.YAML:
+            return parser
+        try:
+            from chunkhound.parsers.rapid_yaml_parser import RapidYamlParser
+        except Exception:
+            return parser
+        return RapidYamlParser(parser)
+
+    def _cache_key(self, language: Language) -> tuple[Language, str]:
+        if language == Language.YAML:
+            mode = os.environ.get("CHUNKHOUND_YAML_ENGINE", "").strip().lower()
+            token = mode or "rapid"
+            return (language, token)
+        return (language, "default")
 
     def get_available_languages(self) -> dict[Language, bool]:
         """Get a dictionary of all languages and their availability status.
@@ -832,7 +857,7 @@ def get_parser_factory(cast_config: CASTConfig | None = None) -> ParserFactory:
 
 def create_parser_for_file(
     file_path: Path, cast_config: CASTConfig | None = None
-) -> UniversalParser:
+) -> LanguageParser:
     """Convenience function to create a parser for a file.
 
     Args:
@@ -840,7 +865,7 @@ def create_parser_for_file(
         cast_config: Optional cAST configuration
 
     Returns:
-        UniversalParser instance appropriate for the file
+        LanguageParser instance appropriate for the file
     """
     factory = get_parser_factory(cast_config)
     return factory.create_parser_for_file(file_path, cast_config)
@@ -848,7 +873,7 @@ def create_parser_for_file(
 
 def create_parser_for_language(
     language: Language, cast_config: CASTConfig | None = None
-) -> UniversalParser:
+) -> LanguageParser:
     """Convenience function to create a parser for a language.
 
     Args:
@@ -856,7 +881,7 @@ def create_parser_for_language(
         cast_config: Optional cAST configuration
 
     Returns:
-        UniversalParser instance configured for the language
+        LanguageParser instance configured for the language
     """
     factory = get_parser_factory(cast_config)
     return factory.create_parser(language, cast_config)
