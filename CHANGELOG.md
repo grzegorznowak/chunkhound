@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - Per-file timeout controls: `indexing.per_file_timeout_seconds`, `indexing.per_file_timeout_min_size_kb`, CLI flags and env overrides.
-- Change-detection with mandatory checksum verification for unchanged files (now always-on when size+mtime match).
+- Smart change detection: Checksums used for verification when mtime/size differ, enabling detection of false-positive metadata changes.
 - DuckDB schema: `files.content_hash` column (idempotent migration via `ALTER TABLE IF NOT EXISTS`).
 - LanceDB schema: `files.content_hash` column for checksum support.
 - Progress improvements: split "Parsing files" vs "Handling files" with live cumulative info.
@@ -25,7 +25,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - **BREAKING**: Checksum algorithm switched from SHA-256 to xxHash3-64 for faster file change detection. All files will be reindexed on first run after upgrade to compute new checksums.
-- **BREAKING**: Checksum verification now mandatory for all providers when size+mtime match. Removed `indexing.verify_checksum_when_mtime_equal` config option and `--verify-checksum` CLI flag.
+- **PERFORMANCE**: Skip detection now uses fast mtime+size comparison (skips immediately when both match). Checksums are used for secondary verification when mtime/size differ to avoid reindexing files with metadata-only changes (e.g., `touch` command, clock adjustments).
 - **BREAKING**: LanceDB provider now requires `content_hash` column in files schema.
 - Default per-file timeout is now enabled by default: `indexing.per_file_timeout_seconds=3.0` (previously `0`, disabled). Set to `0` to disable.
 - When timeouts are enabled and no explicit concurrency is set, parser workers auto‑scale to `cpu_count` (capped at 32). Override via `indexing.max_concurrent`, `--max-concurrent`, or `CHUNKHOUND_INDEXING__MAX_CONCURRENT`.
