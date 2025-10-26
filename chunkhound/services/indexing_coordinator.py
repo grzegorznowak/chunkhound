@@ -791,34 +791,28 @@ class IndexingCoordinator(BaseService):
                                 stored_mtime = -1.0
                             same_mtime = abs(stored_mtime - float(st.st_mtime)) <= mtime_eps
                             if same_size and same_mtime:
+                                # Fast skip - trust filesystem metadata (mtime+size match)
+                                skipped_unchanged += 1
+                                reasons["ok"] += 1
+                            else:
+                                # Size or mtime changed - verify if content actually changed via checksum
                                 db_hash = db_file.get("content_hash")
+                                cur_hash = self._compute_hash_with_fallback(f)
 
-                                # Only compute hash if DB doesn't have one (performance optimization)
-                                if db_hash is None:
-                                    # No hash in DB - compute and reindex to populate
-                                    cur_hash = self._compute_hash_with_fallback(f)
-                                    precomputed_hashes[str(f.resolve())] = cur_hash
-                                    files_to_process.append((f, cur_hash))
-                                    if cur_hash is None:
-                                        reasons["error"] += 1
-                                    else:
-                                        reasons["not_found"] += 1
-                                else:
-                                    # DB has hash and file unchanged (size+mtime match) - trust cached hash
+                                if db_hash and cur_hash and db_hash == cur_hash:
+                                    # False positive - metadata changed but content didn't
                                     skipped_unchanged += 1
                                     reasons["ok"] += 1
-                            else:
-                                # File changed (size or mtime differs) - compute hash for skip optimization on next run
-                                if not same_size:
-                                    reasons["size"] += 1
-                                elif not same_mtime:
-                                    reasons["mtime"] += 1
-
-                                cur_hash = self._compute_hash_with_fallback(f)
-                                precomputed_hashes[str(f.resolve())] = cur_hash
-                                files_to_process.append((f, cur_hash))
-                                if cur_hash is None:
-                                    reasons["error"] += 1
+                                else:
+                                    # Content actually changed (or hash unavailable) - reindex
+                                    precomputed_hashes[str(f.resolve())] = cur_hash
+                                    files_to_process.append((f, cur_hash))
+                                    if not same_size:
+                                        reasons["size"] += 1
+                                    elif not same_mtime:
+                                        reasons["mtime"] += 1
+                                    if cur_hash is None:
+                                        reasons["error"] += 1
                         else:
                             # New file not in DB - compute hash for skip optimization on next run
                             cur_hash = self._compute_hash_with_fallback(f)
