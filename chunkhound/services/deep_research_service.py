@@ -2330,7 +2330,7 @@ class DeepResearchService:
                 for chunk in sorted_chunks:
                     start_line = chunk.get("start_line", "?")
                     end_line = chunk.get("end_line", "?")
-                    chunk_code = chunk.get("code", "")
+                    chunk_code = chunk.get("content", "")
 
                     # Add line marker before chunk code
                     chunk_sections.append(
