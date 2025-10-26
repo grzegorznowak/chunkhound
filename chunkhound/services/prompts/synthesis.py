@@ -4,6 +4,23 @@ Generates comprehensive technical analysis of codebase from BFS exploration resu
 """
 
 
+# Shared citation requirements for all synthesis modes
+CITATION_REQUIREMENTS = (
+    """**Citations**: MANDATORY reference numbers for every technical claim, """
+    """constant, algorithm, and pattern.
+   - Format: `[N]` where N is the reference number from Source References
+   - Examples:
+     * "timeout = 5.0s (SEARCH_TIMEOUT) [1]"
+     * "Multi-hop expansion [1] processes results iteratively"
+     * "RerankResult dataclass [2] stores similarity scores"
+   - Use exact values, avoid approximations like "around", """
+    """"approximately", "roughly"
+   - Every algorithm, constant, pattern, and architectural decision """
+    """needs a citation
+   - Use reference numbers from the Source References table provided"""
+)
+
+
 # System message template with variable: output_guidance
 def get_system_message(output_guidance: str) -> str:
     """Get synthesis system message with output guidance.
@@ -53,19 +70,17 @@ Draft notes:
 - "Entry: search_service.py:search() → multi-hop expansion"
 - "Loop: while time < 5s, results < 500"
 - "Termination: score drop > 0.15, min score < 0.5"
-- "Constants: TIMEOUT=5s:289, MAX=500:292, DROP=0.15:425"
+- "Constants: TIMEOUT=5s, MAX=500, DROP=0.15"
 - "Pattern: adaptive depth, prevents result degradation"
 - "Trade-off: latency vs recall, chose 5s limit"
 
-Then produce full analysis with complete details, citations, pseudocode.
+Then produce full analysis with complete details, reference citations [N], pseudocode.
 
 **Key principle:** Think in concise drafts, write comprehensive output.
 </reasoning_strategy>
 
 <requirements>
-1. **Citations**: MANDATORY file:line for every claim, constant, algorithm, pattern
-   - Format: "timeout = 5.0s (SEARCH_TIMEOUT at search.py:23)"
-   - Use absolute paths when available
+1. {CITATION_REQUIREMENTS}
 
 2. **Architecture First**: 30,000-foot view before components
    - System style, layer hierarchy, core principles
@@ -114,14 +129,14 @@ Then produce full analysis with complete details, citations, pseudocode.
 ## Core Algorithms
 For each (3-5 most complex):
 
-**Algorithm**: [Name] (file.py:start-end)
+**Algorithm**: [Name] [N]
 **Purpose**: [Problem solved]
 **Pseudocode**:
 ```python
-while condition:  # file.py:123
-    if threshold: break  # file.py:125, prevents X
+while condition:  # [N]
+    if threshold: break  # [N], prevents X
 ```
-**Constants**: [Table with name/value/purpose/location]
+**Constants**: [Table with name/value/purpose/references]
 **Complexity**: [O-notation time/space]
 **Rationale**: [Why this approach]
 
@@ -138,7 +153,7 @@ while condition:  # file.py:123
 [End-to-end transformations with ASCII diagrams]
 
 **Pipeline**:
-1. **Input → Output**: [Description] (file.py:123-145)
+1. **Input → Output**: [Description] [N]
    - Input: [Type]
    - Operation: [What happens]
    - Output: [Type]
@@ -177,13 +192,15 @@ For each pattern:
 3. For patterns: explain WHY and TRADE-OFFS
 4. Show explicit data pipeline (numbered input → output)
 5. Present algorithms as executable pseudocode with exact thresholds
-6. Cite file:line for every technical claim
+6. Cite sources using reference numbers [N] for every technical claim
 7. Prioritize architectural understanding over completeness
 </approach>"""
 
 
-# User prompt template with variables: root_query, code_context
+# User prompt template with variables: root_query, code_context, reference_table
 USER_TEMPLATE = """Question: {root_query}
+
+{reference_table}
 
 Complete Code Context:
 {code_context}
@@ -200,7 +217,8 @@ First, analyze the code using Chain of Draft (minimal draft notes, 5-7 words per
 Then write full analysis following the format specification.
 
 CRITICAL REQUIREMENTS:
-- Extract EXACT values with constant names and file:line citations
+- Extract EXACT values with constant names and cite using reference numbers [N]
+- Use ONLY the reference numbers from the Source References table above
 - Focus on architectural understanding (AI agents retrieve additional chunks on-demand)
 - Curate 3-5 most complex algorithms, not all algorithms
 - Explain WHY for every design pattern and TRADE-OFFS accepted
