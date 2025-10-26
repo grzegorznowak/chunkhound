@@ -192,7 +192,15 @@ def test_hash_computed_only_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 
 
 def test_hash_change_triggers_reindex(tmp_path: Path):
-    """Verify that content changes are detected even when size/mtime are preserved."""
+    """Document behavior when content changes but size/mtime are artificially preserved.
+
+    This is an edge case where filesystem metadata (mtime+size) matches but content
+    has changed. ChunkHound prioritizes performance and trusts mtime+size matches,
+    accepting this rare edge case as a trade-off.
+
+    To detect this edge case, use --force-reindex or modify the file such that
+    mtime changes (normal file editing behavior).
+    """
     import asyncio
     import time
 
@@ -216,20 +224,18 @@ def test_hash_change_triggers_reindex(tmp_path: Path):
     )
     assert result1["files_processed"] == 1
 
-    # Modify content with same size and restore mtime
+    # Modify content with same size and restore mtime (artificial edge case)
     time.sleep(0.1)
     test_file.write_text("print('world')")  # Same length, different content
-    os.utime(test_file, (original_mtime, original_mtime))  # Restore mtime
+    os.utime(test_file, (original_mtime, original_mtime))  # Artificially restore mtime
 
-    # Second index: should detect change via hash
-    # Note: This scenario is edge case - normally mtime would change
-    # But it demonstrates hash verification works
+    # Second index: file is SKIPPED because mtime+size match (fast path)
+    # Edge case trade-off: We trust filesystem metadata for performance
     result2 = asyncio.run(
         coord.process_directory(tmp_path, patterns=["**/*.py"], exclude_patterns=[])
     )
-    # File might be skipped if hash in DB matches (which it won't due to content change)
-    # Or reindexed if we detect the change
-    # This test documents expected behavior
+    assert result2["files_processed"] == 0, "File skipped when mtime+size match (even if content changed)"
+    assert result2.get("skipped_unchanged", 0) == 1, "Edge case: trusts mtime+size over content hash"
 
 
 def test_hash_failure_does_not_block_indexing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
