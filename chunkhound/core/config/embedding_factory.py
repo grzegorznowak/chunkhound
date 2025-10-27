@@ -81,6 +81,7 @@ class EmbeddingProviderFactory:
         model = config.get("model")
         rerank_model = config.get("rerank_model")
         rerank_url = config.get("rerank_url", "/rerank")
+        rerank_format = config.get("rerank_format", "auto")
 
         # Model should come from config, but handle None case safely
         if not model:
@@ -89,7 +90,7 @@ class EmbeddingProviderFactory:
         logger.debug(
             f"Creating OpenAI provider: model={model}, "
             f"base_url={base_url}, api_key={'***' if api_key else None}, "
-            f"rerank_model={rerank_model}"
+            f"rerank_model={rerank_model}, rerank_format={rerank_format}"
         )
 
         try:
@@ -99,6 +100,7 @@ class EmbeddingProviderFactory:
                 model=model,
                 rerank_model=rerank_model,
                 rerank_url=rerank_url,
+                rerank_format=rerank_format,
             )
         except Exception as e:
             raise ValueError(f"Failed to create OpenAI provider: {e}") from e

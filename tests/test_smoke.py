@@ -556,6 +556,45 @@ class TestTypeAnnotations:
             )
 
 
+class TestConfigurationSmoke:
+    """Test that new configuration parameters don't break imports or config."""
+
+    def test_rerank_format_configuration(self):
+        """Verify rerank_format parameter doesn't break imports or config.
+
+        This test ensures the new TEI reranking format configuration can be
+        instantiated without errors, catching import-time or validation issues.
+        """
+        from chunkhound.core.config.embedding_config import EmbeddingConfig
+
+        # Should not raise during import or instantiation with TEI format
+        config_tei = EmbeddingConfig(
+            provider="openai",
+            model="text-embedding-3-small",
+            base_url="http://localhost:8001",
+            rerank_format="tei",
+        )
+        assert config_tei.rerank_format == "tei"
+
+        # Should not raise with Cohere format
+        config_cohere = EmbeddingConfig(
+            provider="openai",
+            model="text-embedding-3-small",
+            base_url="http://localhost:8001",
+            rerank_model="rerank-model",
+            rerank_format="cohere",
+        )
+        assert config_cohere.rerank_format == "cohere"
+
+        # Should not raise with auto format (default)
+        config_auto = EmbeddingConfig(
+            provider="openai",
+            model="text-embedding-3-small",
+            base_url="http://localhost:8001",
+        )
+        assert config_auto.rerank_format == "auto"
+
+
 if __name__ == "__main__":
     # Allow running directly for debugging
     pytest.main([__file__, "-v"])

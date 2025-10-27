@@ -1434,12 +1434,10 @@ class LanceDBProvider(SerialDatabaseProvider):
 
         try:
             if self._chunks_table:
-                logger.debug("Optimizing chunks table - compacting fragments...")
-                self._chunks_table.optimize()
-                logger.debug("Cleaning up old versions for chunks table...")
-                # Clean up versions older than 1 hour aggressively
-                stats = self._chunks_table.cleanup_old_versions(
-                    older_than=timedelta(hours=1), delete_unverified=True
+                logger.debug("Optimizing chunks table - compacting fragments and cleaning up old versions...")
+                # optimize() now handles cleanup internally (cleanup_old_versions deprecated since 0.21.0)
+                stats = self._chunks_table.optimize(
+                    cleanup_older_than=timedelta(hours=1), delete_unverified=True
                 )
                 logger.debug(
                     f"Chunks table cleanup freed {stats.bytes_removed / 1024 / 1024:.2f} MB"
@@ -1447,12 +1445,10 @@ class LanceDBProvider(SerialDatabaseProvider):
                 logger.debug("Chunks table optimization complete")
 
             if self._files_table:
-                logger.debug("Optimizing files table...")
-                self._files_table.optimize()
-                logger.debug("Cleaning up old versions for files table...")
-                # Clean up versions older than 1 hour aggressively
-                stats = self._files_table.cleanup_old_versions(
-                    older_than=timedelta(hours=1), delete_unverified=True
+                logger.debug("Optimizing files table - compacting fragments and cleaning up old versions...")
+                # optimize() now handles cleanup internally (cleanup_old_versions deprecated since 0.21.0)
+                stats = self._files_table.optimize(
+                    cleanup_older_than=timedelta(hours=1), delete_unverified=True
                 )
                 logger.debug(
                     f"Files table cleanup freed {stats.bytes_removed / 1024 / 1024:.2f} MB"

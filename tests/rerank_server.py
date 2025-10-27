@@ -2,8 +2,17 @@
 """
 Mock reranking server for testing multi-hop semantic search.
 
-This lightweight server provides a Cohere-compatible /rerank endpoint
-for testing purposes without requiring heavy dependencies like vLLM.
+This lightweight server provides a /rerank endpoint compatible with both:
+- Cohere format (documents field, relevance_score)
+- TEI format (texts field, score)
+
+Auto-detects format from request for testing purposes without requiring
+heavy dependencies like vLLM or TEI servers.
+
+LIMITATIONS:
+- Simple HTTP parsing may fail with some HTTP clients (e.g., httpx in some configs)
+- For comprehensive testing, use a real reranking service (vLLM, TEI)
+- Suitable for basic format testing and development only
 """
 
 import asyncio
@@ -20,8 +29,8 @@ logger.add(sys.stderr, level="INFO", format="{time:HH:mm:ss} | {level} | {messag
 
 
 class MockRerankServer:
-    """Mock reranking server with Cohere-compatible API."""
-    
+    """Mock reranking server with Cohere and TEI compatible API."""
+
     def __init__(self, host: str = "127.0.0.1", port: int = 8001):
         self.host = host
         self.port = port
@@ -33,47 +42,56 @@ class MockRerankServer:
         return {"healthy": True, "service": "mock-rerank-server"}
     
     async def rerank_handler(self, request: dict) -> dict:
-        """Handle reranking requests with Cohere-compatible API."""
+        """Handle reranking requests with Cohere and TEI compatible API.
+
+        Auto-detects format from request:
+        - Cohere: uses 'documents' field, requires 'model'
+        - TEI: uses 'texts' field, model optional
+        """
         try:
             # Parse request body
             body = request.get("body", {})
-            
-            # Extract parameters
-            model = body.get("model", "mock-reranker")
+
+            # Extract parameters and detect format
             query = body.get("query", "")
-            documents = body.get("documents", [])
+            model = body.get("model", "mock-reranker")
+
+            # Detect format: TEI uses "texts", Cohere uses "documents"
+            is_tei = "texts" in body
+            documents = body.get("texts" if is_tei else "documents", [])
             top_n = body.get("top_n")
-            
+
+            format_name = "TEI" if is_tei else "Cohere"
+            logger.debug(f"Detected {format_name} format request with {len(documents)} documents")
+
             # Calculate mock relevance scores
             results = []
             for idx, doc in enumerate(documents):
                 score = self._calculate_relevance(query, doc)
-                results.append({
-                    "index": idx,
-                    "relevance_score": score
-                })
-            
-            # Sort by score descending
-            results.sort(key=lambda x: x["relevance_score"], reverse=True)
-            
+
+                # Use format-appropriate field name
+                if is_tei:
+                    results.append({"index": idx, "score": score})
+                else:
+                    results.append({"index": idx, "relevance_score": score})
+
+            # Sort by score descending (works for both field names)
+            score_field = "score" if is_tei else "relevance_score"
+            results.sort(key=lambda x: x[score_field], reverse=True)
+
             # Apply top_n if specified
             if top_n is not None and top_n > 0:
                 results = results[:top_n]
-            
-            logger.debug(f"Reranked {len(documents)} documents, returning {len(results)} results")
-            
-            return {
-                "results": results,
-                "model": model,
-                "meta": {"api_version": "v1"}
-            }
-            
+
+            logger.debug(
+                f"Reranked {len(documents)} documents, returning {len(results)} results ({format_name} format)"
+            )
+
+            return {"results": results, "model": model, "meta": {"api_version": "v1"}}
+
         except Exception as e:
             logger.error(f"Error in rerank handler: {e}")
-            return {
-                "error": str(e),
-                "status": 400
-            }
+            return {"error": str(e), "status": 400}
     
     def _calculate_relevance(self, query: str, document: str) -> float:
         """
