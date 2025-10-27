@@ -1,9 +1,12 @@
 """Embedding providers for ChunkHound - pluggable vector embedding generation."""
 
 from dataclasses import dataclass
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 
 from loguru import logger
+
+if TYPE_CHECKING:
+    from chunkhound.providers.embeddings.openai_provider import OpenAIEmbeddingProvider
 
 # Core domain models
 
@@ -157,6 +160,7 @@ def create_openai_provider(
     model: str = "text-embedding-3-small",
     rerank_model: str | None = None,
     rerank_url: str = "/rerank",
+    rerank_format: str = "auto",
 ) -> "OpenAIEmbeddingProvider":
     """Create an OpenAI embedding provider with default settings.
 
@@ -166,6 +170,7 @@ def create_openai_provider(
         model: Model name to use
         rerank_model: Model name to use for reranking (enables multi-hop search)
         rerank_url: Rerank endpoint URL (defaults to /rerank)
+        rerank_format: Reranking API format - 'cohere', 'tei', or 'auto' (default: 'auto')
 
     Returns:
         Configured OpenAI embedding provider
@@ -179,4 +184,5 @@ def create_openai_provider(
         model=model,
         rerank_model=rerank_model,
         rerank_url=rerank_url,
+        rerank_format=rerank_format,
     )
