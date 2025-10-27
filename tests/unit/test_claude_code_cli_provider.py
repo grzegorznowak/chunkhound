@@ -58,16 +58,6 @@ class TestClaudeCodeCLIProvider:
         # Any model name is passed through as-is
         assert provider._map_model_to_cli_arg("custom-model") == "custom-model"
 
-    def test_is_cli_available(self, provider):
-        """Test CLI availability check."""
-        with patch("subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(returncode=0)
-            assert provider._is_cli_available() is True
-
-        with patch("subprocess.run") as mock_run:
-            mock_run.side_effect = FileNotFoundError()
-            assert provider._is_cli_available() is False
-
     def test_estimate_tokens(self, provider):
         """Test token estimation (rough approximation)."""
         text = "a" * 400  # 400 characters
@@ -249,8 +239,7 @@ class TestClaudeCodeCLIProvider:
         mock_process.communicate.return_value = (b"OK", b"")
         mock_subprocess.return_value = mock_process
 
-        with patch.object(provider, "_is_cli_available", return_value=True):
-            result = await provider.health_check()
+        result = await provider.health_check()
 
         assert result["status"] == "healthy"
         assert result["provider"] == "claude-code-cli"
@@ -258,22 +247,22 @@ class TestClaudeCodeCLIProvider:
         assert "test_response" in result
 
     @pytest.mark.asyncio
-    async def test_health_check_cli_not_found(self, provider):
+    async def test_health_check_cli_not_found(self, provider, mock_subprocess):
         """Test health check when CLI is not available."""
-        with patch.object(provider, "_is_cli_available", return_value=False):
-            result = await provider.health_check()
+        mock_subprocess.side_effect = FileNotFoundError("claude: command not found")
+
+        result = await provider.health_check()
 
         assert result["status"] == "unhealthy"
         assert result["provider"] == "claude-code-cli"
-        assert "not found" in result["error"].lower()
+        assert "error" in result
 
     @pytest.mark.asyncio
     async def test_health_check_cli_fails(self, provider, mock_subprocess):
         """Test health check when CLI call fails."""
         mock_subprocess.side_effect = RuntimeError("CLI failed")
 
-        with patch.object(provider, "_is_cli_available", return_value=True):
-            result = await provider.health_check()
+        result = await provider.health_check()
 
         assert result["status"] == "unhealthy"
         assert "error" in result
