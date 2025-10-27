@@ -4,6 +4,10 @@ from __future__ import annotations
 
 import logging
 import os
+import re
+from collections import Counter
+from contextlib import contextmanager
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Sequence
@@ -12,6 +16,7 @@ from chunkhound.core.models.chunk import Chunk
 from chunkhound.core.types.common import ChunkType, FileId, Language, LineNumber
 from chunkhound.interfaces.language_parser import LanguageParser, ParseResult
 from chunkhound.parsers.universal_parser import UniversalParser
+from chunkhound.parsers.yaml_template_sanitizer import sanitize_helm_templates
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +42,16 @@ class RapidYamlParser(LanguageParser):
         self._enabled = not _env_wants_tree_sitter()
         self._ryml = None
         self._tree = None
+        # Memoize paths that should not be parsed with RapidYAML again this process
+        self._denylist_paths: set[str] = set()
+        # Counters for one-line summary logging
+        self._count_sanitized = 0
+        self._count_pre_skip = 0
+        self._count_complex_skip = 0
+        self._count_ryml_ok = 0
+        self._count_ryml_fail = 0
+        self._count_fallback_ts = 0
+
         if self._enabled:
             try:
                 import ryml  # type: ignore[import-not-found]
@@ -91,25 +106,66 @@ class RapidYamlParser(LanguageParser):
         file_path: Path | None = None,
         file_id: FileId | None = None,
     ) -> list[Chunk]:
+        # Denylist: skip ryml attempts for known-bad paths (no tree-sitter fallback)
+        if file_path is not None and str(file_path) in getattr(self, "_denylist_paths", set()):
+            self._count_fallback_ts += 1
+            return []
+
         if not self._can_use_rapid():
             return self._fallback.parse_content(content, file_path, file_id)
 
-        if not content.strip():
+        sanitized = sanitize_helm_templates(content)
+        effective_content = sanitized.text
+        fallback_source = effective_content if sanitized.changed else content
+        if sanitized.changed:
+            self._count_sanitized += 1
+            summary = _summarize_rewrites(sanitized.rewrites)
+            path_str = str(file_path) if file_path else "<memory>"
+            logger.debug(
+                "Sanitized templated YAML %s (%s)",
+                path_str,
+                summary,
+            )
+
+        # If sanitizer advises pre-skip (eg, non-YAML fragments), avoid ryml churn
+        if getattr(sanitized, "pre_skip", False):
+            self._count_pre_skip += 1
+            self._count_fallback_ts += 1
+            return []
+
+        if _has_complex_keys(effective_content):
+            path_str = str(file_path) if file_path else "<memory>"
+            logger.debug(
+                "RapidYAML skipped %s: detected complex YAML keys. Falling back to tree-sitter.",
+                path_str,
+            )
+            self._count_complex_skip += 1
+            self._count_fallback_ts += 1
+            return []
+
+        if not effective_content.strip():
             return []
 
         try:
             builder = _RapidYamlChunkBuilder(
                 self._ryml,
                 self._tree,
-                content,
+                effective_content,
                 file_id or FileId(0),
             )
-            return builder.build_chunks()
+            chunks = builder.build_chunks()
+            self._count_ryml_ok += 1
+            return chunks
         except Exception as exc:
-            logger.warning(
+            logger.debug(
                 "RapidYAML parser failed (%s). Falling back to tree-sitter.", exc
             )
-            return self._fallback.parse_content(content, file_path, file_id)
+            # Add to denylist to avoid repeated attempts
+            if file_path is not None:
+                self._denylist_paths.add(str(file_path))
+            self._count_ryml_fail += 1
+            self._count_fallback_ts += 1
+            return []
 
     def parse_with_result(self, file_path: Path, file_id: FileId) -> ParseResult:
         if not self._can_use_rapid():
@@ -141,7 +197,22 @@ class RapidYamlParser(LanguageParser):
         self._fallback.setup()
 
     def cleanup(self) -> None:
-        self._fallback.cleanup()
+        # Emit one-line summary for this parser instance
+        logger.info(
+            "RapidYAML summary: sanitized=%d pre_skip=%d complex_skip=%d ryml_ok=%d ryml_fail=%d fallback_ts=%d",
+            self._count_sanitized,
+            self._count_pre_skip,
+            self._count_complex_skip,
+            self._count_ryml_ok,
+            self._count_ryml_fail,
+            self._count_fallback_ts,
+        )
+        # Delegate cleanup if supported
+        if hasattr(self._fallback, "cleanup"):
+            try:
+                self._fallback.cleanup()  # type: ignore[call-arg]
+            except Exception:
+                pass
 
     def reset(self) -> None:
         self._fallback.reset()
@@ -255,7 +326,8 @@ class _RapidYamlChunkBuilder:
     def build_chunks(self) -> list[Chunk]:
         self.tree.clear()
         self.tree.clear_arena()
-        self.ryml.parse_in_place(self._buffer, tree=self.tree)
+        with _suppress_c_output():
+            self.ryml.parse_in_place(self._buffer, tree=self.tree)
 
         root = self.tree.root_id()
         chunks: list[Chunk] = []
@@ -293,7 +365,8 @@ class _RapidYamlChunkBuilder:
     def _create_chunk(
         self, node: int, node_type: str, symbol: str, depth: int
     ) -> Chunk | None:
-        emitted = self.ryml.emit_yaml(self.tree, node)
+        with _suppress_c_output():
+            emitted = self.ryml.emit_yaml(self.tree, node)
         normalized = emitted.lstrip("\n")
         first_line = normalized.splitlines()[0] if normalized else symbol
         start_line, end_line = self.locator.locate(first_line, depth)
@@ -356,3 +429,43 @@ class _RapidYamlChunkBuilder:
         if node_type == "KEYSEQ":
             return "sequence"
         return "mapping"
+
+
+_COMPLEX_KEY_RE = re.compile(r"^\s*\?\s*(?:\{|\[|$)")
+
+
+def _has_complex_keys(content: str) -> bool:
+    for line in content.splitlines():
+        if _COMPLEX_KEY_RE.match(line):
+            return True
+    return False
+
+
+def _summarize_rewrites(rewrites) -> str:
+    if not rewrites:
+        return "no rewrites"
+    counts = Counter(rewrite.kind for rewrite in rewrites)
+    parts = [f"{kind}={counts[kind]}" for kind in sorted(counts)]
+    return ", ".join(parts)
+
+
+@contextmanager
+def _suppress_c_output():
+    """Temporarily redirect C-level stdout/stderr to os.devnull during ryml calls."""
+    try:
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        saved_out = os.dup(1)
+        saved_err = os.dup(2)
+        os.dup2(devnull, 1)
+        os.dup2(devnull, 2)
+        try:
+            yield
+        finally:
+            os.dup2(saved_out, 1)
+            os.dup2(saved_err, 2)
+            os.close(saved_out)
+            os.close(saved_err)
+            os.close(devnull)
+    except Exception:
+        # Fail open: if redirection fails, proceed without silencing
+        yield

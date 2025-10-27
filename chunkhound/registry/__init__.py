@@ -174,19 +174,24 @@ class ProviderRegistry:
         database_provider = self.get_provider("database")
         embedding_provider = None
 
-        try:
-            logger.debug(
-                "[REGISTRY] Attempting to get embedding provider for IndexingCoordinator"
-            )
-            embedding_provider = self.get_provider("embedding")
-            logger.debug(
-                f"[REGISTRY] Successfully got embedding provider: {type(embedding_provider)}"
-            )
-        except ValueError as e:
-            logger.warning(
-                f"[REGISTRY] No embedding provider configured for IndexingCoordinator: {e}"
-            )
-            pass  # No embedding provider configured
+        # Respect explicit --no-embeddings: do not attempt lookup and avoid warnings
+        if self._config and getattr(self._config, "embeddings_disabled", False):
+            embedding_provider = None
+            logger.debug("[REGISTRY] Embeddings disabled; skipping embedding provider")
+        else:
+            try:
+                logger.debug(
+                    "[REGISTRY] Attempting to get embedding provider for IndexingCoordinator"
+                )
+                embedding_provider = self.get_provider("embedding")
+                logger.debug(
+                    f"[REGISTRY] Successfully got embedding provider: {type(embedding_provider)}"
+                )
+            except ValueError as e:
+                logger.warning(
+                    f"[REGISTRY] No embedding provider configured for IndexingCoordinator: {e}"
+                )
+                pass  # No embedding provider configured
 
         # Get base directory from config (guaranteed to be set) or fallback to cwd
         base_directory = self._config.target_dir if self._config else Path.cwd()
@@ -207,10 +212,14 @@ class ProviderRegistry:
         database_provider = self.get_provider("database")
         embedding_provider = None
 
-        try:
-            embedding_provider = self.get_provider("embedding")
-        except ValueError:
-            logger.warning("No embedding provider configured for search service")
+        if self._config and getattr(self._config, "embeddings_disabled", False):
+            embedding_provider = None
+            logger.debug("[REGISTRY] Embeddings disabled; search service will run without embeddings")
+        else:
+            try:
+                embedding_provider = self.get_provider("embedding")
+            except ValueError:
+                logger.warning("No embedding provider configured for search service")
 
         return SearchService(
             database_provider=database_provider, embedding_provider=embedding_provider
@@ -221,10 +230,14 @@ class ProviderRegistry:
         database_provider = self.get_provider("database")
         embedding_provider = None
 
-        try:
-            embedding_provider = self.get_provider("embedding")
-        except ValueError:
-            logger.warning("No embedding provider configured for embedding service")
+        if self._config and getattr(self._config, "embeddings_disabled", False):
+            embedding_provider = None
+            logger.debug("[REGISTRY] Embeddings disabled; embedding service will be inert")
+        else:
+            try:
+                embedding_provider = self.get_provider("embedding")
+            except ValueError:
+                logger.warning("No embedding provider configured for embedding service")
 
         # Get batch configuration from config
         if self._config and self._config.embedding:

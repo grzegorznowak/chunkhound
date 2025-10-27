@@ -53,6 +53,33 @@ def test_rapid_yaml_parser_emits_chunks():
     assert any("services.web" in chunk.symbol for chunk in chunks)
 
 
+@pytest.mark.skipif(
+    os.environ.get("CHUNKHOUND_YAML_ENGINE", "").lower() == "tree",
+    reason="RapidYAML disabled via environment",
+)
+def test_rapid_yaml_parser_handles_helm_templates():
+    try:
+        import ryml  # type: ignore # noqa: F401
+    except Exception:  # pragma: no cover - optional dependency
+        pytest.skip("ryml module not available in test environment")
+
+    fallback = _build_fallback_parser()
+    parser = RapidYamlParser(fallback)
+
+    templated = (
+        "{{- if .Values.enabled }}\n"
+        "metadata:\n"
+        '  labels: {{- include "demo.labels" . | nindent 4 }}\n'
+        "  annotations:\n"
+        "    note: static\n"
+        "{{- end }}\n"
+    )
+
+    chunks = parser.parse_content(templated, None, FileId(5))
+    assert chunks, "sanitized Helm template should still produce chunks"
+    assert any(chunk.symbol.startswith("metadata") for chunk in chunks)
+
+
 def test_env_flag_disables_rapid_yaml(monkeypatch):
     monkeypatch.setenv("CHUNKHOUND_YAML_ENGINE", "tree")
     fallback = _build_fallback_parser()
@@ -63,3 +90,52 @@ def test_env_flag_disables_rapid_yaml(monkeypatch):
     baseline = fallback.parse_content(sample, None, FileId(1))
 
     assert len(chunks) == len(baseline)
+
+
+@pytest.mark.skipif(
+    os.environ.get("CHUNKHOUND_YAML_ENGINE", "").lower() == "tree",
+    reason="RapidYAML disabled via environment",
+)
+def test_rapid_yaml_parser_denylist_memo(tmp_path):
+    try:
+        import ryml  # noqa: F401
+    except Exception:
+        pytest.skip("ryml module not available")
+
+    # Content that triggers complex-key detection ('containers as keys')
+    bad = "? [a, b]: c\n"
+
+    fallback = _build_fallback_parser()
+    parser = RapidYamlParser(fallback)
+
+    p = tmp_path / "bad.yaml"
+    p.write_text(bad)
+
+    # First parse: forces ryml failure; no tree-sitter fallback per policy
+    chunks1 = parser.parse_content(bad, p, FileId(7))
+    assert chunks1 == []
+
+    # Second parse: path should be denylisted → no ryml attempt, same fallback result
+    chunks2 = parser.parse_content(bad, p, FileId(7))
+    assert chunks2 == []
+
+
+@pytest.mark.skipif(
+    os.environ.get("CHUNKHOUND_YAML_ENGINE", "").lower() == "tree",
+    reason="RapidYAML disabled via environment",
+)
+def test_summary_logged_on_cleanup(caplog):
+    try:
+        import ryml  # noqa: F401
+    except Exception:
+        pytest.skip("ryml module not available")
+
+    fallback = _build_fallback_parser()
+    parser = RapidYamlParser(fallback)
+    caplog.clear()
+    caplog.set_level("INFO")
+    # Trigger a small sanitized parse
+    text = "metadata:\n  labels: {{- include \"chart.labels\" . | nindent 4 }}\n"
+    parser.parse_content(text, None, FileId(9))
+    parser.cleanup()
+    assert any("RapidYAML summary:" in rec.message for rec in caplog.records)
