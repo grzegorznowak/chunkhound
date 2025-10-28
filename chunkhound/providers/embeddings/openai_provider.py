@@ -10,6 +10,11 @@ from typing import Any
 import httpx
 from loguru import logger
 
+from chunkhound.core.config.embedding_config import (
+    RERANK_BASE_URL_REQUIRED,
+    RERANK_MODEL_REQUIRED_COHERE,
+    validate_rerank_configuration,
+)
 from chunkhound.core.exceptions.core import ValidationError
 from chunkhound.interfaces.embedding_provider import EmbeddingConfig, RerankResult
 
@@ -191,6 +196,7 @@ class OpenAIEmbeddingProvider:
         model: str = "text-embedding-3-small",
         rerank_model: str | None = None,
         rerank_url: str = "/rerank",
+        rerank_format: str = "auto",
         batch_size: int = 100,
         timeout: int = 30,
         retry_attempts: int = 3,
@@ -203,8 +209,9 @@ class OpenAIEmbeddingProvider:
             api_key: OpenAI API key (defaults to OPENAI_API_KEY env var)
             base_url: Base URL for OpenAI API (defaults to OPENAI_BASE_URL env var)
             model: Model name to use for embeddings
-            rerank_model: Model name to use for reranking (enables multi-hop search)
+            rerank_model: Model name to use for reranking (optional for TEI format)
             rerank_url: Rerank endpoint URL (defaults to /rerank)
+            rerank_format: Reranking API format - 'cohere', 'tei', or 'auto' (default: 'auto')
             batch_size: Maximum batch size for API requests
             timeout: Request timeout in seconds
             retry_attempts: Number of retry attempts for failed requests
@@ -222,10 +229,33 @@ class OpenAIEmbeddingProvider:
         self._model = model
         self._rerank_model = rerank_model
         self._rerank_url = rerank_url
+        self._rerank_format = rerank_format
+        self._detected_rerank_format: str | None = None  # Cache for auto-detected format
+        self._format_detection_lock = asyncio.Lock()  # Protect format detection cache
+        self._batch_size = batch_size
         self._timeout = timeout
         self._retry_attempts = retry_attempts
         self._retry_delay = retry_delay
         self._max_tokens = max_tokens
+
+        # Validate rerank configuration at initialization (fail-fast)
+        # Match config validation logic: check if reranking is enabled
+        is_using_reranking = rerank_model or (rerank_format == "tei" and rerank_url)
+        if is_using_reranking or rerank_format == "cohere":
+            validate_rerank_configuration(
+                provider="openai",
+                rerank_format=rerank_format,
+                rerank_model=rerank_model,
+                rerank_url=rerank_url,
+                base_url=base_url,
+            )
+
+            # Warn about auto-detection risks in production
+            if rerank_format == "auto":
+                logger.warning(
+                    "Using rerank_format='auto' may cause first request to fail if format guess is wrong. "
+                    "For production use, explicitly set rerank_format to 'cohere' or 'tei'."
+                )
 
         # Configure Qwen-specific batch sizes (extracted for clarity)
         self._configure_qwen_batch_sizes(model, rerank_model, batch_size)
@@ -954,9 +984,92 @@ class OpenAIEmbeddingProvider:
         """
         return self.RECOMMENDED_CONCURRENCY
 
+    def _resolve_rerank_format(self) -> str:
+        """Resolve the reranking format to use for the next request.
+
+        Returns cached detected format if available in auto mode, otherwise
+        returns the configured format.
+
+        Thread safety: Reading _detected_rerank_format without a lock is safe
+        due to Python's GIL ensuring atomic pointer reads. The write operation
+        in _parse_rerank_response uses async lock for proper synchronization.
+
+        Returns:
+            Format to use: 'cohere', 'tei', or 'auto'
+        """
+        if self._detected_rerank_format:
+            return self._detected_rerank_format
+        return self._rerank_format
+
+    def _build_rerank_payload(
+        self, query: str, documents: list[str], top_k: int | None, format_to_use: str
+    ) -> dict:
+        """Build rerank request payload based on format.
+
+        Args:
+            query: Search query
+            documents: List of documents to rerank
+            top_k: Maximum number of results to return
+            format_to_use: Format to use ('cohere', 'tei', or 'auto')
+
+        Returns:
+            Request payload dictionary
+        """
+        if format_to_use == "tei":
+            # TEI format: no model in request, uses "texts" field
+            logger.debug(
+                f"Using TEI format for reranking {len(documents)} documents"
+            )
+            return {"query": query, "texts": documents}
+
+        elif format_to_use == "cohere":
+            # Cohere format: requires model, uses "documents" field
+            # Validation already done in __init__, so we know model is present
+            payload = {"model": self._rerank_model, "query": query, "documents": documents}
+            if top_k is not None:
+                payload["top_n"] = top_k
+            logger.debug(
+                f"Using Cohere format for reranking {len(documents)} documents with model {self._rerank_model}"
+            )
+            return payload
+
+        else:  # auto mode
+            # Try Cohere first if model is set, otherwise TEI
+            if self._rerank_model:
+                payload = {"model": self._rerank_model, "query": query, "documents": documents}
+                if top_k is not None:
+                    payload["top_n"] = top_k
+                logger.debug(
+                    f"Auto-detecting format, trying Cohere first (model: {self._rerank_model})"
+                )
+                return payload
+            else:
+                logger.debug("Auto-detecting format, trying TEI first (no model set)")
+                return {"query": query, "texts": documents}
+
     def supports_reranking(self) -> bool:
-        """Check if reranking is supported."""
-        return self._rerank_model is not None
+        """Check if reranking is supported with current configuration.
+
+        Uses shared validation logic to determine if reranking can be performed.
+
+        Returns:
+            True if provider can perform reranking with current config
+        """
+        if not self._rerank_url:
+            return False
+
+        # Use shared validation logic - if validation passes, reranking is supported
+        try:
+            validate_rerank_configuration(
+                provider="openai",
+                rerank_format=self._rerank_format,
+                rerank_model=self._rerank_model,
+                rerank_url=self._rerank_url,
+                base_url=self._base_url,
+            )
+            return True
+        except ValueError:
+            return False
 
     async def rerank(
         self, query: str, documents: list[str], top_k: int | None = None
@@ -966,6 +1079,9 @@ class OpenAIEmbeddingProvider:
         Implements batch splitting to prevent OOM errors on large document sets.
         For Qwen3 rerankers: uses model-specific batch limits (64-128).
         Results are aggregated across batches and sorted by relevance score.
+
+        Supports both Cohere and TEI (Text Embeddings Inference) formats.
+        Format can be explicitly set or auto-detected from response.
 
         Args:
             query: The search query
@@ -1095,10 +1211,10 @@ class OpenAIEmbeddingProvider:
         documents: list[str],
         top_k: int | None = None,
     ) -> list[RerankResult]:
-        """Internal method to rerank a single batch of documents.
+        """Internal method to rerank a single batch of documents with format detection.
 
-        Extracted from rerank() to support batch splitting while preserving
-        retry logic and error handling patterns from VoyageAI provider.
+        Supports both Cohere and TEI (Text Embeddings Inference) formats.
+        Format can be explicitly set or auto-detected from response.
 
         Args:
             query: The search query
@@ -1110,9 +1226,9 @@ class OpenAIEmbeddingProvider:
         """
         await self._ensure_client()
 
-        # Validate base_url exists for reranking
-        if not self._base_url:
-            raise ValueError("base_url is required for reranking operations")
+        # Validate base_url exists for relative URLs (redundant check for safety)
+        if not self._rerank_url.startswith(("http://", "https://")) and not self._base_url:
+            raise ValueError(RERANK_BASE_URL_REQUIRED)
 
         # Build full rerank endpoint URL
         if self._rerank_url.startswith(("http://", "https://")):
@@ -1124,17 +1240,11 @@ class OpenAIEmbeddingProvider:
             rerank_url = self._rerank_url.lstrip("/")
             rerank_endpoint = f"{base_url}/{rerank_url}"
 
-        # Prepare request payload
-        payload = {"model": self._rerank_model, "query": query, "documents": documents}
-        if top_k is not None:
-            payload["top_n"] = top_k
+        # Resolve format and build payload
+        format_to_use = self._resolve_rerank_format()
+        payload = self._build_rerank_payload(query, documents, top_k, format_to_use)
 
         try:
-            logger.debug(
-                f"Reranking {len(documents)} documents with model {self._rerank_model} "
-                f"at endpoint {rerank_endpoint}"
-            )
-
             # Make API request with timeout using httpx directly
             # since OpenAI client doesn't support custom endpoints well
 
@@ -1152,41 +1262,22 @@ class OpenAIEmbeddingProvider:
 
             async with httpx.AsyncClient(**client_kwargs) as client:
                 headers = {"Content-Type": "application/json"}
+
+                # Add Authorization header if API key is set (required for TEI with --api-key)
+                if self._api_key:
+                    headers["Authorization"] = f"Bearer {self._api_key}"
+                    logger.debug("Added Authorization header for rerank request")
+
                 response = await client.post(
                     rerank_endpoint, json=payload, headers=headers
                 )
                 response.raise_for_status()
                 response_data = response.json()
 
-            # Validate response structure
-            if "results" not in response_data:
-                raise ValueError("Invalid rerank response: missing 'results' field")
-
-            results = response_data["results"]
-            if not isinstance(results, list):
-                raise ValueError("Invalid rerank response: 'results' must be a list")
-
-            # Convert to ChunkHound format with validation
-            rerank_results = []
-            for i, result in enumerate(results):
-                if not isinstance(result, dict):
-                    logger.warning(f"Skipping invalid result {i}: not a dict")
-                    continue
-
-                if "index" not in result or "relevance_score" not in result:
-                    logger.warning(f"Skipping result {i}: missing required fields")
-                    continue
-
-                try:
-                    rerank_results.append(
-                        RerankResult(
-                            index=int(result["index"]),
-                            score=float(result["relevance_score"]),
-                        )
-                    )
-                except (ValueError, TypeError) as e:
-                    logger.warning(f"Skipping result {i}: invalid data types - {e}")
-                    continue
+            # Parse response with format auto-detection
+            rerank_results = await self._parse_rerank_response(
+                response_data, format_to_use, num_documents=len(documents)
+            )
 
             # Update usage statistics
             self._usage_stats["requests_made"] += 1
@@ -1228,3 +1319,114 @@ class OpenAIEmbeddingProvider:
             self._usage_stats["errors"] += 1
             logger.error(f"Unexpected error during reranking: {e}")
             raise
+
+    async def _parse_rerank_response(
+        self, response_data: dict, format_hint: str, num_documents: int
+    ) -> list[RerankResult]:
+        """Parse rerank response with format auto-detection.
+
+        Thread-safe format detection using async lock to prevent race conditions.
+        Validates that returned indices are within bounds of the original document list.
+
+        Args:
+            response_data: JSON response from rerank API
+            format_hint: Format hint ('cohere', 'tei', or 'auto')
+            num_documents: Number of documents that were sent for reranking
+
+        Returns:
+            List of RerankResult objects
+
+        Raises:
+            ValueError: If response format is invalid or unrecognized
+        """
+        # Early validation: check num_documents is reasonable
+        if num_documents <= 0:
+            logger.warning(
+                f"num_documents is {num_documents} (zero or negative), returning empty results"
+            )
+            return []
+
+        # Validate response has results
+        if "results" not in response_data:
+            raise ValueError("Invalid rerank response: missing 'results' field")
+
+        results = response_data["results"]
+        if not isinstance(results, list):
+            raise ValueError("Invalid rerank response: 'results' must be a list")
+
+        if not results:
+            logger.warning("Rerank response contains empty results list")
+            return []
+
+        # Try to detect format from first result
+        first_result = results[0]
+        if not isinstance(first_result, dict):
+            raise ValueError("Invalid rerank response: results must contain dict objects")
+
+        # Detect format based on field names
+        has_relevance_score = "relevance_score" in first_result
+        has_score = "score" in first_result
+        has_index = "index" in first_result
+
+        if not has_index:
+            raise ValueError("Invalid rerank response: results must have 'index' field")
+
+        # Determine score field name
+        score_field = None
+        detected_format = None
+
+        if has_relevance_score:
+            score_field = "relevance_score"
+            detected_format = "cohere"
+        elif has_score:
+            score_field = "score"
+            detected_format = "tei"
+        else:
+            raise ValueError(
+                "Invalid rerank response: results must have 'relevance_score' or 'score' field"
+            )
+
+        # Cache detected format if in auto mode (thread-safe with async lock)
+        if format_hint == "auto" and detected_format:
+            async with self._format_detection_lock:
+                # Double-check pattern: check if another task already detected the format
+                if self._detected_rerank_format is None:
+                    self._detected_rerank_format = detected_format
+                    logger.debug(f"Auto-detected rerank format: {detected_format}")
+
+        # Convert to ChunkHound format with validation
+        rerank_results = []
+        for i, result in enumerate(results):
+            if not isinstance(result, dict):
+                logger.warning(f"Skipping invalid result {i}: not a dict")
+                continue
+
+            if "index" not in result or score_field not in result:
+                logger.warning(
+                    f"Skipping result {i}: missing required fields (index, {score_field})"
+                )
+                continue
+
+            try:
+                index = int(result["index"])
+                score = float(result[score_field])
+
+                # Validate index is within bounds
+                if index < 0:
+                    logger.warning(
+                        f"Skipping result {i}: negative index {index}"
+                    )
+                    continue
+
+                if index >= num_documents:
+                    logger.warning(
+                        f"Skipping result {i}: index {index} out of bounds (num_documents={num_documents})"
+                    )
+                    continue
+
+                rerank_results.append(RerankResult(index=index, score=score))
+            except (ValueError, TypeError) as e:
+                logger.warning(f"Skipping result {i}: invalid data types - {e}")
+                continue
+
+        return rerank_results
