@@ -28,6 +28,7 @@ class TestQwenModelDetection:
         """Test that Qwen reranker models are detected."""
         provider = OpenAIEmbeddingProvider(
             api_key="test-key",
+            base_url="http://localhost:11434/v1",
             model="text-embedding-3-small",
             rerank_model="qwen3-reranker-8b",
         )
@@ -88,6 +89,7 @@ class TestQwenModelDetection:
         """Test get_max_rerank_batch_size() returns Qwen-specific limits."""
         provider = OpenAIEmbeddingProvider(
             api_key="test-key",
+            base_url="http://localhost:11434/v1",
             model="text-embedding-3-small",
             rerank_model="qwen3-reranker-4b",
         )
@@ -193,6 +195,7 @@ class TestQwenBatchSplitting:
         """Test that small document sets don't trigger batch splitting."""
         provider = OpenAIEmbeddingProvider(
             api_key="test-key",
+            base_url="http://localhost:11434/v1",
             model="text-embedding-3-small",
             rerank_model="qwen3-reranker-8b",
         )
@@ -229,6 +232,7 @@ class TestQwenBatchSplitting:
         """Test that large document sets trigger batch splitting."""
         provider = OpenAIEmbeddingProvider(
             api_key="test-key",
+            base_url="http://localhost:11434/v1",
             model="text-embedding-3-small",
             rerank_model="qwen3-reranker-8b",  # max_batch = 64
         )
@@ -263,6 +267,7 @@ class TestQwenBatchSplitting:
         """Test that indices are correctly adjusted across batches."""
         provider = OpenAIEmbeddingProvider(
             api_key="test-key",
+            base_url="http://localhost:11434/v1",
             model="text-embedding-3-small",
             rerank_model="qwen3-reranker-8b",
         )
@@ -291,6 +296,7 @@ class TestQwenBatchSplitting:
         """Test that empty document list returns empty results."""
         provider = OpenAIEmbeddingProvider(
             api_key="test-key",
+            base_url="http://localhost:11434/v1",
             model="text-embedding-3-small",
             rerank_model="qwen3-reranker-8b",
         )
