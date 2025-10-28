@@ -1100,7 +1100,16 @@ class OpenAIEmbeddingProvider:
         # Single batch case - use original logic for efficiency
         if len(documents) <= batch_size_limit:
             logger.debug(f"Reranking {len(documents)} documents in single batch")
-            return await self._rerank_single_batch(query, documents, top_k)
+            results = await self._rerank_single_batch(query, documents, top_k)
+
+            # Apply client-side top_k for formats without server-side support (TEI)
+            # Cohere includes top_n in request, but we apply this uniformly for consistency
+            if top_k is not None and len(results) > top_k:
+                # Results from _rerank_single_batch are already sorted descending by score
+                results = results[:top_k]
+                logger.debug(f"Applied client-side top_k filter: {len(results)} results")
+
+            return results
 
         # Multiple batches required - split and aggregate
         logger.info(
