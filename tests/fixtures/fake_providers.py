@@ -106,6 +106,47 @@ class FakeLLMProvider(LLMProvider):
         ]
         return await asyncio.gather(*tasks)
 
+    async def complete_structured(
+        self,
+        prompt: str,
+        json_schema: dict[str, Any],
+        system: str | None = None,
+        max_completion_tokens: int = 4096,
+    ) -> dict[str, Any]:
+        """Generate structured JSON response based on prompt patterns."""
+        import json
+
+        await asyncio.sleep(0.001)  # Simulate minimal latency
+
+        self._requests_made += 1
+
+        # Match prompt to response pattern
+        prompt_lower = prompt.lower()
+        response_content = '{"result": "default"}'
+
+        for pattern, response in self._responses.items():
+            if pattern in prompt_lower:
+                response_content = response
+                break
+
+        # Estimate tokens
+        prompt_tokens = self.estimate_tokens(prompt)
+        if system:
+            prompt_tokens += self.estimate_tokens(system)
+        completion_tokens = self.estimate_tokens(response_content)
+        total_tokens = prompt_tokens + completion_tokens
+
+        self._prompt_tokens += prompt_tokens
+        self._completion_tokens += completion_tokens
+        self._tokens_used += total_tokens
+
+        # Try to parse as JSON
+        try:
+            return json.loads(response_content)
+        except json.JSONDecodeError:
+            # Fallback to wrapped string
+            return {"content": response_content}
+
     def estimate_tokens(self, text: str) -> int:
         """Estimate token count (4 chars per token)."""
         return len(text) // 4
