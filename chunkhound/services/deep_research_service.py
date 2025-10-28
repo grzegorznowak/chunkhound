@@ -14,6 +14,15 @@ from chunkhound.embeddings import EmbeddingManager
 from chunkhound.llm_manager import LLMManager
 from chunkhound.services import prompts
 from chunkhound.services.clustering_service import ClusterGroup, ClusteringService
+from chunkhound.services.research.budget_calculator import BudgetCalculator
+from chunkhound.services.research.citation_manager import CitationManager
+from chunkhound.services.research.context_manager import ContextManager
+from chunkhound.services.research.file_reader import FileReader
+from chunkhound.services.research.quality_validator import QualityValidator
+from chunkhound.services.research.query_expander import QueryExpander
+from chunkhound.services.research.question_generator import QuestionGenerator
+from chunkhound.services.research.synthesis_engine import SynthesisEngine
+from chunkhound.services.research.unified_search import UnifiedSearch
 
 if TYPE_CHECKING:
     from chunkhound.api.cli.utils.tree_progress import TreeProgressDisplay
@@ -211,6 +220,10 @@ class DeepResearchService:
         self._progress_lock_init = (
             threading.Lock()
         )  # Thread-safe guard for lock creation
+        self._synthesis_engine = SynthesisEngine(llm_manager, database_services, self)
+        self._question_generator = QuestionGenerator(llm_manager)
+        self._citation_manager = CitationManager()
+        self._quality_validator = QualityValidator(llm_manager)
 
     async def _ensure_progress_lock(self) -> None:
         """Ensure progress lock exists (must be called in async event loop context).
@@ -1724,141 +1737,24 @@ class DeepResearchService:
         Returns:
             List of follow-up questions
         """
-        # Validate that file contents were provided (required by algorithm)
-        if not file_contents:
-            logger.error(
-                "Cannot generate follow-up questions: no file contents provided. "
-                f"Query: {query}, Chunks: {len(chunks)}"
-            )
-            return []  # Return empty list instead of invalid questions
-
-        llm = self._llm_manager.get_utility_provider()
-
-        # Define JSON schema for structured output
-        schema = {
-            "type": "object",
-            "properties": {
-                "questions": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": f"Array of 0-{MAX_FOLLOWUP_QUESTIONS} follow-up questions",
-                }
-            },
-            "required": ["questions"],
-            "additionalProperties": False,
-        }
-
-        # Simplified system prompt per GPT-5-Nano best practices
-        system = prompts.FOLLOWUP_GENERATION_SYSTEM
-
-        # Build code context from file contents
-        # Note: files already limited by _read_files_with_budget
-        # This applies the total LLM input budget (query + ancestors + files)
-        code_context = []
-        total_tokens = 0
-        max_tokens_for_context = (
-            max_input_tokens if max_input_tokens is not None else MAX_LLM_INPUT_TOKENS
-        )
-
-        for path, content in file_contents.items():
-            content_tokens = llm.estimate_tokens(content)
-            if total_tokens + content_tokens <= max_tokens_for_context:
-                code_context.append(f"File: {path}\n{'=' * 60}\n{content}\n{'=' * 60}")
-                total_tokens += content_tokens
-            else:
-                # Truncate to fit within total budget
-                remaining_tokens = max_tokens_for_context - total_tokens
-                if remaining_tokens > 500:  # Only include if meaningful
-                    chars_to_include = remaining_tokens * 4  # ~4 chars per token
-                    code_context.append(
-                        f"File: {path}\n{'=' * 60}\n{content[:chars_to_include]}...\n{'=' * 60}"
-                    )
-                break
-
-        logger.debug(
-            f"LLM input: {total_tokens} tokens from {len(code_context)} files (budget: {max_tokens_for_context})"
-        )
-
-        code_section = (
-            "\n\n".join(code_context) if code_context else "No code files loaded"
-        )
-
-        # Also include chunk snippets for context
-        chunks_preview = "\n".join(
-            [
-                f"- {chunk.get('file_path', 'unknown')}:{chunk.get('start_line', '?')}-{chunk.get('end_line', '?')} ({chunk.get('symbol', 'no symbol')})"
-                for chunk in chunks[:10]
-            ]
-        )
-
         # Build exploration gist to prevent redundant exploration
         exploration_gist = self._build_exploration_gist(global_explored_data)
 
-        # Build common prompt sections
-        gist_section = (
-            f"""Already explored:
-{exploration_gist}
+        # Sync node counter to question generator
+        self._question_generator.set_node_counter(self._node_counter)
 
-"""
-            if exploration_gist
-            else ""
-        )
-
-        target_instruction = (
-            "NEW code elements (not in explored files above)"
-            if exploration_gist
-            else "specific code elements found"
-        )
-
-        # Construct prompt with conditional gist section
-        prompt = prompts.FOLLOWUP_GENERATION_USER.format(
-            gist_section=gist_section,
-            root_query=context.root_query,
+        # Delegate to question generator
+        return await self._question_generator.generate_follow_up_questions(
             query=query,
-            ancestors=" -> ".join(context.ancestors),
-            code_section=code_section,
-            chunks_preview=chunks_preview,
-            max_questions=MAX_FOLLOWUP_QUESTIONS,
-            target_instruction=target_instruction,
+            context=context,
+            file_contents=file_contents,
+            chunks=chunks,
+            global_explored_data=global_explored_data,
+            exploration_gist=exploration_gist,
+            max_input_tokens=max_input_tokens,
+            depth=depth,
+            max_depth=max_depth,
         )
-
-        # Calculate adaptive output budget (scales 3k → 8k with depth)
-        depth_ratio = depth / max(max_depth, 1)
-        max_output_tokens = int(
-            FOLLOWUP_OUTPUT_TOKENS_MIN
-            + (FOLLOWUP_OUTPUT_TOKENS_MAX - FOLLOWUP_OUTPUT_TOKENS_MIN) * depth_ratio
-        )
-        logger.debug(
-            f"Follow-up generation budget: {max_output_tokens:,} tokens "
-            f"(depth {depth}/{max_depth}, ratio {depth_ratio:.2f})"
-        )
-
-        try:
-            result = await llm.complete_structured(
-                prompt=prompt,
-                json_schema=schema,
-                system=system,
-                max_completion_tokens=max_output_tokens,
-            )
-
-            questions = result.get("questions", [])
-
-            # Filter empty questions
-            valid_questions = [q.strip() for q in questions if q and q.strip()]
-
-            # Filter questions by relevance to root query
-            if valid_questions:
-                valid_questions = await self._filter_relevant_followups(
-                    valid_questions, context.root_query, query, context
-                )
-
-            return valid_questions[:MAX_FOLLOWUP_QUESTIONS]
-
-        except Exception as e:
-            logger.warning(
-                f"Follow-up question generation failed: {e}, returning empty list"
-            )
-            return []
 
     async def _synthesize_questions(
         self, nodes: list[BFSNode], context: ResearchContext, target_count: int
@@ -1877,126 +1773,20 @@ class DeepResearchService:
             Fresh BFSNode objects with synthesized queries and empty metadata.
             These nodes will find their own chunks during processing.
         """
-        if len(nodes) <= target_count:
-            return nodes
+        # Sync node counter to question generator
+        self._question_generator.set_node_counter(self._node_counter)
 
-        # Quality pre-filtering: Remove low-quality questions before synthesis
-        filtered_nodes = [
-            node
-            for node in nodes
-            if len(node.query.strip()) > 10  # Minimum length
-            and not node.query.lower()
-            .strip()
-            .startswith(("what is ", "is there ", "does "))  # Avoid simple yes/no
-        ]
-
-        # If filtering reduced below target, skip synthesis
-        if len(filtered_nodes) <= target_count:
-            logger.debug(
-                f"After quality filtering, {len(filtered_nodes)} questions remain (<= target {target_count}), skipping synthesis"
-            )
-            return filtered_nodes
-
-        # Use filtered nodes for synthesis
-        synthesis_nodes = filtered_nodes
-        questions_str = "\n".join(
-            [f"{i + 1}. {node.query}" for i, node in enumerate(synthesis_nodes)]
-        )
-
-        llm = self._llm_manager.get_utility_provider()
-
-        # Create synthetic merge parent
-        merge_parent = BFSNode(
-            query=f"[Merge of {len(synthesis_nodes)} research directions]",
-            depth=nodes[0].depth - 1,
-            node_id=self._get_next_node_id(),
-            children=synthesis_nodes,  # Reference all input nodes
-        )
-
-        # Define JSON schema with explanation parameter (forces reasoning)
-        schema = {
-            "type": "object",
-            "properties": {
-                "reasoning": {
-                    "type": "string",
-                    "description": "Brief explanation of synthesis strategy and why these questions explore different unexplored aspects",
-                },
-                "questions": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": f"Array of 1 to {target_count} synthesized research questions, each exploring a distinct aspect",
-                },
-            },
-            "required": ["reasoning", "questions"],
-            "additionalProperties": False,
-        }
-
-        # Direct, unambiguous prompt optimized for GPT-5-Nano instruction adherence
-        system = prompts.QUESTION_SYNTHESIS_SYSTEM
-
-        prompt = prompts.QUESTION_SYNTHESIS_USER.format(
-            root_query=context.root_query,
-            questions_str=questions_str,
+        # Delegate to question generator
+        result = await self._question_generator.synthesize_questions(
+            nodes=nodes,
+            context=context,
             target_count=target_count,
         )
 
-        logger.debug(
-            f"Question synthesis budget: {QUESTION_SYNTHESIS_TOKENS:,} tokens (model: {llm.model})"
-        )
+        # Sync node counter back from question generator
+        self._node_counter = self._question_generator._node_counter
 
-        try:
-            result = await llm.complete_structured(
-                prompt=prompt,
-                json_schema=schema,
-                system=system,
-                max_completion_tokens=QUESTION_SYNTHESIS_TOKENS,
-            )
-
-            reasoning = result.get("reasoning", "")
-            synthesized_queries = result.get("questions", [])
-
-            logger.debug(f"Synthesis reasoning: {reasoning}")
-
-            # Validate that we got at least some questions
-            if not synthesized_queries or len(synthesized_queries) == 0:
-                logger.warning(
-                    f"LLM returned empty questions array despite explicit requirement. "
-                    f"Reasoning provided: '{reasoning}'. Falling back to truncated node list."
-                )
-                return synthesis_nodes[:target_count]
-
-            # Create fresh BFSNode objects with empty metadata
-            synthesized_nodes = []
-            for query in synthesized_queries[:target_count]:
-                if not query or not query.strip():
-                    continue
-                node = BFSNode(
-                    query=query.strip(),
-                    parent=merge_parent,  # Point to synthetic parent
-                    depth=nodes[0].depth,  # Same depth as input nodes
-                    node_id=self._get_next_node_id(),
-                    chunks=[],  # Empty - will populate during processing
-                    file_contents={},  # Empty - will populate during processing
-                )
-                synthesized_nodes.append(node)
-
-            if not synthesized_nodes:
-                logger.warning(
-                    "All synthesized questions were empty, falling back to first N nodes"
-                )
-                return nodes[:target_count]
-
-            logger.info(
-                f"Synthesized {len(nodes)} questions into {len(synthesized_nodes)} new research directions"
-            )
-
-            return synthesized_nodes
-
-        except Exception as e:
-            logger.warning(
-                f"Question synthesis failed: {e}, falling back to first N nodes"
-            )
-            return nodes[:target_count]
+        return result
 
     def _aggregate_all_findings(self, root: BFSNode) -> dict[str, Any]:
         """Aggregate all chunks and files from entire BFS tree.
@@ -2134,185 +1924,9 @@ class DeepResearchService:
         Returns:
             Tuple of (prioritized_chunks, budgeted_files, budget_info)
         """
-        llm = self._llm_manager.get_utility_provider()
-
-        # Use output token budget from dynamic calculation
-        output_tokens = synthesis_budgets["output_tokens"]
-
-        # Get available tokens for code content from synthesis budgets
-        available_tokens = synthesis_budgets["input_tokens"]
-
-        logger.info(
-            f"Managing token budget: {available_tokens:,} tokens available for code content"
+        return await self._synthesis_engine._manage_token_budget_for_synthesis(
+            chunks, files, root_query, synthesis_budgets
         )
-
-        # Sort chunks by score from multi-hop semantic search (highest first)
-        sorted_chunks = sorted(chunks, key=lambda c: c.get("score", 0.0), reverse=True)
-
-        # Build file-to-chunks mapping
-        file_to_chunks: dict[str, list[dict[str, Any]]] = {}
-        for chunk in sorted_chunks:
-            file_path = chunk.get("file_path", "")
-            if file_path:
-                if file_path not in file_to_chunks:
-                    file_to_chunks[file_path] = []
-                file_to_chunks[file_path].append(chunk)
-
-        # Create file representative documents for reranking
-        # This prevents file diversity collapse where files explored at multiple
-        # BFS depths accumulate exponentially higher scores
-        file_paths = []
-        file_documents = []
-
-        for file_path, file_chunks in file_to_chunks.items():
-            # Sort chunks by score and take top N chunks (configured by constant)
-            sorted_file_chunks = sorted(
-                file_chunks, key=lambda c: c.get("score", 0.0), reverse=True
-            )
-            top_chunks = sorted_file_chunks[:MAX_CHUNKS_PER_FILE_REPR]
-
-            # Build representative document
-            repr_parts = []
-            for chunk in top_chunks:
-                start_line = chunk.get("start_line", 1)
-                end_line = chunk.get("end_line", 1)
-                content = chunk.get("content", "")
-                repr_parts.append(f"Lines {start_line}-{end_line}:\n{content}")
-
-            document = f"{file_path}\n\n" + "\n\n".join(repr_parts)
-
-            # Truncate to token limit
-            if llm.estimate_tokens(document) > MAX_TOKENS_PER_FILE_REPR:
-                chars_to_include = MAX_TOKENS_PER_FILE_REPR * 4
-                document = document[:chars_to_include]
-
-            file_paths.append(file_path)
-            file_documents.append(document)
-
-        # Rerank files by relevance to root query
-        # This ensures file priority is based on relevance to original query,
-        # not accumulated scores from multi-level BFS exploration
-        await self._emit_event(
-            "synthesis_rerank", f"Reranking {len(file_documents)} files by relevance"
-        )
-        embedding_provider = self._embedding_manager.get_provider()
-
-        # Check provider batch limits (providers handle batch splitting automatically)
-        max_batch = embedding_provider.get_max_rerank_batch_size()
-        if len(file_documents) > max_batch:
-            logger.info(
-                f"Reranking {len(file_documents)} files will be automatically split into "
-                f"batches of {max_batch} (provider: {embedding_provider.name})"
-            )
-
-        # Initialize file priorities dict (populated by either reranking or fallback)
-        file_priorities: dict[str, float] = {}
-
-        # Try reranking with fallback to chunk score accumulation
-        try:
-            rerank_results = await embedding_provider.rerank(
-                query=root_query, documents=file_documents, top_k=None
-            )
-        except Exception as e:
-            logger.warning(
-                f"File reranking failed ({type(e).__name__}: {e}), "
-                f"falling back to accumulated chunk scores"
-            )
-            logger.debug(f"Reranking failure traceback: {e}", exc_info=True)
-
-            # Fallback: Use accumulated chunk scores (original behavior before reranking)
-            for file_path, file_chunks in file_to_chunks.items():
-                file_priorities[file_path] = sum(
-                    c.get("score", 0.0) for c in file_chunks
-                )
-
-            logger.info(f"Using chunk score fallback for {len(file_priorities)} files")
-        else:
-            # Build priority map from rerank scores
-            # Process results outside try block - let IndexError fail loudly if provider returns bad data
-            for result in rerank_results:
-                file_path = file_paths[result.index]
-                file_priorities[file_path] = result.score
-
-            logger.info(
-                f"Reranked {len(file_priorities)} files for synthesis budget allocation"
-            )
-
-        # Sort files by priority score (highest first)
-        # Works for both reranking and fallback paths
-        sorted_files = sorted(file_priorities.items(), key=lambda x: x[1], reverse=True)
-
-        # Build budgeted file contents
-        budgeted_files: dict[str, str] = {}
-        total_tokens = 0
-        files_included_fully = 0
-        files_included_partial = 0
-        files_excluded = 0
-
-        for file_path, priority in sorted_files:
-            if file_path not in files:
-                continue
-
-            content = files[file_path]
-            content_tokens = llm.estimate_tokens(content)
-
-            if total_tokens + content_tokens <= available_tokens:
-                # Include full file
-                budgeted_files[file_path] = content
-                total_tokens += content_tokens
-                files_included_fully += 1
-            else:
-                # Check if we can include a snippet
-                remaining_tokens = available_tokens - total_tokens
-
-                if remaining_tokens > 1000:  # Only include if meaningful
-                    # Include top chunks from this file as snippets
-                    file_chunks = file_to_chunks[file_path]
-                    snippet_parts = []
-
-                    for chunk in file_chunks[:5]:  # Top 5 chunks max
-                        start_line = chunk.get("start_line", 1)
-                        end_line = chunk.get("end_line", 1)
-                        chunk_content = chunk.get("content", "")
-
-                        snippet_parts.append(
-                            f"# Lines {start_line}-{end_line}\n{chunk_content}"
-                        )
-
-                    snippet = "\n\n".join(snippet_parts)
-                    snippet_tokens = llm.estimate_tokens(snippet)
-
-                    if snippet_tokens <= remaining_tokens:
-                        budgeted_files[file_path] = snippet
-                        total_tokens += snippet_tokens
-                        files_included_partial += 1
-                    else:
-                        # Truncate snippet to fit
-                        chars_to_include = remaining_tokens * 4  # ~4 chars per token
-                        budgeted_files[file_path] = snippet[:chars_to_include]
-                        total_tokens = available_tokens
-                        files_included_partial += 1
-                        break  # Budget exhausted
-                else:
-                    files_excluded += 1
-                    break  # Budget exhausted
-
-        budget_info = {
-            "available_tokens": available_tokens,
-            "used_tokens": total_tokens,
-            "utilization": f"{(total_tokens / available_tokens) * 100:.1f}%",
-            "files_included_fully": files_included_fully,
-            "files_included_partial": files_included_partial,
-            "files_excluded": files_excluded,
-            "total_files": len(sorted_files),
-        }
-
-        logger.info(
-            f"Token budget managed: {total_tokens:,}/{available_tokens:,} tokens used ({budget_info['utilization']}), "
-            f"{files_included_fully} full files, {files_included_partial} partial, {files_excluded} excluded"
-        )
-
-        return sorted_chunks, budgeted_files, budget_info
 
     async def _single_pass_synthesis(
         self,
@@ -2343,152 +1957,9 @@ class DeepResearchService:
         Returns:
             Synthesized answer from single LLM call with appended sources footer
         """
-        # Use output token budget from dynamic calculation
-        max_output_tokens = synthesis_budgets["output_tokens"]
-
-        # Filter chunks to only include those from budgeted files
-        # This ensures consistency between reference map, citations, and footer
-        original_chunk_count = len(chunks)
-        budgeted_chunks = self._filter_chunks_to_files(chunks, files)
-
-        logger.info(
-            f"Starting single-pass synthesis with {len(files)} files, "
-            f"{len(budgeted_chunks)} chunks (filtered from {original_chunk_count} total, "
-            f"output_limit={max_output_tokens:,})"
+        return await self._synthesis_engine._single_pass_synthesis(
+            root_query, chunks, files, context, synthesis_budgets
         )
-
-        llm = self._llm_manager.get_synthesis_provider()
-
-        # SAFETY NET: Final validation before synthesis
-        # This should never happen due to earlier validations, but catch it just in case
-        if not files:
-            logger.error(
-                f"Synthesis called with empty files dict despite {original_chunk_count} chunks. "
-                "This indicates a bug in aggregation or budget management."
-            )
-            raise RuntimeError(
-                f"Cannot synthesize answer: no code context available. "
-                f"Found {original_chunk_count} chunks but received 0 files for synthesis. "
-                f"This is a bug - earlier validation should have caught this. "
-                f"Check aggregation and budget management logs."
-            )
-
-        # Build code context sections
-        code_sections = []
-
-        # Group chunks by file for better presentation
-        chunks_by_file: dict[str, list[dict[str, Any]]] = {}
-        for chunk in budgeted_chunks:
-            file_path = chunk.get("file_path", "unknown")
-            if file_path not in chunks_by_file:
-                chunks_by_file[file_path] = []
-            chunks_by_file[file_path].append(chunk)
-
-        # Build sections from files (already budgeted)
-        for file_path, content in files.items():
-            # If we have chunks for this file, build content with individual line markers
-            if file_path in chunks_by_file:
-                file_chunks = chunks_by_file[file_path]
-                # Sort chunks by start_line for logical ordering
-                sorted_chunks = sorted(
-                    file_chunks, key=lambda c: c.get("start_line", 0)
-                )
-
-                # Build content with line markers for each chunk
-                chunk_sections = []
-                for chunk in sorted_chunks:
-                    start_line = chunk.get("start_line", "?")
-                    end_line = chunk.get("end_line", "?")
-                    chunk_code = chunk.get("content", "")
-
-                    # Add line marker before chunk code
-                    chunk_sections.append(
-                        f"# Lines {start_line}-{end_line}\n{chunk_code}"
-                    )
-
-                file_content = "\n\n".join(chunk_sections)
-            else:
-                # No chunks for this file, use full content from budget
-                file_content = content
-
-            code_sections.append(
-                f"### {file_path}\n{'=' * 80}\n{file_content}\n{'=' * 80}"
-            )
-
-        code_context = "\n\n".join(code_sections)
-
-        # Build file reference map for numbered citations
-        file_reference_map = self._build_file_reference_map(budgeted_chunks, files)
-        reference_table = self._format_reference_table(file_reference_map)
-
-        # Build output guidance with fixed 25k token budget
-        # Output budget is always 25k (includes reasoning + actual output)
-        output_guidance = (
-            f"**Target Output:** Provide a thorough and detailed analysis of approximately "
-            f"{max_output_tokens:,} tokens (includes reasoning). Focus on all relevant "
-            f"architectural layers, patterns, and implementation details with technical accuracy."
-        )
-
-        # Build comprehensive synthesis prompt (adapted from Code Expert methodology)
-        system = prompts.SYNTHESIS_SYSTEM_BUILDER(output_guidance)
-
-        prompt = prompts.SYNTHESIS_USER.format(
-            root_query=root_query,
-            reference_table=reference_table,
-            code_context=code_context,
-        )
-
-        logger.info(
-            f"Calling LLM for single-pass synthesis "
-            f"(max_completion_tokens={max_output_tokens:,}, "
-            f"timeout={SINGLE_PASS_TIMEOUT_SECONDS}s)"
-        )
-
-        response = await llm.complete(
-            prompt,
-            system=system,
-            max_completion_tokens=max_output_tokens,
-            timeout=SINGLE_PASS_TIMEOUT_SECONDS,
-        )
-
-        answer = response.content
-
-        # Validate synthesis response
-        answer_length = len(answer.strip()) if answer else 0
-        logger.info(
-            f"LLM synthesis response: length={answer_length}, "
-            f"finish_reason={response.finish_reason}"
-        )
-
-        # Minimum threshold for valid synthesis (excluding footer)
-        MIN_SYNTHESIS_LENGTH = 100  # Chars, not tokens
-
-        if answer_length < MIN_SYNTHESIS_LENGTH:
-            logger.error(
-                f"Synthesis returned suspiciously short answer: {answer_length} chars "
-                f"(minimum: {MIN_SYNTHESIS_LENGTH}, finish_reason={response.finish_reason})"
-            )
-            raise RuntimeError(
-                f"LLM synthesis failed: generated only {answer_length} characters "
-                f"(minimum: {MIN_SYNTHESIS_LENGTH}). finish_reason={response.finish_reason}. "
-                "This indicates an LLM error, content filter, or model refusal."
-            )
-
-        # Append sources footer with file and chunk information
-        try:
-            footer = self._build_sources_footer(budgeted_chunks, files, file_reference_map)
-            if footer:
-                answer = f"{answer}\n\n{footer}"
-        except Exception as e:
-            logger.warning(
-                f"Failed to generate sources footer: {e}. Continuing without footer."
-            )
-
-        logger.info(
-            f"Single-pass synthesis complete: {llm.estimate_tokens(answer):,} tokens generated"
-        )
-
-        return answer
 
     async def _cluster_sources_for_synthesis(
         self,
@@ -2506,26 +1977,9 @@ class DeepResearchService:
         Returns:
             Tuple of (cluster_groups, metadata)
         """
-        logger.info(f"Clustering {len(files)} files for map-reduce synthesis")
-
-        # Initialize clustering service
-        embedding_provider = self._embedding_manager.get_provider()
-        llm_provider = self._llm_manager.get_synthesis_provider()
-        clustering_service = ClusteringService(
-            embedding_provider=embedding_provider,  # type: ignore[arg-type]
-            llm_provider=llm_provider,
-            max_tokens_per_cluster=MAX_TOKENS_PER_CLUSTER,
+        return await self._synthesis_engine._cluster_sources_for_synthesis(
+            chunks, files, synthesis_budgets
         )
-
-        # Cluster the files
-        cluster_groups, metadata = await clustering_service.cluster_files(files)
-
-        logger.info(
-            f"Clustered into {metadata['num_clusters']} groups, "
-            f"avg {metadata['avg_tokens_per_cluster']:,} tokens/cluster"
-        )
-
-        return cluster_groups, metadata
 
     async def _map_synthesis_on_cluster(
         self,
@@ -2548,121 +2002,9 @@ class DeepResearchService:
                 - summary: str (synthesized content for this cluster)
                 - sources: list[dict] (files and chunks used)
         """
-        # Filter chunks to only those in this cluster's files
-        # This ensures consistency between reference map, citations, and cluster content
-        original_chunk_count = len(chunks)
-        cluster_chunks = self._filter_chunks_to_files(chunks, cluster.files_content)
-
-        logger.debug(
-            f"Synthesizing cluster {cluster.cluster_id} "
-            f"({len(cluster.file_paths)} files, {len(cluster_chunks)} chunks filtered from {original_chunk_count}, "
-            f"{cluster.total_tokens:,} tokens)"
+        return await self._synthesis_engine._map_synthesis_on_cluster(
+            cluster, root_query, chunks, synthesis_budgets
         )
-
-        llm = self._llm_manager.get_synthesis_provider()
-
-        # Build code context for this cluster (same logic as single-pass)
-        code_sections = []
-        chunks_by_file: dict[str, list[dict[str, Any]]] = {}
-        for chunk in cluster_chunks:
-            file_path = chunk.get("file_path", "unknown")
-            if file_path not in chunks_by_file:
-                chunks_by_file[file_path] = []
-            chunks_by_file[file_path].append(chunk)
-
-        for file_path, content in cluster.files_content.items():
-            if file_path in chunks_by_file:
-                file_chunks = chunks_by_file[file_path]
-                sorted_chunks = sorted(
-                    file_chunks, key=lambda c: c.get("start_line", 0)
-                )
-                chunk_sections = []
-                for chunk in sorted_chunks:
-                    start_line = chunk.get("start_line", "?")
-                    end_line = chunk.get("end_line", "?")
-                    chunk_code = chunk.get("content", "")
-                    chunk_sections.append(
-                        f"# Lines {start_line}-{end_line}\n{chunk_code}"
-                    )
-                file_content = "\n\n".join(chunk_sections)
-            else:
-                file_content = content
-
-            code_sections.append(
-                f"### {file_path}\n{'=' * 80}\n{file_content}\n{'=' * 80}"
-            )
-
-        code_context = "\n\n".join(code_sections)
-
-        # Build file reference map for numbered citations (cluster-specific)
-        cluster_files = cluster.files_content
-        file_reference_map = self._build_file_reference_map(cluster_chunks, cluster_files)
-        reference_table = self._format_reference_table(file_reference_map)
-
-        # Build cluster-specific synthesis prompt
-        # Use smaller output budget per cluster (will be combined in reduce step)
-        cluster_output_tokens = min(
-            CLUSTER_OUTPUT_TOKEN_BUDGET, synthesis_budgets["output_tokens"] // 2
-        )
-
-        system = f"""You are analyzing a subset of code files as part of a larger codebase analysis.
-
-Focus on:
-1. Key architectural patterns and components in these files
-2. Important implementation details and relationships
-3. How these files contribute to answering the query
-
-{prompts.CITATION_REQUIREMENTS}
-
-Be thorough but concise - your analysis will be combined with other clusters.
-Target output: ~{cluster_output_tokens:,} tokens (includes reasoning)."""
-
-        prompt = f"""Query: {root_query}
-
-{reference_table}
-
-Analyze the following code files and provide insights relevant to the query above:
-
-{code_context}
-
-Provide a comprehensive analysis focusing on the query."""
-
-        logger.debug(
-            f"Calling LLM for cluster {cluster.cluster_id} synthesis "
-            f"(max_completion_tokens={cluster_output_tokens:,}, "
-            f"timeout={SINGLE_PASS_TIMEOUT_SECONDS}s)"
-        )
-
-        response = await llm.complete(
-            prompt,
-            system=system,
-            max_completion_tokens=cluster_output_tokens,
-            timeout=SINGLE_PASS_TIMEOUT_SECONDS,
-        )
-
-        # Build sources list for this cluster
-        sources = []
-        for chunk in cluster_chunks:
-            sources.append(
-                {
-                    "file_path": chunk.get("file_path"),
-                    "start_line": chunk.get("start_line"),
-                    "end_line": chunk.get("end_line"),
-                }
-            )
-
-        logger.debug(
-            f"Cluster {cluster.cluster_id} synthesis complete: "
-            f"{llm.estimate_tokens(response.content):,} tokens generated"
-        )
-
-        return {
-            "cluster_id": cluster.cluster_id,
-            "summary": response.content,
-            "sources": sources,
-            "file_paths": cluster.file_paths,
-            "file_reference_map": file_reference_map,
-        }
 
     async def _reduce_synthesis(
         self,
@@ -2684,129 +2026,9 @@ Provide a comprehensive analysis focusing on the query."""
         Returns:
             Final synthesized answer with sources footer
         """
-        # Filter chunks to only include those from synthesized files
-        # This ensures consistency between reference map, citations, and footer
-        original_chunk_count = len(all_chunks)
-        budgeted_chunks = self._filter_chunks_to_files(all_chunks, all_files)
-
-        logger.info(
-            f"Reducing {len(cluster_results)} cluster summaries into final answer "
-            f"({len(budgeted_chunks)} chunks filtered from {original_chunk_count})"
+        return await self._synthesis_engine._reduce_synthesis(
+            root_query, cluster_results, all_chunks, all_files, synthesis_budgets
         )
-
-        llm = self._llm_manager.get_synthesis_provider()
-        max_output_tokens = synthesis_budgets["output_tokens"]
-
-        # Build global file reference map for all clusters
-        file_reference_map = self._build_file_reference_map(budgeted_chunks, all_files)
-        reference_table = self._format_reference_table(file_reference_map)
-
-        # Remap cluster-local citations to global reference numbers
-        logger.info("Remapping cluster-local citations to global references")
-        for result in cluster_results:
-            cluster_file_map = result["file_reference_map"]
-            original_summary = result["summary"]
-            remapped_summary = self._remap_cluster_citations(
-                original_summary, cluster_file_map, file_reference_map
-            )
-            result["summary"] = remapped_summary
-
-        # Combine all cluster summaries (now with global references)
-        cluster_summaries = []
-        for i, result in enumerate(cluster_results, 1):
-            summary = result["summary"]
-            file_paths = result["file_paths"]
-            files = ", ".join(file_paths[:5])  # Show first 5 files
-            if len(file_paths) > 5:
-                remaining = len(file_paths) - 5
-                files += f", ... (+{remaining} more)"
-
-            cluster_summaries.append(
-                f"## Cluster {i} Analysis\n**Files**: {files}\n\n{summary}"
-            )
-
-        combined_summaries = "\n\n" + "=" * 80 + "\n\n".join(cluster_summaries)
-
-        # Build reduce prompt
-        system = f"""You are synthesizing multiple partial analyses into a comprehensive final answer.
-
-Your task:
-1. Integrate insights from all cluster analyses
-2. Eliminate redundancy and contradictions
-3. Organize information coherently
-4. Maintain focus on the original query
-5. PRESERVE ALL reference number citations [N] from cluster analyses
-   - Citation numbers have already been remapped to global references
-   - Do NOT generate new citations (you don't have access to code)
-   - DO preserve existing [N] citations when combining insights
-   - Maintain citation density throughout the integrated answer
-
-Target output: ~{max_output_tokens:,} tokens (includes reasoning)."""
-
-        prompt = f"""Query: {root_query}
-
-{reference_table}
-
-You have been provided with analyses of different code clusters.
-Synthesize these into a comprehensive, well-organized answer to the query.
-
-NOTE: All citation numbers [N] in the cluster analyses have been remapped to match the global Source References table above. Simply preserve these citations as you integrate the analyses.
-
-{combined_summaries}
-
-Provide a complete, integrated analysis that addresses the original query."""
-
-        logger.debug(
-            f"Calling LLM for reduce synthesis "
-            f"(max_completion_tokens={max_output_tokens:,})"
-        )
-
-        response = await llm.complete(
-            prompt,
-            system=system,
-            max_completion_tokens=max_output_tokens,
-            timeout=SINGLE_PASS_TIMEOUT_SECONDS,  # type: ignore[call-arg]
-        )
-
-        answer = response.content
-
-        # Validate minimum length
-        MIN_SYNTHESIS_LENGTH = 100
-        answer_length = len(answer.strip()) if answer else 0
-
-        if answer_length < MIN_SYNTHESIS_LENGTH:
-            logger.error(
-                f"Reduce synthesis returned suspiciously short answer: {answer_length} chars"
-            )
-            raise RuntimeError(
-                f"LLM reduce synthesis failed: generated only {answer_length} characters "
-                f"(minimum: {MIN_SYNTHESIS_LENGTH}). finish_reason={response.finish_reason}."
-            )
-
-        # Validate citation references are valid
-        invalid_citations = self._validate_citation_references(answer, file_reference_map)
-        if invalid_citations:
-            logger.warning(
-                f"Found {len(invalid_citations)} invalid citation references after reduce: "
-                f"{invalid_citations[:10]}"
-                + (f" ... and {len(invalid_citations) - 10} more" if len(invalid_citations) > 10 else "")
-            )
-
-        # Append sources footer (aggregate all sources from all clusters)
-        try:
-            footer = self._build_sources_footer(budgeted_chunks, all_files, file_reference_map)
-            if footer:
-                answer = f"{answer}\n\n{footer}"
-        except Exception as e:
-            logger.warning(
-                f"Failed to generate sources footer: {e}. Continuing without footer."
-            )
-
-        logger.info(
-            f"Reduce synthesis complete: {llm.estimate_tokens(answer):,} tokens generated"
-        )
-
-        return answer
 
     def _filter_verbosity(self, text: str) -> str:
         """Remove common LLM verbosity patterns from synthesis output.
@@ -3031,36 +2253,6 @@ Provide a complete, integrated analysis that addresses the original query."""
             return "".join(f"[{n}]" for n in sorted_numbers)
 
         return _CITATION_SEQUENCE_PATTERN.sub(sort_sequence, text)
-
-    def _filter_chunks_to_files(
-        self,
-        chunks: list[dict[str, Any]],
-        files: dict[str, str],
-    ) -> list[dict[str, Any]]:
-        """Filter chunks to only include those from specified files.
-
-        Ensures consistency between reference map, citations, and footer by
-        only including chunks from files that were actually synthesized.
-
-        Args:
-            chunks: List of all chunks from BFS traversal
-            files: Dictionary of files used in synthesis
-
-        Returns:
-            Filtered list of chunks matching files dict
-
-        Examples:
-            >>> chunks = [
-            ...     {"file_path": "src/main.py", "content": "..."},
-            ...     {"file_path": "tests/test.py", "content": "..."},
-            ...     {"file_path": "docs/readme.md", "content": "..."},
-            ... ]
-            >>> files = {"src/main.py": "...", "tests/test.py": "..."}
-            >>> filtered = service._filter_chunks_to_files(chunks, files)
-            >>> len(filtered)
-            2
-        """
-        return [c for c in chunks if c.get("file_path") in files]
 
     def _build_file_reference_map(
         self, chunks: list[dict[str, Any]], files: dict[str, str]
@@ -3415,47 +2607,13 @@ Provide a complete, integrated analysis that addresses the original query."""
         Returns:
             Filtered list of most relevant follow-up questions
         """
-        if len(questions) <= 1:
-            return questions
-
-        llm = self._llm_manager.get_utility_provider()
-
-        questions_str = "\n".join(f"{i + 1}. {q}" for i, q in enumerate(questions))
-
-        system = prompts.QUESTION_FILTERING_SYSTEM
-
-        prompt = prompts.QUESTION_FILTERING_USER.format(
+        # Delegate to question generator
+        return await self._question_generator.filter_relevant_followups(
+            questions=questions,
             root_query=root_query,
             current_query=current_query,
-            questions_str=questions_str,
-            max_questions=MAX_FOLLOWUP_QUESTIONS,
+            context=context,
         )
-
-        logger.debug(
-            f"Question filtering budget: {QUESTION_FILTERING_TOKENS:,} tokens (model: {llm.model})"
-        )
-
-        try:
-            response = await llm.complete(
-                prompt, system=system, max_completion_tokens=QUESTION_FILTERING_TOKENS
-            )
-            # Parse selected indices
-            selected = [
-                int(n.strip()) - 1
-                for n in response.content.replace(",", " ").split()
-                if n.strip().isdigit()
-            ]
-            filtered = [questions[i] for i in selected if 0 <= i < len(questions)]
-
-            if filtered:
-                logger.debug(
-                    f"Filtered {len(questions)} follow-ups to {len(filtered)} relevant ones"
-                )
-                return filtered[:MAX_FOLLOWUP_QUESTIONS]
-        except Exception as e:
-            logger.warning(f"Follow-up filtering failed: {e}, using all questions")
-
-        return questions[:MAX_FOLLOWUP_QUESTIONS]
 
     def _calculate_synthesis_budgets(
         self, repo_stats: dict[str, Any]
