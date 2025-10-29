@@ -154,8 +154,8 @@ async def test_search_strategy_selection_verification(simple_test_database):
     query = "user authentication"
     
     # Test strategy selection by mocking the internal methods
-    with patch.object(voyage_search, '_search_semantic_multi_hop', return_value=([], {})) as mock_multi_hop:
-        with patch.object(openai_search, '_search_semantic_standard', return_value=([], {})) as mock_standard:
+    with patch.object(voyage_search._multi_hop_strategy, 'search', return_value=([], {})) as mock_multi_hop:
+        with patch.object(openai_search._single_hop_strategy, 'search', return_value=([], {})) as mock_standard:
             
             # VoyageAI provider should trigger multi-hop search
             await voyage_search.search_semantic(query, page_size=5)
@@ -204,15 +204,15 @@ async def test_multi_hop_quality_over_quantity(content_aware_test_data):
     
     # Capture standard search results
     standard_results = []
-    original_standard = search_service._search_semantic_standard
-    
+    original_standard = search_service._single_hop_strategy.search
+
     async def capture_standard(*args, **kwargs):
         nonlocal standard_results
         results, pagination = await original_standard(*args, **kwargs)
         standard_results = results[:10]  # Top 10 for precision comparison
         return results, pagination
-    
-    with patch.object(search_service, '_search_semantic_standard', side_effect=capture_standard):
+
+    with patch.object(search_service._single_hop_strategy, 'search', side_effect=capture_standard):
         two_hop_results, _ = await search_service.search_semantic(query, page_size=10)
     
     # Calculate broader semantic relevance - use available terms for more lenient matching

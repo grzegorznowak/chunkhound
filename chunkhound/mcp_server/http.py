@@ -27,15 +27,17 @@ class HttpMCPServer(MCPServerBase):
     request/response model.
     """
 
-    def __init__(self, config: Config, port: int = 5173):
+    def __init__(self, config: Config, port: int = 5173, host: str = "0.0.0.0"):
         """Initialize HTTP MCP server.
 
         Args:
             config: Validated configuration object
             port: Port to listen on (default: 5173)
+            host: Host to bind to (default: "0.0.0.0")
         """
         super().__init__(config)
         self.port = port
+        self.host = host
 
         # Mark process as MCP mode so downstream code avoids interactive prompts
         os.environ["CHUNKHOUND_MCP_MODE"] = "1"
@@ -87,8 +89,13 @@ class HttpMCPServer(MCPServerBase):
 
                     # Convert TextContent list to dict for FastMCP
                     if result and isinstance(result[0], types.TextContent):
-                        parsed_result: dict[str, Any] = json.loads(result[0].text)
-                        return parsed_result
+                        try:
+                            # Try parsing as JSON first (for structured responses)
+                            parsed_result: dict[str, Any] = json.loads(result[0].text)
+                            return parsed_result
+                        except json.JSONDecodeError:
+                            # Plain text response (e.g., markdown from code_research)
+                            return {"content": result[0].text}
                     return {"error": "Invalid response format"}
 
                 # Set the handler's name and docstring from tool definition
@@ -107,10 +114,10 @@ class HttpMCPServer(MCPServerBase):
         than the stdio implementation.
         """
         try:
-            self.debug_log(f"Starting HTTP server on port {self.port}")
+            self.debug_log(f"Starting HTTP server on {self.host}:{self.port}")
 
             # Run the FastMCP server in HTTP mode
-            await self.app.run_http_async(port=self.port, host="0.0.0.0")
+            await self.app.run_http_async(port=self.port, host=self.host)
 
         except KeyboardInterrupt:
             self.debug_log("Server interrupted by user")
@@ -132,7 +139,7 @@ async def main() -> None:
     import sys
 
     from chunkhound.api.cli.utils.config_factory import create_validated_config
-    from chunkhound.mcp.common import add_common_mcp_arguments
+    from chunkhound.mcp_server.common import add_common_mcp_arguments
 
     parser = argparse.ArgumentParser(
         description="ChunkHound MCP HTTP server (FastMCP 2.0)",
@@ -157,7 +164,7 @@ async def main() -> None:
         sys.exit(1)
 
     # Create and run the HTTP server
-    server = HttpMCPServer(config, port=args.port)
+    server = HttpMCPServer(config, port=args.port, host=args.host)
     await server.run()
 
 

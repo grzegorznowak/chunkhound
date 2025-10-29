@@ -41,20 +41,39 @@ def find_project_root(start_path: Path | None = None) -> Path:
             sys.exit(1)
         return project_root
 
-    # No CLI argument - check for .chunkhound.json in current directory
-    current_dir = Path.cwd()
-    chunkhound_json = current_dir / ".chunkhound.json"
+    # No CLI argument - walk up tree looking for project markers
+    current = Path.cwd()
+    home = Path.home()
 
-    if chunkhound_json.exists():
-        return current_dir
+    # Walk up to filesystem root (but stop at home directory for safety)
+    while current != current.parent and current != home:
+        # Priority 1: Explicit .chunkhound.json marker
+        if (current / ".chunkhound.json").exists():
+            return current
 
-    # No valid project root found - terminate with clear error
+        # Priority 2: Existing database directory
+        if (current / ".chunkhound" / "db").exists():
+            return current
+
+        # Priority 3: Git repository root
+        if (current / ".git").exists():
+            return current
+
+        current = current.parent
+
+    # No markers found - provide helpful error
     print("Error: No ChunkHound project found.", file=sys.stderr)
-    print(
-        f"Expected .chunkhound.json in current directory: {current_dir}",
-        file=sys.stderr,
-    )
-    print("Or provide a project directory as a positional argument.", file=sys.stderr)
+    print(f"Searched upward from: {Path.cwd()}", file=sys.stderr)
+    print("", file=sys.stderr)
+    print("Expected to find one of:", file=sys.stderr)
+    print("  - .chunkhound.json (explicit project marker)", file=sys.stderr)
+    print("  - .chunkhound/db (indexed database)", file=sys.stderr)
+    print("  - .git (git repository root)", file=sys.stderr)
+    print("", file=sys.stderr)
+    print("Solutions:", file=sys.stderr)
+    print("  1. Create .chunkhound.json in your project root", file=sys.stderr)
+    print("  2. Run 'chunkhound index .' from project root first", file=sys.stderr)
+    print("  3. Pass explicit path: chunkhound <command> /path/to/project", file=sys.stderr)
     sys.exit(1)
 
 

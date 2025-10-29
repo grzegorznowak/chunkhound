@@ -244,6 +244,16 @@ class EmbeddingProvider(Protocol):
         """
         ...
 
+    def get_max_rerank_batch_size(self) -> int:
+        """Get maximum documents per batch for reranking operations.
+
+        Returns:
+            Maximum number of documents to rerank in a single batch.
+            Used to prevent OOM errors on large result sets.
+            Model-specific limits apply (e.g., Qwen3-8B: 64, Qwen3-0.6B: 128).
+        """
+        ...
+
 
 class LocalEmbeddingProvider(EmbeddingProvider, Protocol):
     """Extended protocol for local embedding providers."""

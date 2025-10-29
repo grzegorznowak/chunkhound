@@ -1,6 +1,8 @@
 """OpenAI embedding provider implementation for ChunkHound - concrete embedding provider using OpenAI API."""
 
 import asyncio
+import heapq
+import math
 from collections.abc import AsyncIterator
 from datetime import datetime
 from typing import Any
@@ -8,6 +10,11 @@ from typing import Any
 import httpx
 from loguru import logger
 
+from chunkhound.core.config.embedding_config import (
+    RERANK_BASE_URL_REQUIRED,
+    RERANK_MODEL_REQUIRED_COHERE,
+    validate_rerank_configuration,
+)
 from chunkhound.core.exceptions.core import ValidationError
 from chunkhound.interfaces.embedding_provider import EmbeddingConfig, RerankResult
 
@@ -23,8 +30,156 @@ except ImportError:
     logger.warning("OpenAI not available - install with: uv pip install openai")
 
 
+# Qwen3 model configuration for Ollama/OpenAI-compatible endpoints
+# Research: https://www.baseten.co/blog/day-zero-benchmarks-for-qwen-3
+# Batch sizes optimized for throughput on GPU inference (A100 baseline)
+# Rerank limits: 32-128 per batch based on model size to prevent OOM
+QWEN_MODEL_CONFIG = {
+    # Qwen3 Embedding Models (via Ollama)
+    # Batch sizes balanced for GPU memory and throughput
+    "dengcao/Qwen3-Embedding-0.6B:Q5_K_M": {
+        "max_tokens_per_batch": 200000,  # Conservative for Q5_K_M quantization
+        "max_texts_per_batch": 512,  # Smallest model: highest throughput
+        "context_length": 8192,
+        "max_rerank_batch": 128,  # Smallest reranker: largest batches
+    },
+    "qwen3-embedding-0.6b": {
+        "max_tokens_per_batch": 200000,
+        "max_texts_per_batch": 512,
+        "context_length": 8192,
+        "max_rerank_batch": 128,
+    },
+    "dengcao/Qwen3-Embedding-4B:Q5_K_M": {
+        "max_tokens_per_batch": 150000,
+        "max_texts_per_batch": 256,  # Medium model: balanced speed/memory
+        "context_length": 8192,
+        "max_rerank_batch": 96,  # Medium reranker batch size
+    },
+    "qwen3-embedding-4b": {
+        "max_tokens_per_batch": 150000,
+        "max_texts_per_batch": 256,
+        "context_length": 8192,
+        "max_rerank_batch": 96,
+    },
+    "dengcao/Qwen3-Embedding-8B:Q5_K_M": {
+        "max_tokens_per_batch": 100000,
+        "max_texts_per_batch": 128,  # Largest model: conservative for memory
+        "context_length": 8192,
+        "max_rerank_batch": 64,  # Largest reranker: smallest batches
+    },
+    "qwen3-embedding-8b": {
+        "max_tokens_per_batch": 100000,
+        "max_texts_per_batch": 128,
+        "context_length": 8192,
+        "max_rerank_batch": 64,
+    },
+    # Qwen3 Reranker Models
+    # Batch sizes based on research: 32-128 for GPU inference
+    # Conservative values to prevent OOM on large result sets
+    "fireworks/qwen3-reranker-0.6b": {
+        "max_tokens_per_batch": 100000,
+        "max_texts_per_batch": 256,
+        "context_length": 131072,  # jina-reranker-v3 context window
+        "max_rerank_batch": 128,  # Higher for smallest model
+    },
+    "qwen3-reranker-0.6b": {
+        "max_tokens_per_batch": 100000,
+        "max_texts_per_batch": 256,
+        "context_length": 131072,
+        "max_rerank_batch": 128,
+    },
+    "fireworks/qwen3-reranker-4b": {
+        "max_tokens_per_batch": 80000,
+        "max_texts_per_batch": 128,
+        "context_length": 32000,
+        "max_rerank_batch": 96,
+    },
+    "qwen3-reranker-4b": {
+        "max_tokens_per_batch": 80000,
+        "max_texts_per_batch": 128,
+        "context_length": 32000,
+        "max_rerank_batch": 96,
+    },
+    "fireworks/qwen3-reranker-8b": {
+        "max_tokens_per_batch": 60000,
+        "max_texts_per_batch": 64,
+        "context_length": 32000,
+        "max_rerank_batch": 64,
+    },
+    "qwen3-reranker-8b": {
+        "max_tokens_per_batch": 60000,
+        "max_texts_per_batch": 64,
+        "context_length": 32000,
+        "max_rerank_batch": 64,
+    },
+}
+
+
+def _validate_qwen_model_config() -> None:
+    """Validate QWEN_MODEL_CONFIG structure at module load time.
+
+    Raises:
+        ValueError: If configuration is invalid
+    """
+    required_fields = {
+        "max_tokens_per_batch",
+        "max_texts_per_batch",
+        "context_length",
+        "max_rerank_batch",
+    }
+
+    for model_name, config in QWEN_MODEL_CONFIG.items():
+        # Check all required fields present
+        missing_fields = required_fields - set(config.keys())
+        if missing_fields:
+            raise ValueError(
+                f"Qwen model '{model_name}' missing required fields: {missing_fields}"
+            )
+
+        # Validate batch sizes are positive integers
+        if config["max_texts_per_batch"] <= 0:
+            raise ValueError(
+                f"Qwen model '{model_name}' has invalid max_texts_per_batch: "
+                f"{config['max_texts_per_batch']} (must be > 0)"
+            )
+
+        if config["max_rerank_batch"] <= 0:
+            raise ValueError(
+                f"Qwen model '{model_name}' has invalid max_rerank_batch: "
+                f"{config['max_rerank_batch']} (must be > 0)"
+            )
+
+        # Validate token limits are reasonable (between 1K and 10M)
+        if not (1000 <= config["max_tokens_per_batch"] <= 10_000_000):
+            raise ValueError(
+                f"Qwen model '{model_name}' has unrealistic max_tokens_per_batch: "
+                f"{config['max_tokens_per_batch']} (should be 1K-10M)"
+            )
+
+        # Validate context length is reasonable
+        if not (512 <= config["context_length"] <= 1_000_000):
+            raise ValueError(
+                f"Qwen model '{model_name}' has unrealistic context_length: "
+                f"{config['context_length']} (should be 512-1M)"
+            )
+
+
+# Validate configuration at module load
+_validate_qwen_model_config()
+
+
 class OpenAIEmbeddingProvider:
-    """OpenAI embedding provider using text-embedding-3-small by default."""
+    """OpenAI embedding provider using text-embedding-3-small by default.
+
+    Thread Safety:
+        This provider is thread-safe and stateless. Multiple concurrent calls to
+        embed() and rerank() are safe. The underlying OpenAI client (httpx-based)
+        handles concurrent requests properly.
+
+        Note: Provider instances should not share mutable state. Each instance
+        maintains its own client and configuration, making concurrent operations
+        on the same instance safe.
+    """
 
     # Recommended concurrent batches for OpenAI API
     # Conservative value (8) accounts for tier-based rate limits:
@@ -41,6 +196,7 @@ class OpenAIEmbeddingProvider:
         model: str = "text-embedding-3-small",
         rerank_model: str | None = None,
         rerank_url: str = "/rerank",
+        rerank_format: str = "auto",
         batch_size: int = 100,
         timeout: int = 30,
         retry_attempts: int = 3,
@@ -53,8 +209,9 @@ class OpenAIEmbeddingProvider:
             api_key: OpenAI API key (defaults to OPENAI_API_KEY env var)
             base_url: Base URL for OpenAI API (defaults to OPENAI_BASE_URL env var)
             model: Model name to use for embeddings
-            rerank_model: Model name to use for reranking (enables multi-hop search)
+            rerank_model: Model name to use for reranking (optional for TEI format)
             rerank_url: Rerank endpoint URL (defaults to /rerank)
+            rerank_format: Reranking API format - 'cohere', 'tei', or 'auto' (default: 'auto')
             batch_size: Maximum batch size for API requests
             timeout: Request timeout in seconds
             retry_attempts: Number of retry attempts for failed requests
@@ -72,13 +229,38 @@ class OpenAIEmbeddingProvider:
         self._model = model
         self._rerank_model = rerank_model
         self._rerank_url = rerank_url
+        self._rerank_format = rerank_format
+        self._detected_rerank_format: str | None = None  # Cache for auto-detected format
+        self._format_detection_lock = asyncio.Lock()  # Protect format detection cache
         self._batch_size = batch_size
         self._timeout = timeout
         self._retry_attempts = retry_attempts
         self._retry_delay = retry_delay
         self._max_tokens = max_tokens
 
-        # Model-specific configuration
+        # Validate rerank configuration at initialization (fail-fast)
+        # Match config validation logic: check if reranking is enabled
+        is_using_reranking = rerank_model or (rerank_format == "tei" and rerank_url)
+        if is_using_reranking or rerank_format == "cohere":
+            validate_rerank_configuration(
+                provider="openai",
+                rerank_format=rerank_format,
+                rerank_model=rerank_model,
+                rerank_url=rerank_url,
+                base_url=base_url,
+            )
+
+            # Warn about auto-detection risks in production
+            if rerank_format == "auto":
+                logger.warning(
+                    "Using rerank_format='auto' may cause first request to fail if format guess is wrong. "
+                    "For production use, explicitly set rerank_format to 'cohere' or 'tei'."
+                )
+
+        # Configure Qwen-specific batch sizes (extracted for clarity)
+        self._configure_qwen_batch_sizes(model, rerank_model, batch_size)
+
+        # Model-specific configuration for OpenAI models
         self._model_config = {
             "text-embedding-3-small": {
                 "dims": 1536,
@@ -109,6 +291,57 @@ class OpenAIEmbeddingProvider:
         # Creating AsyncOpenAI in __init__ can fail when no event loop is running
         self._client = None
         self._client_initialized = False
+
+    def _configure_qwen_batch_sizes(
+        self, model: str, rerank_model: str | None, batch_size: int
+    ) -> None:
+        """Configure Qwen-specific batch sizes if Qwen models detected.
+
+        Detects Qwen embedding and reranker models and applies model-specific
+        batch size limits to prevent OOM errors. Follows VoyageAI pattern.
+
+        Args:
+            model: Embedding model name
+            rerank_model: Optional reranker model name
+            batch_size: User-requested batch size
+        """
+        # Detect Qwen models
+        qwen_config = None
+        model_lower = model.lower()
+        rerank_model_lower = (rerank_model or "").lower()
+
+        # Check if embedding model is a Qwen model
+        if "qwen" in model_lower or model in QWEN_MODEL_CONFIG:
+            qwen_config = QWEN_MODEL_CONFIG.get(model)
+            if qwen_config:
+                logger.info(f"Detected Qwen embedding model: {model}")
+
+        # Check if rerank model is a Qwen model
+        qwen_rerank_config = None
+        if rerank_model and (
+            "qwen" in rerank_model_lower or rerank_model in QWEN_MODEL_CONFIG
+        ):
+            qwen_rerank_config = QWEN_MODEL_CONFIG.get(rerank_model)
+            if qwen_rerank_config:
+                logger.info(f"Detected Qwen reranker model: {rerank_model}")
+
+        # Apply Qwen batch size limits if detected
+        if qwen_config:
+            # Apply min(user_batch_size, model_max_batch) pattern from VoyageAI
+            effective_batch_size = min(batch_size, qwen_config["max_texts_per_batch"])
+            if effective_batch_size < batch_size:
+                logger.info(
+                    f"Limiting batch size to {effective_batch_size} "
+                    f"(model max: {qwen_config['max_texts_per_batch']})"
+                )
+            self._batch_size = effective_batch_size
+            self._qwen_model_config = qwen_config
+        else:
+            self._batch_size = batch_size
+            self._qwen_model_config = None
+
+        # Store rerank config separately for get_max_rerank_batch_size()
+        self._qwen_rerank_config = qwen_rerank_config
 
     async def _ensure_client(self) -> None:
         """Ensure the OpenAI client is initialized (must be called from async context)."""
@@ -345,8 +578,8 @@ class OpenAIEmbeddingProvider:
                         f"[{datetime.now().isoformat()}] OPENAI-PROVIDER ERROR: texts={len(validated_texts)}, max_chars={max_chars}, error={e}\n"
                     )
                     f.flush()
-            except:
-                pass
+            except (IOError, OSError):
+                pass  # Debug logging is best-effort, OK to fail silently
 
             raise
 
@@ -676,6 +909,10 @@ class OpenAIEmbeddingProvider:
 
     def get_max_tokens_per_batch(self) -> int:
         """Get maximum tokens per batch for this provider."""
+        # Check Qwen config first (higher limits for Ollama endpoints)
+        if self._qwen_model_config:
+            return self._qwen_model_config["max_tokens_per_batch"]
+        # Fall back to OpenAI model config
         if self._model in self._model_config:
             return self._model_config[self._model]["max_tokens"]
         return 8191  # Default OpenAI limit
@@ -716,7 +953,28 @@ class OpenAIEmbeddingProvider:
 
     def get_max_documents_per_batch(self) -> int:
         """Get maximum documents per batch for OpenAI provider."""
+        # Qwen config is already applied to self._batch_size in __init__
         return self._batch_size
+
+    def get_max_rerank_batch_size(self) -> int:
+        """Get maximum documents per batch for reranking operations.
+
+        Returns model-specific batch limit for reranking to prevent OOM errors.
+        For Qwen3 rerankers: 64-128 based on model size (research-based).
+        For other models: uses embedding batch size as fallback.
+
+        Returns:
+            Maximum number of documents to rerank in a single batch
+        """
+        # Use rerank-specific config if available (Qwen models)
+        if self._qwen_rerank_config and "max_rerank_batch" in self._qwen_rerank_config:
+            return self._qwen_rerank_config["max_rerank_batch"]
+        # Fall back to embedding config if rerank model is same as embedding model
+        if self._qwen_model_config and "max_rerank_batch" in self._qwen_model_config:
+            return self._qwen_model_config["max_rerank_batch"]
+        # Conservative default: limit to batch_size to prevent unbounded requests
+        # Research shows 32-128 is optimal for GPU reranking
+        return min(self._batch_size, 128)
 
     def get_recommended_concurrency(self) -> int:
         """Get recommended number of concurrent batches for OpenAI.
@@ -726,19 +984,260 @@ class OpenAIEmbeddingProvider:
         """
         return self.RECOMMENDED_CONCURRENCY
 
+    def _resolve_rerank_format(self) -> str:
+        """Resolve the reranking format to use for the next request.
+
+        Returns cached detected format if available in auto mode, otherwise
+        returns the configured format.
+
+        Thread safety: Reading _detected_rerank_format without a lock is safe
+        due to Python's GIL ensuring atomic pointer reads. The write operation
+        in _parse_rerank_response uses async lock for proper synchronization.
+
+        Returns:
+            Format to use: 'cohere', 'tei', or 'auto'
+        """
+        if self._detected_rerank_format:
+            return self._detected_rerank_format
+        return self._rerank_format
+
+    def _build_rerank_payload(
+        self, query: str, documents: list[str], top_k: int | None, format_to_use: str
+    ) -> dict:
+        """Build rerank request payload based on format.
+
+        Args:
+            query: Search query
+            documents: List of documents to rerank
+            top_k: Maximum number of results to return
+            format_to_use: Format to use ('cohere', 'tei', or 'auto')
+
+        Returns:
+            Request payload dictionary
+        """
+        if format_to_use == "tei":
+            # TEI format: no model in request, uses "texts" field
+            logger.debug(
+                f"Using TEI format for reranking {len(documents)} documents"
+            )
+            return {"query": query, "texts": documents}
+
+        elif format_to_use == "cohere":
+            # Cohere format: requires model, uses "documents" field
+            # Validation already done in __init__, so we know model is present
+            payload = {"model": self._rerank_model, "query": query, "documents": documents}
+            if top_k is not None:
+                payload["top_n"] = top_k
+            logger.debug(
+                f"Using Cohere format for reranking {len(documents)} documents with model {self._rerank_model}"
+            )
+            return payload
+
+        else:  # auto mode
+            # Try Cohere first if model is set, otherwise TEI
+            if self._rerank_model:
+                payload = {"model": self._rerank_model, "query": query, "documents": documents}
+                if top_k is not None:
+                    payload["top_n"] = top_k
+                logger.debug(
+                    f"Auto-detecting format, trying Cohere first (model: {self._rerank_model})"
+                )
+                return payload
+            else:
+                logger.debug("Auto-detecting format, trying TEI first (no model set)")
+                return {"query": query, "texts": documents}
+
     def supports_reranking(self) -> bool:
-        """Check if reranking is supported."""
-        return self._rerank_model is not None
+        """Check if reranking is supported with current configuration.
+
+        Uses shared validation logic to determine if reranking can be performed.
+
+        Returns:
+            True if provider can perform reranking with current config
+        """
+        if not self._rerank_url:
+            return False
+
+        # Use shared validation logic - if validation passes, reranking is supported
+        try:
+            validate_rerank_configuration(
+                provider="openai",
+                rerank_format=self._rerank_format,
+                rerank_model=self._rerank_model,
+                rerank_url=self._rerank_url,
+                base_url=self._base_url,
+            )
+            return True
+        except ValueError:
+            return False
 
     async def rerank(
         self, query: str, documents: list[str], top_k: int | None = None
     ) -> list[RerankResult]:
-        """Rerank documents using configured rerank model."""
+        """Rerank documents using configured rerank model with automatic batch splitting.
+
+        Implements batch splitting to prevent OOM errors on large document sets.
+        For Qwen3 rerankers: uses model-specific batch limits (64-128).
+        Results are aggregated across batches and sorted by relevance score.
+
+        Supports both Cohere and TEI (Text Embeddings Inference) formats.
+        Format can be explicitly set or auto-detected from response.
+
+        Args:
+            query: The search query
+            documents: List of documents to rerank
+            top_k: Optional limit on number of results to return
+
+        Returns:
+            List of RerankResult objects sorted by relevance score (highest first)
+        """
+        if not documents:
+            return []
+
+        # Get model-specific batch size limit
+        batch_size_limit = self.get_max_rerank_batch_size()
+
+        # Single batch case - use original logic for efficiency
+        if len(documents) <= batch_size_limit:
+            logger.debug(f"Reranking {len(documents)} documents in single batch")
+            results = await self._rerank_single_batch(query, documents, top_k)
+
+            # Apply client-side top_k for formats without server-side support (TEI)
+            # Cohere includes top_n in request, but we apply this uniformly for consistency
+            if top_k is not None and len(results) > top_k:
+                # Results from _rerank_single_batch are already sorted descending by score
+                results = results[:top_k]
+                logger.debug(f"Applied client-side top_k filter: {len(results)} results")
+
+            return results
+
+        # Multiple batches required - split and aggregate
+        logger.info(
+            f"Splitting {len(documents)} documents into batches of {batch_size_limit} "
+            f"for reranking (model: {self._rerank_model})"
+        )
+
+        all_results = []
+        num_batches = math.ceil(len(documents) / batch_size_limit)
+        failed_batches = 0
+
+        for batch_idx in range(num_batches):
+            start_idx = batch_idx * batch_size_limit
+            end_idx = min(start_idx + batch_size_limit, len(documents))
+            batch_documents = documents[start_idx:end_idx]
+
+            logger.debug(
+                f"Reranking batch {batch_idx + 1}/{num_batches}: "
+                f"documents {start_idx}-{end_idx}"
+            )
+
+            # Retry logic for this batch (following VoyageAI pattern)
+            batch_results = None
+            for attempt in range(self._retry_attempts):
+                try:
+                    # Rerank this batch without top_k limit (we'll apply globally)
+                    batch_results = await self._rerank_single_batch(
+                        query, batch_documents, top_k=None
+                    )
+                    break  # Success - exit retry loop
+                except Exception as e:
+                    # Classify error as retryable or not
+                    error_str = str(e).lower()
+                    is_retryable = any([
+                        "timeout" in error_str,
+                        "connection" in error_str,
+                        "503" in error_str,  # Service unavailable
+                        "429" in error_str,  # Rate limit
+                    ])
+
+                    if is_retryable and attempt < self._retry_attempts - 1:
+                        # Exponential backoff
+                        delay = self._retry_delay * (2 ** attempt)
+                        logger.warning(
+                            f"Batch {batch_idx + 1} failed (attempt {attempt + 1}), "
+                            f"retrying in {delay}s: {e}"
+                        )
+                        await asyncio.sleep(delay)
+                        continue
+                    else:
+                        # Last attempt or non-retryable error
+                        logger.error(
+                            f"Batch {batch_idx + 1} failed after {attempt + 1} attempts: {e}"
+                        )
+                        # Continue to next batch instead of failing entire operation
+                        batch_results = []
+                        failed_batches += 1
+                        break
+
+            # Process results if batch succeeded
+            if batch_results:
+                # Adjust indices to be relative to original document list
+                # Use immutable pattern instead of mutation
+                for result in batch_results:
+                    # Validate index is within batch bounds (handles negative indices)
+                    if result.index < 0 or result.index >= len(batch_documents):
+                        logger.warning(
+                            f"Invalid index {result.index} from rerank API "
+                            f"(batch size: {len(batch_documents)}), skipping result"
+                        )
+                        continue
+
+                    # Create new RerankResult with adjusted index
+                    adjusted_result = RerankResult(
+                        index=result.index + start_idx,
+                        score=result.score
+                    )
+                    all_results.append(adjusted_result)
+
+        # Warn if any batches failed
+        if failed_batches > 0:
+            logger.warning(
+                f"Reranking completed with partial failures: {failed_batches} of "
+                f"{num_batches} batches failed. Results may be incomplete."
+            )
+
+        # Apply top_k selection efficiently using heapq when beneficial
+        if top_k is not None and top_k < len(all_results) * 0.5:
+            # Use heap-based selection for better performance when k << n
+            # heapq.nlargest is O(n log k) vs sort O(n log n)
+            all_results = heapq.nlargest(top_k, all_results, key=lambda r: r.score)
+        else:
+            # Sort all results when returning most/all of them
+            all_results.sort(key=lambda r: r.score, reverse=True)
+            if top_k is not None and top_k < len(all_results):
+                all_results = all_results[:top_k]
+
+        logger.debug(
+            f"Reranked {len(documents)} documents across {num_batches} batches "
+            f"({num_batches - failed_batches} succeeded), returning {len(all_results)} results"
+        )
+
+        return all_results
+
+    async def _rerank_single_batch(
+        self,
+        query: str,
+        documents: list[str],
+        top_k: int | None = None,
+    ) -> list[RerankResult]:
+        """Internal method to rerank a single batch of documents with format detection.
+
+        Supports both Cohere and TEI (Text Embeddings Inference) formats.
+        Format can be explicitly set or auto-detected from response.
+
+        Args:
+            query: The search query
+            documents: List of documents to rerank (single batch)
+            top_k: Optional limit on number of results
+
+        Returns:
+            List of RerankResult objects with indices relative to input documents
+        """
         await self._ensure_client()
 
-        # Validate base_url exists for reranking
-        if not self._base_url:
-            raise ValueError("base_url is required for reranking operations")
+        # Validate base_url exists for relative URLs (redundant check for safety)
+        if not self._rerank_url.startswith(("http://", "https://")) and not self._base_url:
+            raise ValueError(RERANK_BASE_URL_REQUIRED)
 
         # Build full rerank endpoint URL
         if self._rerank_url.startswith(("http://", "https://")):
@@ -750,17 +1249,11 @@ class OpenAIEmbeddingProvider:
             rerank_url = self._rerank_url.lstrip("/")
             rerank_endpoint = f"{base_url}/{rerank_url}"
 
-        # Prepare request payload
-        payload = {"model": self._rerank_model, "query": query, "documents": documents}
-        if top_k is not None:
-            payload["top_n"] = top_k
+        # Resolve format and build payload
+        format_to_use = self._resolve_rerank_format()
+        payload = self._build_rerank_payload(query, documents, top_k, format_to_use)
 
         try:
-            logger.debug(
-                f"Reranking {len(documents)} documents with model {self._rerank_model} "
-                f"at endpoint {rerank_endpoint}"
-            )
-
             # Make API request with timeout using httpx directly
             # since OpenAI client doesn't support custom endpoints well
 
@@ -778,41 +1271,22 @@ class OpenAIEmbeddingProvider:
 
             async with httpx.AsyncClient(**client_kwargs) as client:
                 headers = {"Content-Type": "application/json"}
+
+                # Add Authorization header if API key is set (required for TEI with --api-key)
+                if self._api_key:
+                    headers["Authorization"] = f"Bearer {self._api_key}"
+                    logger.debug("Added Authorization header for rerank request")
+
                 response = await client.post(
                     rerank_endpoint, json=payload, headers=headers
                 )
                 response.raise_for_status()
                 response_data = response.json()
 
-            # Validate response structure
-            if "results" not in response_data:
-                raise ValueError("Invalid rerank response: missing 'results' field")
-
-            results = response_data["results"]
-            if not isinstance(results, list):
-                raise ValueError("Invalid rerank response: 'results' must be a list")
-
-            # Convert to ChunkHound format with validation
-            rerank_results = []
-            for i, result in enumerate(results):
-                if not isinstance(result, dict):
-                    logger.warning(f"Skipping invalid result {i}: not a dict")
-                    continue
-
-                if "index" not in result or "relevance_score" not in result:
-                    logger.warning(f"Skipping result {i}: missing required fields")
-                    continue
-
-                try:
-                    rerank_results.append(
-                        RerankResult(
-                            index=int(result["index"]),
-                            score=float(result["relevance_score"]),
-                        )
-                    )
-                except (ValueError, TypeError) as e:
-                    logger.warning(f"Skipping result {i}: invalid data types - {e}")
-                    continue
+            # Parse response with format auto-detection
+            rerank_results = await self._parse_rerank_response(
+                response_data, format_to_use, num_documents=len(documents)
+            )
 
             # Update usage statistics
             self._usage_stats["requests_made"] += 1
@@ -854,3 +1328,114 @@ class OpenAIEmbeddingProvider:
             self._usage_stats["errors"] += 1
             logger.error(f"Unexpected error during reranking: {e}")
             raise
+
+    async def _parse_rerank_response(
+        self, response_data: dict, format_hint: str, num_documents: int
+    ) -> list[RerankResult]:
+        """Parse rerank response with format auto-detection.
+
+        Thread-safe format detection using async lock to prevent race conditions.
+        Validates that returned indices are within bounds of the original document list.
+
+        Args:
+            response_data: JSON response from rerank API
+            format_hint: Format hint ('cohere', 'tei', or 'auto')
+            num_documents: Number of documents that were sent for reranking
+
+        Returns:
+            List of RerankResult objects
+
+        Raises:
+            ValueError: If response format is invalid or unrecognized
+        """
+        # Early validation: check num_documents is reasonable
+        if num_documents <= 0:
+            logger.warning(
+                f"num_documents is {num_documents} (zero or negative), returning empty results"
+            )
+            return []
+
+        # Validate response has results
+        if "results" not in response_data:
+            raise ValueError("Invalid rerank response: missing 'results' field")
+
+        results = response_data["results"]
+        if not isinstance(results, list):
+            raise ValueError("Invalid rerank response: 'results' must be a list")
+
+        if not results:
+            logger.warning("Rerank response contains empty results list")
+            return []
+
+        # Try to detect format from first result
+        first_result = results[0]
+        if not isinstance(first_result, dict):
+            raise ValueError("Invalid rerank response: results must contain dict objects")
+
+        # Detect format based on field names
+        has_relevance_score = "relevance_score" in first_result
+        has_score = "score" in first_result
+        has_index = "index" in first_result
+
+        if not has_index:
+            raise ValueError("Invalid rerank response: results must have 'index' field")
+
+        # Determine score field name
+        score_field = None
+        detected_format = None
+
+        if has_relevance_score:
+            score_field = "relevance_score"
+            detected_format = "cohere"
+        elif has_score:
+            score_field = "score"
+            detected_format = "tei"
+        else:
+            raise ValueError(
+                "Invalid rerank response: results must have 'relevance_score' or 'score' field"
+            )
+
+        # Cache detected format if in auto mode (thread-safe with async lock)
+        if format_hint == "auto" and detected_format:
+            async with self._format_detection_lock:
+                # Double-check pattern: check if another task already detected the format
+                if self._detected_rerank_format is None:
+                    self._detected_rerank_format = detected_format
+                    logger.debug(f"Auto-detected rerank format: {detected_format}")
+
+        # Convert to ChunkHound format with validation
+        rerank_results = []
+        for i, result in enumerate(results):
+            if not isinstance(result, dict):
+                logger.warning(f"Skipping invalid result {i}: not a dict")
+                continue
+
+            if "index" not in result or score_field not in result:
+                logger.warning(
+                    f"Skipping result {i}: missing required fields (index, {score_field})"
+                )
+                continue
+
+            try:
+                index = int(result["index"])
+                score = float(result[score_field])
+
+                # Validate index is within bounds
+                if index < 0:
+                    logger.warning(
+                        f"Skipping result {i}: negative index {index}"
+                    )
+                    continue
+
+                if index >= num_documents:
+                    logger.warning(
+                        f"Skipping result {i}: index {index} out of bounds (num_documents={num_documents})"
+                    )
+                    continue
+
+                rerank_results.append(RerankResult(index=index, score=score))
+            except (ValueError, TypeError) as e:
+                logger.warning(f"Skipping result {i}: invalid data types - {e}")
+                continue
+
+        return rerank_results

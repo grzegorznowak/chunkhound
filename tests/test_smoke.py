@@ -54,8 +54,8 @@ class TestModuleImports:
     def test_critical_imports(self):
         """Test critical modules that have caused issues before."""
         critical_modules = [
-            "chunkhound.mcp.stdio",
-            "chunkhound.mcp.http_server",  # This would have caught the bug!
+            "chunkhound.mcp_server.stdio",
+            "chunkhound.mcp_server.http_server",  # This would have caught the bug!
             "chunkhound.api.cli.main",
             "chunkhound.database",
             "chunkhound.embeddings",
@@ -78,7 +78,9 @@ class TestCLICommands:
             ["chunkhound", "--version"],
             ["chunkhound", "index", "--help"],
             ["chunkhound", "search", "--help"],
+            ["chunkhound", "research", "--help"],
             ["chunkhound", "mcp", "--help"],
+            ["chunkhound", "calibrate", "--help"],
         ],
     )
     def test_cli_help_commands(self, command):
@@ -109,7 +111,7 @@ class TestCLICommands:
                 "run",
                 "python",
                 "-c",
-                "import chunkhound.mcp.http_server; print('OK')",
+                "import chunkhound.mcp_server.http_server; print('OK')",
             ],
             capture_output=True,
             text=True,
@@ -210,8 +212,8 @@ class TestServerStartup:
             )
 
             try:
-                # Wait for server startup with timeout
-                await asyncio.wait_for(asyncio.sleep(3), timeout=30.0)
+                # Wait for server startup with timeout (5s for slower CI environments)
+                await asyncio.wait_for(asyncio.sleep(5), timeout=30.0)
 
                 # Verify server is running
                 if proc.returncode is not None:
@@ -302,7 +304,7 @@ class TestServerStartup:
 import sys
 import os
 sys.path.insert(0, "{os.getcwd()}")
-from chunkhound.mcp.stdio import main
+from chunkhound.mcp_server.stdio import main
 import asyncio
 
 async def test():
@@ -313,8 +315,8 @@ async def test():
     # Test we can import without immediate crash
     try:
         # Just test that critical imports work - this catches most startup issues
-        from chunkhound.mcp.stdio import StdioMCPServer
-        from chunkhound.mcp.http import HttpMCPServer  
+        from chunkhound.mcp_server.stdio import StdioMCPServer
+        from chunkhound.mcp_server.http import HttpMCPServer  
         from chunkhound.core.config.config import Config
         
         # Test config creation
@@ -554,6 +556,45 @@ class TestTypeAnnotations:
                 f"Found problematic forward reference union patterns in:\n"
                 + "\n".join(f"  - {f}" for f in problematic_files)
             )
+
+
+class TestConfigurationSmoke:
+    """Test that new configuration parameters don't break imports or config."""
+
+    def test_rerank_format_configuration(self):
+        """Verify rerank_format parameter doesn't break imports or config.
+
+        This test ensures the new TEI reranking format configuration can be
+        instantiated without errors, catching import-time or validation issues.
+        """
+        from chunkhound.core.config.embedding_config import EmbeddingConfig
+
+        # Should not raise during import or instantiation with TEI format
+        config_tei = EmbeddingConfig(
+            provider="openai",
+            model="text-embedding-3-small",
+            base_url="http://localhost:8001",
+            rerank_format="tei",
+        )
+        assert config_tei.rerank_format == "tei"
+
+        # Should not raise with Cohere format
+        config_cohere = EmbeddingConfig(
+            provider="openai",
+            model="text-embedding-3-small",
+            base_url="http://localhost:8001",
+            rerank_model="rerank-model",
+            rerank_format="cohere",
+        )
+        assert config_cohere.rerank_format == "cohere"
+
+        # Should not raise with auto format (default)
+        config_auto = EmbeddingConfig(
+            provider="openai",
+            model="text-embedding-3-small",
+            base_url="http://localhost:8001",
+        )
+        assert config_auto.rerank_format == "auto"
 
 
 if __name__ == "__main__":

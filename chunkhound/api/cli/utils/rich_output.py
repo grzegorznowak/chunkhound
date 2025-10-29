@@ -288,9 +288,11 @@ class RichOutputFormatter:
                 default: str = "",
                 style: str = "",
                 justify: Literal["default", "left", "center", "right", "full"] = "left",
+                max_width: int | None = None,
             ) -> None:
                 self.field_name = field_name
                 self.default = default
+                self.max_width = max_width
                 # Use a simple format string that we'll handle ourselves
                 super().__init__("", style=style, justify=justify)
 
@@ -300,6 +302,10 @@ class RichOutputFormatter:
                     if hasattr(task, "fields")
                     else self.default
                 )
+
+                # Truncate value if max_width is specified and exceeded
+                if self.max_width and len(value) > self.max_width:
+                    value = value[:self.max_width - 3] + "..."
 
                 return Text(value, style=self.style)
 
@@ -311,8 +317,8 @@ class RichOutputFormatter:
             TextColumn("•"),
             TimeElapsedColumn(),
             TextColumn("•"),
-            SafeTextColumn("speed", "", style="green"),
-            SafeTextColumn("info", "", style="dim"),
+            SafeTextColumn("speed", "", style="green", max_width=20),
+            SafeTextColumn("info", "", style="dim", max_width=40),
             console=self.console,
             expand=False,
             transient=False,  # Don't make progress disappear when complete
