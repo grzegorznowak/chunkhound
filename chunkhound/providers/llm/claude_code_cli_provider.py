@@ -3,8 +3,11 @@
 This provider wraps the Claude Code CLI (claude --print) to enable deep research
 using the user's existing Claude subscription instead of API credits.
 
-Note: The CLI includes Claude Code's agentic system prompt and cannot provide
-"raw" API access. Use the Anthropic SDK provider if you need clean API access.
+Note: This provider is configured for vanilla LLM behavior:
+- All tools disabled (Write, Edit, Bash, WebFetch, etc.)
+- MCP servers disabled via --strict-mcp-config
+- Workspace isolation (runs from /tmp to prevent context gathering)
+- Clean API access without workspace overhead
 """
 
 import asyncio
@@ -24,7 +27,6 @@ class ClaudeCodeCLIProvider(LLMProvider):
 
     # Constants for timeouts and estimation
     TOKEN_CHARS_RATIO = 4  # Approximate characters per token for Claude models
-    VERSION_CHECK_TIMEOUT = 5  # Seconds to wait for CLI version check
     HEALTH_CHECK_TIMEOUT = 30  # Seconds to wait for health check completion
 
     def __init__(
@@ -53,75 +55,6 @@ class ClaudeCodeCLIProvider(LLMProvider):
         self._estimated_tokens_used = 0
         self._estimated_prompt_tokens = 0
         self._estimated_completion_tokens = 0
-
-        # Verify CLI is available and compatible
-        if not self._is_cli_available():
-            logger.warning(
-                "Claude Code CLI not found. Install from: https://claude.com/claude-code"
-            )
-        else:
-            # Check compatibility with required features
-            is_compatible, error_msg = self._check_cli_compatibility()
-            if not is_compatible:
-                logger.warning(
-                    f"Claude Code CLI compatibility issue: {error_msg}. "
-                    "Update CLI from: https://claude.com/claude-code"
-                )
-
-    def _is_cli_available(self) -> bool:
-        """Check if claude CLI is available in PATH."""
-        try:
-            subprocess.run(
-                ["claude", "--version"],
-                capture_output=True,
-                timeout=self.VERSION_CHECK_TIMEOUT,
-                check=False,
-            )
-            return True
-        except (subprocess.SubprocessError, FileNotFoundError):
-            return False
-
-    def _check_cli_compatibility(self) -> tuple[bool, str]:
-        """Check if CLI supports required features.
-
-        Returns:
-            Tuple of (is_compatible, error_message)
-            If compatible, error_message is empty string.
-        """
-        try:
-            # Test that --print flag works
-            result = subprocess.run(
-                ["claude", "--print", "test"],
-                capture_output=True,
-                timeout=self.VERSION_CHECK_TIMEOUT,
-                check=False,
-            )
-
-            # If exit code is 0 or 1 (model error), CLI is available
-            # Exit code 2 usually means unknown flag
-            if result.returncode == 2:
-                return False, "CLI does not support --print flag (upgrade required)"
-
-            # Check for specific error messages indicating missing features
-            stderr = result.stderr.decode("utf-8").lower()
-            if "unknown option" in stderr or "unrecognized" in stderr:
-                if "--print" in stderr:
-                    return False, "CLI does not support --print flag (upgrade required)"
-                if "--model" in stderr:
-                    return False, "CLI does not support --model flag (upgrade required)"
-                if "--output-format" in stderr:
-                    return (
-                        False,
-                        "CLI does not support --output-format flag (upgrade required)",
-                    )
-
-            return True, ""
-
-        except subprocess.TimeoutExpired:
-            # Timeout during compatibility check - CLI might be too old or hanging
-            return False, "CLI compatibility check timed out"
-        except (subprocess.SubprocessError, FileNotFoundError):
-            return False, "CLI not found in PATH"
 
     def _map_model_to_cli_arg(self, model: str) -> str:
         """Map full model name to CLI model argument.
@@ -163,12 +96,32 @@ class ClaudeCodeCLIProvider(LLMProvider):
         model_arg = self._map_model_to_cli_arg(self._model)
         cmd = ["claude", "--print", "--model", model_arg, "--output-format", "text"]
 
+        # Disable all tools for vanilla LLM behavior (no workspace context needed)
+        cmd.extend([
+            "--disallowedTools",
+            "Write",
+            "Edit",
+            "Bash",
+            "SlashCommand",
+            "WebFetch",
+            "WebSearch",
+            "Agent",
+            "Glob",
+            "Grep",
+            "List",
+            "TodoWrite",
+            "Task",
+        ])
+
+        # Prevent MCP server loading for clean LLM access
+        cmd.extend(["--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}'])
+
         # Add system prompt if provided (appends to default)
         if system:
             cmd.extend(["--append-system-prompt", system])
 
-        # Add the user prompt
-        cmd.append(prompt)
+        # Add the user prompt (-- separator must come after all flags)
+        cmd.extend(["--", prompt])
 
         # Set environment for subscription-based auth
         env = os.environ.copy()
@@ -185,12 +138,14 @@ class ClaudeCodeCLIProvider(LLMProvider):
         for attempt in range(self._max_retries):
             process = None
             try:
-                # Create subprocess (without timeout - this is usually instant)
+                # Create subprocess with neutral CWD to prevent workspace scanning
                 process = await asyncio.create_subprocess_exec(
                     *cmd,
+                    stdin=subprocess.DEVNULL,  # Prevent stdin inheritance (fixes MCP server freeze)
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     env=env,
+                    cwd="/tmp",  # Run from neutral directory to avoid Claude CLI workspace context gathering
                 )
 
                 # Wrap communicate() with timeout (this is the long-running part)
@@ -418,16 +373,10 @@ Respond with JSON only, no additional text."""
         return len(text) // self.TOKEN_CHARS_RATIO
 
     async def health_check(self) -> dict[str, Any]:
-        """Perform health check by testing CLI availability and basic completion."""
-        # First check if CLI is available
-        if not self._is_cli_available():
-            return {
-                "status": "unhealthy",
-                "provider": "claude-code-cli",
-                "error": "Claude Code CLI not found in PATH",
-            }
+        """Perform health check by attempting a simple completion.
 
-        # Try a simple completion
+        This will naturally detect if the CLI is missing or incompatible.
+        """
         try:
             response = await self.complete(
                 "Say 'OK'", max_completion_tokens=10, timeout=self.HEALTH_CHECK_TIMEOUT
@@ -453,3 +402,11 @@ Respond with JSON only, no additional text."""
             "prompt_tokens_estimated": self._estimated_prompt_tokens,
             "completion_tokens_estimated": self._estimated_completion_tokens,
         }
+
+    def get_synthesis_concurrency(self) -> int:
+        """Get recommended concurrency for parallel synthesis operations.
+
+        Returns:
+            3 for Claude Code CLI (conservative default matching OpenAI pattern)
+        """
+        return 3

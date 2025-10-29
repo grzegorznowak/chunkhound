@@ -27,15 +27,17 @@ class HttpMCPServer(MCPServerBase):
     request/response model.
     """
 
-    def __init__(self, config: Config, port: int = 5173):
+    def __init__(self, config: Config, port: int = 5173, host: str = "0.0.0.0"):
         """Initialize HTTP MCP server.
 
         Args:
             config: Validated configuration object
             port: Port to listen on (default: 5173)
+            host: Host to bind to (default: "0.0.0.0")
         """
         super().__init__(config)
         self.port = port
+        self.host = host
 
         # Mark process as MCP mode so downstream code avoids interactive prompts
         os.environ["CHUNKHOUND_MCP_MODE"] = "1"
@@ -112,10 +114,10 @@ class HttpMCPServer(MCPServerBase):
         than the stdio implementation.
         """
         try:
-            self.debug_log(f"Starting HTTP server on port {self.port}")
+            self.debug_log(f"Starting HTTP server on {self.host}:{self.port}")
 
             # Run the FastMCP server in HTTP mode
-            await self.app.run_http_async(port=self.port, host="0.0.0.0")
+            await self.app.run_http_async(port=self.port, host=self.host)
 
         except KeyboardInterrupt:
             self.debug_log("Server interrupted by user")
@@ -162,7 +164,7 @@ async def main() -> None:
         sys.exit(1)
 
     # Create and run the HTTP server
-    server = HttpMCPServer(config, port=args.port)
+    server = HttpMCPServer(config, port=args.port, host=args.host)
     await server.run()
 
 

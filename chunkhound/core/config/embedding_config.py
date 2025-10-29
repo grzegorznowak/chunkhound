@@ -10,12 +10,62 @@ import argparse
 import os
 from typing import Any, Literal
 
-from pydantic import Field, SecretStr, field_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from typing_extensions import Self
 
 from chunkhound.core.constants import VOYAGE_DEFAULT_MODEL
 
 from .openai_utils import is_official_openai_endpoint
+
+
+# Error message constants for consistent messaging across config and provider
+RERANK_MODEL_REQUIRED_COHERE = (
+    "rerank_model is required when using rerank_format='cohere'. "
+    "Either provide rerank_model or use rerank_format='tei'."
+)
+RERANK_BASE_URL_REQUIRED = (
+    "base_url is required when using reranking with relative rerank_url. "
+    "Either provide base_url or use an absolute rerank_url (http://...)"
+)
+
+
+def validate_rerank_configuration(
+    provider: str,
+    rerank_format: str,
+    rerank_model: str | None,
+    rerank_url: str,
+    base_url: str | None,
+) -> None:
+    """Validate rerank configuration consistency.
+
+    Shared validation logic used by both config and provider layers.
+
+    Args:
+        provider: Embedding provider name
+        rerank_format: Reranking API format ('cohere', 'tei', or 'auto')
+        rerank_model: Model name for reranking (optional for TEI)
+        rerank_url: Rerank endpoint URL
+        base_url: Base URL for API (required for relative rerank_url)
+
+    Raises:
+        ValueError: If configuration is invalid
+    """
+    # VoyageAI uses SDK-based reranking, doesn't need URL configuration
+    if provider == "voyageai":
+        return
+
+    # For Cohere format, rerank_model is required
+    if rerank_format == "cohere" and not rerank_model:
+        raise ValueError(RERANK_MODEL_REQUIRED_COHERE)
+
+    # If using reranking (model set or TEI format with URL), validate URL config
+    is_using_reranking = rerank_model or (rerank_format == "tei" and rerank_url)
+
+    if is_using_reranking:
+        # For relative URLs, we need base_url
+        if not rerank_url.startswith(("http://", "https://")) and not base_url:
+            raise ValueError(RERANK_BASE_URL_REQUIRED)
 
 
 class EmbeddingConfig(BaseSettings):
@@ -72,6 +122,13 @@ class EmbeddingConfig(BaseSettings):
         "Relative paths combined with base_url for same-server reranking.",
     )
 
+    rerank_format: Literal["cohere", "tei", "auto"] = Field(
+        default="auto",
+        description="Reranking API format. 'cohere' for Cohere-compatible APIs (requires model in request), "
+        "'tei' for Hugging Face Text Embeddings Inference (model set at deployment), "
+        "'auto' for automatic format detection from response.",
+    )
+
     # Internal settings - not exposed to users
     batch_size: int = Field(default=100, description="Internal batch size")
     timeout: int = Field(default=30, description="Internal timeout")
@@ -114,30 +171,17 @@ class EmbeddingConfig(BaseSettings):
 
         return v
 
-    @field_validator("rerank_model")
-    def validate_rerank_config(cls, v: str | None, info) -> str | None:  # noqa: N805
-        """Validate rerank configuration completeness."""
-        if v is None:
-            return v
-
-        # When rerank_model is set, check if we have what we need for URL construction
-        values = info.data
-        provider = values.get("provider", "openai")
-        rerank_url = values.get("rerank_url", "/rerank")
-        base_url = values.get("base_url")
-
-        # VoyageAI uses SDK-based reranking, doesn't need URL configuration
-        if provider == "voyageai":
-            return v
-
-        # For other providers, if rerank_url is relative, we need base_url
-        if not rerank_url.startswith(("http://", "https://")) and not base_url:
-            raise ValueError(
-                "base_url is required when using rerank_model with relative rerank_url. "
-                "Either provide base_url or use an absolute rerank_url (http://...)"
-            )
-
-        return v
+    @model_validator(mode="after")
+    def validate_rerank_config(self) -> Self:
+        """Validate rerank configuration using shared validation logic."""
+        validate_rerank_configuration(
+            provider=self.provider,
+            rerank_format=self.rerank_format,
+            rerank_model=self.rerank_model,
+            rerank_url=self.rerank_url,
+            base_url=self.base_url,
+        )
+        return self
 
     def get_provider_config(self) -> dict[str, Any]:
         """
@@ -167,6 +211,7 @@ class EmbeddingConfig(BaseSettings):
         if self.rerank_model:
             base_config["rerank_model"] = self.rerank_model
         base_config["rerank_url"] = self.rerank_url
+        base_config["rerank_format"] = self.rerank_format
 
         return base_config
 

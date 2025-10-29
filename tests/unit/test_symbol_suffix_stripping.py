@@ -7,7 +7,7 @@ hidden from consumers like deep research to ensure regex searches work correctly
 
 import pytest
 
-from chunkhound.services.search_service import _strip_chunk_part_suffix
+from chunkhound.services.search.result_enhancer import _strip_chunk_part_suffix
 
 
 class TestStripChunkPartSuffix:
@@ -118,7 +118,7 @@ class TestSearchResultEnhancement:
             "end_line": 10,
         }
 
-        enhanced = service._enhance_search_result(result)
+        enhanced = service._result_enhancer.enhance_search_result(result)
 
         # Should have clean symbol
         assert enhanced["symbol"] == "MyClass"
@@ -144,7 +144,7 @@ class TestSearchResultEnhancement:
             "end_line": 2,
         }
 
-        enhanced = service._enhance_search_result(result)
+        enhanced = service._result_enhancer.enhance_search_result(result)
 
         # Symbol should be unchanged
         assert enhanced["symbol"] == "normal_function"
@@ -172,7 +172,7 @@ class TestSearchResultEnhancement:
             },
         }
 
-        enhanced = service._enhance_search_result(result)
+        enhanced = service._result_enhancer.enhance_search_result(result)
 
         # Should clean symbol
         assert enhanced["symbol"] == "MyClass"
@@ -197,7 +197,7 @@ class TestSearchResultEnhancement:
             "content": "class VeryLargeClass:\n    pass",
         }
 
-        enhanced = service._enhance_search_result(result)
+        enhanced = service._result_enhancer.enhance_search_result(result)
 
         # Should strip all nested suffixes
         assert enhanced["symbol"] == "VeryLargeClass"
@@ -217,7 +217,7 @@ class TestSearchResultEnhancement:
             "file_path": "test.py",
         }
 
-        enhanced = service._enhance_search_result(result)
+        enhanced = service._result_enhancer.enhance_search_result(result)
 
         # Should not crash, just not have symbol field
         assert "symbol" not in enhanced
@@ -236,7 +236,7 @@ class TestSearchResultEnhancement:
             "content": "some code",
         }
 
-        enhanced = service._enhance_search_result(result)
+        enhanced = service._result_enhancer.enhance_search_result(result)
 
         # Should preserve empty symbol
         assert enhanced["symbol"] == ""

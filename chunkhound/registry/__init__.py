@@ -8,8 +8,10 @@ Simplified from 540 lines to ~250 lines by:
 """
 
 import os
+from collections.abc import MutableMapping
 from pathlib import Path
-from typing import Any
+from threading import Lock
+from typing import Any, Callable
 
 from loguru import logger
 
@@ -25,6 +27,73 @@ from chunkhound.core.types.common import Language
 # Import new unified parser system
 from chunkhound.parsers.parser_factory import get_parser_factory
 
+
+class LazyLanguageParsers(MutableMapping[Language, Any]):
+    """Mapping that lazily materializes language parsers on first access."""
+
+    def __init__(self):
+        self._factories: dict[Language, Callable[[], Any]] = {}
+        self._instances: dict[Language, Any] = {}
+        self._lock = Lock()
+
+    def register_factory(
+        self, language: Language, factory: Callable[[], Any]
+    ) -> None:
+        """Register a factory used to materialize a parser lazily."""
+        self._factories[language] = factory
+
+    def materialized_copy(self) -> dict[Language, Any]:
+        """Return copy of parsers that have already been instantiated."""
+        with self._lock:
+            return dict(self._instances)
+
+    def __getitem__(self, key: Language) -> Any:
+        with self._lock:
+            if key in self._instances:
+                return self._instances[key]
+
+        factory = self._factories.get(key)
+        if factory is None:
+            raise KeyError(key)
+
+        parser = factory()
+        with self._lock:
+            existing = self._instances.get(key)
+            if existing is not None:
+                return existing
+            self._instances[key] = parser
+            return parser
+
+    def __setitem__(self, key: Language, value: Any) -> None:
+        with self._lock:
+            self._instances[key] = value
+            self._factories.pop(key, None)
+
+    def __delitem__(self, key: Language) -> None:
+        with self._lock:
+            self._instances.pop(key, None)
+            self._factories.pop(key, None)
+
+    def __iter__(self):
+        with self._lock:
+            combined = set(self._instances.keys()) | set(self._factories.keys())
+        return iter(combined)
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(set(self._instances.keys()) | set(self._factories.keys()))
+
+    def __contains__(self, key: object) -> bool:
+        if not isinstance(key, Language):
+            return False
+        with self._lock:
+            return key in self._instances or key in self._factories
+
+    def clear(self) -> None:
+        with self._lock:
+            self._instances.clear()
+            self._factories.clear()
+
 # Import services
 from chunkhound.services.embedding_service import EmbeddingService
 from chunkhound.services.indexing_coordinator import IndexingCoordinator
@@ -37,7 +106,7 @@ class ProviderRegistry:
     def __init__(self):
         """Initialize the provider registry."""
         self._providers: dict[str, Any] = {}
-        self._language_parsers: dict[Language, Any] = {}
+        self._language_parsers: LazyLanguageParsers = LazyLanguageParsers()
         self._config: Config | None = None
 
     def configure(self, config: Config) -> None:
@@ -90,11 +159,14 @@ class ProviderRegistry:
 
     def get_language_parser(self, language: Language) -> Any | None:
         """Get parser for specified programming language."""
-        return self._language_parsers.get(language)
+        try:
+            return self._language_parsers[language]
+        except KeyError:
+            return None
 
     def get_all_language_parsers(self) -> dict[Language, Any]:
         """Get all registered language parsers."""
-        return self._language_parsers.copy()
+        return self._language_parsers.materialized_copy()
 
     def create_indexing_coordinator(self) -> IndexingCoordinator:
         """Create an IndexingCoordinator with all dependencies."""
@@ -102,19 +174,24 @@ class ProviderRegistry:
         database_provider = self.get_provider("database")
         embedding_provider = None
 
-        try:
-            logger.debug(
-                "[REGISTRY] Attempting to get embedding provider for IndexingCoordinator"
-            )
-            embedding_provider = self.get_provider("embedding")
-            logger.debug(
-                f"[REGISTRY] Successfully got embedding provider: {type(embedding_provider)}"
-            )
-        except ValueError as e:
-            logger.warning(
-                f"[REGISTRY] No embedding provider configured for IndexingCoordinator: {e}"
-            )
-            pass  # No embedding provider configured
+        # Respect explicit --no-embeddings: do not attempt lookup and avoid warnings
+        if self._config and getattr(self._config, "embeddings_disabled", False):
+            embedding_provider = None
+            logger.debug("[REGISTRY] Embeddings disabled; skipping embedding provider")
+        else:
+            try:
+                logger.debug(
+                    "[REGISTRY] Attempting to get embedding provider for IndexingCoordinator"
+                )
+                embedding_provider = self.get_provider("embedding")
+                logger.debug(
+                    f"[REGISTRY] Successfully got embedding provider: {type(embedding_provider)}"
+                )
+            except ValueError as e:
+                logger.warning(
+                    f"[REGISTRY] No embedding provider configured for IndexingCoordinator: {e}"
+                )
+                pass  # No embedding provider configured
 
         # Get base directory from config (guaranteed to be set) or fallback to cwd
         base_directory = self._config.target_dir if self._config else Path.cwd()
@@ -135,10 +212,14 @@ class ProviderRegistry:
         database_provider = self.get_provider("database")
         embedding_provider = None
 
-        try:
-            embedding_provider = self.get_provider("embedding")
-        except ValueError:
-            logger.warning("No embedding provider configured for search service")
+        if self._config and getattr(self._config, "embeddings_disabled", False):
+            embedding_provider = None
+            logger.debug("[REGISTRY] Embeddings disabled; search service will run without embeddings")
+        else:
+            try:
+                embedding_provider = self.get_provider("embedding")
+            except ValueError:
+                logger.warning("No embedding provider configured for search service")
 
         return SearchService(
             database_provider=database_provider, embedding_provider=embedding_provider
@@ -149,10 +230,14 @@ class ProviderRegistry:
         database_provider = self.get_provider("database")
         embedding_provider = None
 
-        try:
-            embedding_provider = self.get_provider("embedding")
-        except ValueError:
-            logger.warning("No embedding provider configured for embedding service")
+        if self._config and getattr(self._config, "embeddings_disabled", False):
+            embedding_provider = None
+            logger.debug("[REGISTRY] Embeddings disabled; embedding service will be inert")
+        else:
+            try:
+                embedding_provider = self.get_provider("embedding")
+            except ValueError:
+                logger.warning("No embedding provider configured for embedding service")
 
         # Get batch configuration from config
         if self._config and self._config.embedding:
@@ -280,11 +365,14 @@ class ProviderRegistry:
         for language, is_available in available_languages.items():
             if is_available:
                 try:
-                    parser = parser_factory.create_parser(language)
-                    self._language_parsers[language] = parser
-
+                    self._language_parsers.register_factory(
+                        language,
+                        lambda lang=language: parser_factory.create_parser(lang),
+                    )
                     if not os.environ.get("CHUNKHOUND_MCP_MODE"):
-                        logger.debug(f"Registered parser for {language.value}")
+                        logger.debug(
+                            f"Registered parser factory for {language.value}"
+                        )
                 except Exception as e:
                     if not os.environ.get("CHUNKHOUND_MCP_MODE"):
                         logger.warning(

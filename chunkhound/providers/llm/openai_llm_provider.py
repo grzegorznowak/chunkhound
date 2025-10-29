@@ -146,9 +146,11 @@ class OpenAILLMProvider(LLMProvider):
 
                 raise RuntimeError(
                     f"LLM response truncated - token limit exceeded{usage_info}. "
-                    f"For reasoning models (GPT-5, Gemini 2.5), this indicates "
-                    f"insufficient max_completion_tokens. Current limit: {max_completion_tokens:,} tokens. "
-                    f"Consider increasing OUTPUT_TOKENS_WITH_REASONING in deep_research_service.py."
+                    f"For reasoning models (GPT-5, Gemini 2.5), this indicates the query requires "
+                    f"extensive reasoning that exhausted the output budget. "
+                    f"The output budget is fixed at {max_completion_tokens:,} tokens for all queries "
+                    f"to accommodate internal 'thinking' tokens (OUTPUT_TOKENS_WITH_REASONING). "
+                    f"Try breaking your query into smaller, more focused questions."
                 )
 
             # Warn on other unexpected finish_reason
@@ -309,3 +311,11 @@ class OpenAILLMProvider(LLMProvider):
             "prompt_tokens": self._prompt_tokens,
             "completion_tokens": self._completion_tokens,
         }
+
+    def get_synthesis_concurrency(self) -> int:
+        """Get recommended concurrency for parallel synthesis operations.
+
+        Returns:
+            3 for OpenAI (conservative default based on tier limits)
+        """
+        return 3

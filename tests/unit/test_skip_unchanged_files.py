@@ -44,6 +44,7 @@ class _FakeDB:
             "size": rec.size_bytes,
             "modified_time": rec.mtime,
             "language": rec.language.value,
+            "content_hash": rec.content_hash,
         }
 
 

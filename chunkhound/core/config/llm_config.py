@@ -226,13 +226,15 @@ class LLMConfig(BaseSettings):
         if self.provider == "openai":
             return ("gpt-5-nano", "gpt-5")
         elif self.provider == "anthropic-bedrock":
-            return ("claude-3-5-haiku-20241022", "claude-3-5-sonnet-20241022")
+            # Bedrock: Haiku 4.5 for both (synthesis-capable + cost-effective, unlike older Haiku)
+            return ("anthropic.claude-haiku-4-5-20251001-v1:0", "anthropic.claude-haiku-4-5-20251001-v1:0")
         elif self.provider == "ollama":
             # Ollama: use same model for both (local deployment)
             return ("llama3.2", "llama3.2")
         elif self.provider == "claude-code-cli":
-            # Claude Code CLI: Haiku 4.5 for utility, Sonnet 4.5 for synthesis
-            return ("claude-3-5-haiku-20241022", "claude-sonnet-4-5-20250929")
+            # Claude Code CLI: Haiku 4.5 for both utility and synthesis
+            # (Haiku 4.5 is synthesis-capable and cost-effective, unlike 3.5)
+            return ("claude-haiku-4-5-20251001", "claude-haiku-4-5-20251001")
         elif self.provider == "codex-cli":
             # Codex CLI: nominal label; require explicit model if desired
             return ("codex", "codex")

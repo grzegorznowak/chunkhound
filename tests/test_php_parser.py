@@ -306,5 +306,86 @@ def test_comprehensive_file(php_parser, comprehensive_php):
     assert "namespace" in all_code or "class" in all_code, "No PHP structures found in parsed code"
 
 
+@pytest.mark.parametrize("test_name,php_code,expected_checks", [
+    (
+        "Function with typed parameters and return type",
+        """<?php
+function getUser(int $id, ?string $name = null): ?User {
+    return null;
+}
+""",
+        {
+            "kind": "function",
+            "node_type": "function_definition",
+            "return_type": "?User",
+        }
+    ),
+    (
+        "Abstract class",
+        """<?php
+abstract class BaseService {
+    private static $instance;
+}
+""",
+        {
+            "kind": "class",
+            "is_abstract": True,
+        }
+    ),
+    (
+        "Final class",
+        """<?php
+final class FinalService {
+    public function test() {}
+}
+""",
+        {
+            "kind": "class",
+            "is_final": True,
+        }
+    ),
+    (
+        "Interface",
+        """<?php
+interface ServiceInterface {
+    public function execute(): mixed;
+}
+""",
+        {
+            "kind": "interface",
+        }
+    ),
+    (
+        "Trait",
+        """<?php
+trait Loggable {
+    private function log(string $message): void {
+        echo $message;
+    }
+}
+""",
+        {
+            "kind": "trait",
+        }
+    ),
+])
+def test_php_metadata_features(php_parser, test_name, php_code, expected_checks):
+    """Test PHP metadata extraction for specific language features."""
+    chunks = php_parser.parse_content(php_code, Path("test.php"), file_id=1)
+
+    assert len(chunks) > 0, f"{test_name}: No chunks found"
+
+    # Get the first chunk (usually the primary definition)
+    chunk = chunks[0]
+
+    assert chunk.metadata is not None, f"{test_name}: No metadata found"
+
+    # Check all expected metadata values
+    for key, expected_value in expected_checks.items():
+        actual_value = chunk.metadata.get(key)
+        assert actual_value == expected_value, \
+            f"{test_name}: {key} mismatch - expected {expected_value}, got {actual_value}"
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

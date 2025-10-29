@@ -94,6 +94,19 @@ class DuckDBProvider(SerialDatabaseProvider):
         )
         self._embedding_repository.set_provider_instance(self)
 
+        # Lightweight performance metrics for chunk writes (per-provider lifecycle)
+        self._metrics: dict[str, dict[str, float | int]] = {
+            "chunks": {
+                "files": 0,
+                "rows": 0,
+                "batches": 0,
+                "temp_create_s": 0.0,
+                "temp_insert_s": 0.0,
+                "main_insert_s": 0.0,
+                "temp_drop_s": 0.0,
+            }
+        }
+
     def _create_connection(self) -> Any:
         """Create and return a DuckDB connection.
 
@@ -974,6 +987,7 @@ class DuckDBProvider(SerialDatabaseProvider):
                     file_id,
                     file.size_bytes if hasattr(file, "size_bytes") else None,
                     file.mtime if hasattr(file, "mtime") else None,
+                    getattr(file, "content_hash", None),
                 )
                 return file_id
 
@@ -983,8 +997,8 @@ class DuckDBProvider(SerialDatabaseProvider):
             # No existing file, insert new one
             result = conn.execute(
                 """
-                INSERT INTO files (path, name, extension, size, modified_time, language)
-                VALUES (?, ?, ?, ?, to_timestamp(?), ?)
+                INSERT INTO files (path, name, extension, size, modified_time, content_hash, language)
+                VALUES (?, ?, ?, ?, to_timestamp(?), ?, ?)
                 RETURNING id
             """,
                 [
@@ -995,6 +1009,7 @@ class DuckDBProvider(SerialDatabaseProvider):
                     else Path(file.path).suffix,
                     file.size_bytes if hasattr(file, "size_bytes") else None,
                     file.mtime if hasattr(file, "mtime") else None,
+                    getattr(file, "content_hash", None),
                     file.language.value if file.language else None,
                 ],
             )
@@ -1226,8 +1241,10 @@ class DuckDBProvider(SerialDatabaseProvider):
             )
 
         # Create temporary table
+        import time as _t
+        _t0 = _t.perf_counter()
         conn.execute("""
-            CREATE TEMPORARY TABLE temp_chunks (
+            CREATE TEMPORARY TABLE IF NOT EXISTS temp_chunks (
                 file_id INTEGER,
                 chunk_type TEXT,
                 symbol TEXT,
@@ -1239,7 +1256,9 @@ class DuckDBProvider(SerialDatabaseProvider):
                 language TEXT
             )
         """)
-
+        _t1 = _t.perf_counter()
+        conn.execute("DELETE FROM temp_chunks")
+        _t_clear = _t.perf_counter()
         # Bulk insert into temp table
         conn.executemany(
             """
@@ -1247,7 +1266,7 @@ class DuckDBProvider(SerialDatabaseProvider):
         """,
             chunk_data,
         )
-
+        _t2 = _t.perf_counter()
         # Insert from temp to main table with RETURNING
         result = conn.execute("""
             INSERT INTO chunks (file_id, chunk_type, symbol, code, start_line, end_line,
@@ -1255,11 +1274,23 @@ class DuckDBProvider(SerialDatabaseProvider):
             SELECT * FROM temp_chunks
             RETURNING id
         """)
-
+        _t3 = _t.perf_counter()
         chunk_ids = [row[0] for row in result.fetchall()]
+        # Reuse temp table across calls; do not drop here
 
-        # Drop temp table
-        conn.execute("DROP TABLE temp_chunks")
+        # Update metrics
+        try:
+            m = self._metrics.get("chunks") or {}
+            m["files"] = int(m.get("files", 0)) + 1
+            m["rows"] = int(m.get("rows", 0)) + len(chunk_data)
+            m["batches"] = int(m.get("batches", 0)) + 1
+            m["temp_create_s"] = float(m.get("temp_create_s", 0.0)) + (_t1 - _t0)
+            m["temp_insert_s"] = float(m.get("temp_insert_s", 0.0)) + (_t2 - _t_clear)
+            m["main_insert_s"] = float(m.get("main_insert_s", 0.0)) + (_t3 - _t2)
+            m["temp_clear_s"] = float(m.get("temp_clear_s", 0.0)) + (_t_clear - _t1)
+            self._metrics["chunks"] = m
+        except Exception:
+            pass
 
         return chunk_ids
 
@@ -1364,9 +1395,34 @@ class DuckDBProvider(SerialDatabaseProvider):
         # Then delete the chunk
         conn.execute("DELETE FROM chunks WHERE id = ?", [chunk_id])
 
+    def _executor_delete_chunks_batch(
+        self, conn: Any, state: dict[str, Any], chunk_ids: list[int]
+    ) -> None:
+        """Executor method for delete_chunks_batch - runs in DB thread."""
+        if not chunk_ids:
+            return
+        # Track operation for checkpoint management
+        track_operation(state)
+        placeholders = ",".join(["?"] * len(chunk_ids))
+        # Delete embeddings first across all embedding tables
+        tables = conn.execute(
+            "SELECT table_name FROM information_schema.tables WHERE table_name LIKE 'embeddings_%'"
+        ).fetchall()
+        for (table_name,) in tables:
+            conn.execute(
+                f"DELETE FROM {table_name} WHERE chunk_id IN ({placeholders})",
+                chunk_ids,
+            )
+        # Delete chunks
+        conn.execute(f"DELETE FROM chunks WHERE id IN ({placeholders})", chunk_ids)
+
     def delete_chunk(self, chunk_id: int) -> None:
         """Delete a single chunk by ID with proper foreign key handling."""
         self._execute_in_db_thread_sync("delete_chunk", chunk_id)
+
+    def delete_chunks_batch(self, chunk_ids: list[int]) -> None:
+        """Delete multiple chunks by ID efficiently (with embedding cleanup)."""
+        self._execute_in_db_thread_sync("delete_chunks_batch", chunk_ids)
 
     def update_chunk(self, chunk_id: int, **kwargs) -> None:
         """Update chunk record with new values - delegate to chunk repository."""
@@ -2484,6 +2540,29 @@ class DuckDBProvider(SerialDatabaseProvider):
         # CHECKPOINT: Happens at 1GB WAL size
         # MANUAL: Not needed - DuckDB self-optimizes
         """
-        # DuckDB automatically manages table optimization through its WAL and MVCC system
-        # No manual optimization needed for DuckDB
-        pass
+        # DuckDB automatically manages table optimization. Emit metrics for visibility.
+        if os.environ.get("CHUNKHOUND_MCP_MODE"):
+            return
+        try:
+            m = self._metrics.get("chunks", {})
+            files = int(m.get("files", 0))
+            rows = int(m.get("rows", 0))
+            batches = int(m.get("batches", 0))
+            t_temp = float(m.get("temp_create_s", 0.0))
+            t_clear = float(m.get("temp_clear_s", 0.0))
+            t_tins = float(m.get("temp_insert_s", 0.0))
+            t_main = float(m.get("main_insert_s", 0.0))
+            if files or rows:
+                logger.info(
+                    "DuckDB chunks bulk metrics: files={} rows={} batches={} "
+                    "t_temp={:.2f}s t_temp_clear={:.2f}s t_temp_insert={:.2f}s t_main_insert={:.2f}s",
+                    files,
+                    rows,
+                    batches,
+                    t_temp,
+                    t_clear,
+                    t_tins,
+                    t_main,
+                )
+        except Exception:
+            pass
