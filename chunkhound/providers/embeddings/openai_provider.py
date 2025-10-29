@@ -1,6 +1,8 @@
 """OpenAI embedding provider implementation for ChunkHound - concrete embedding provider using OpenAI API."""
 
 import asyncio
+import heapq
+import math
 from collections.abc import AsyncIterator
 from datetime import datetime
 from typing import Any
@@ -28,8 +30,156 @@ except ImportError:
     logger.warning("OpenAI not available - install with: uv pip install openai")
 
 
+# Qwen3 model configuration for Ollama/OpenAI-compatible endpoints
+# Research: https://www.baseten.co/blog/day-zero-benchmarks-for-qwen-3
+# Batch sizes optimized for throughput on GPU inference (A100 baseline)
+# Rerank limits: 32-128 per batch based on model size to prevent OOM
+QWEN_MODEL_CONFIG = {
+    # Qwen3 Embedding Models (via Ollama)
+    # Batch sizes balanced for GPU memory and throughput
+    "dengcao/Qwen3-Embedding-0.6B:Q5_K_M": {
+        "max_tokens_per_batch": 200000,  # Conservative for Q5_K_M quantization
+        "max_texts_per_batch": 512,  # Smallest model: highest throughput
+        "context_length": 8192,
+        "max_rerank_batch": 128,  # Smallest reranker: largest batches
+    },
+    "qwen3-embedding-0.6b": {
+        "max_tokens_per_batch": 200000,
+        "max_texts_per_batch": 512,
+        "context_length": 8192,
+        "max_rerank_batch": 128,
+    },
+    "dengcao/Qwen3-Embedding-4B:Q5_K_M": {
+        "max_tokens_per_batch": 150000,
+        "max_texts_per_batch": 256,  # Medium model: balanced speed/memory
+        "context_length": 8192,
+        "max_rerank_batch": 96,  # Medium reranker batch size
+    },
+    "qwen3-embedding-4b": {
+        "max_tokens_per_batch": 150000,
+        "max_texts_per_batch": 256,
+        "context_length": 8192,
+        "max_rerank_batch": 96,
+    },
+    "dengcao/Qwen3-Embedding-8B:Q5_K_M": {
+        "max_tokens_per_batch": 100000,
+        "max_texts_per_batch": 128,  # Largest model: conservative for memory
+        "context_length": 8192,
+        "max_rerank_batch": 64,  # Largest reranker: smallest batches
+    },
+    "qwen3-embedding-8b": {
+        "max_tokens_per_batch": 100000,
+        "max_texts_per_batch": 128,
+        "context_length": 8192,
+        "max_rerank_batch": 64,
+    },
+    # Qwen3 Reranker Models
+    # Batch sizes based on research: 32-128 for GPU inference
+    # Conservative values to prevent OOM on large result sets
+    "fireworks/qwen3-reranker-0.6b": {
+        "max_tokens_per_batch": 100000,
+        "max_texts_per_batch": 256,
+        "context_length": 131072,  # jina-reranker-v3 context window
+        "max_rerank_batch": 128,  # Higher for smallest model
+    },
+    "qwen3-reranker-0.6b": {
+        "max_tokens_per_batch": 100000,
+        "max_texts_per_batch": 256,
+        "context_length": 131072,
+        "max_rerank_batch": 128,
+    },
+    "fireworks/qwen3-reranker-4b": {
+        "max_tokens_per_batch": 80000,
+        "max_texts_per_batch": 128,
+        "context_length": 32000,
+        "max_rerank_batch": 96,
+    },
+    "qwen3-reranker-4b": {
+        "max_tokens_per_batch": 80000,
+        "max_texts_per_batch": 128,
+        "context_length": 32000,
+        "max_rerank_batch": 96,
+    },
+    "fireworks/qwen3-reranker-8b": {
+        "max_tokens_per_batch": 60000,
+        "max_texts_per_batch": 64,
+        "context_length": 32000,
+        "max_rerank_batch": 64,
+    },
+    "qwen3-reranker-8b": {
+        "max_tokens_per_batch": 60000,
+        "max_texts_per_batch": 64,
+        "context_length": 32000,
+        "max_rerank_batch": 64,
+    },
+}
+
+
+def _validate_qwen_model_config() -> None:
+    """Validate QWEN_MODEL_CONFIG structure at module load time.
+
+    Raises:
+        ValueError: If configuration is invalid
+    """
+    required_fields = {
+        "max_tokens_per_batch",
+        "max_texts_per_batch",
+        "context_length",
+        "max_rerank_batch",
+    }
+
+    for model_name, config in QWEN_MODEL_CONFIG.items():
+        # Check all required fields present
+        missing_fields = required_fields - set(config.keys())
+        if missing_fields:
+            raise ValueError(
+                f"Qwen model '{model_name}' missing required fields: {missing_fields}"
+            )
+
+        # Validate batch sizes are positive integers
+        if config["max_texts_per_batch"] <= 0:
+            raise ValueError(
+                f"Qwen model '{model_name}' has invalid max_texts_per_batch: "
+                f"{config['max_texts_per_batch']} (must be > 0)"
+            )
+
+        if config["max_rerank_batch"] <= 0:
+            raise ValueError(
+                f"Qwen model '{model_name}' has invalid max_rerank_batch: "
+                f"{config['max_rerank_batch']} (must be > 0)"
+            )
+
+        # Validate token limits are reasonable (between 1K and 10M)
+        if not (1000 <= config["max_tokens_per_batch"] <= 10_000_000):
+            raise ValueError(
+                f"Qwen model '{model_name}' has unrealistic max_tokens_per_batch: "
+                f"{config['max_tokens_per_batch']} (should be 1K-10M)"
+            )
+
+        # Validate context length is reasonable
+        if not (512 <= config["context_length"] <= 1_000_000):
+            raise ValueError(
+                f"Qwen model '{model_name}' has unrealistic context_length: "
+                f"{config['context_length']} (should be 512-1M)"
+            )
+
+
+# Validate configuration at module load
+_validate_qwen_model_config()
+
+
 class OpenAIEmbeddingProvider:
-    """OpenAI embedding provider using text-embedding-3-small by default."""
+    """OpenAI embedding provider using text-embedding-3-small by default.
+
+    Thread Safety:
+        This provider is thread-safe and stateless. Multiple concurrent calls to
+        embed() and rerank() are safe. The underlying OpenAI client (httpx-based)
+        handles concurrent requests properly.
+
+        Note: Provider instances should not share mutable state. Each instance
+        maintains its own client and configuration, making concurrent operations
+        on the same instance safe.
+    """
 
     # Recommended concurrent batches for OpenAI API
     # Conservative value (8) accounts for tier-based rate limits:
@@ -107,7 +257,10 @@ class OpenAIEmbeddingProvider:
                     "For production use, explicitly set rerank_format to 'cohere' or 'tei'."
                 )
 
-        # Model-specific configuration
+        # Configure Qwen-specific batch sizes (extracted for clarity)
+        self._configure_qwen_batch_sizes(model, rerank_model, batch_size)
+
+        # Model-specific configuration for OpenAI models
         self._model_config = {
             "text-embedding-3-small": {
                 "dims": 1536,
@@ -138,6 +291,57 @@ class OpenAIEmbeddingProvider:
         # Creating AsyncOpenAI in __init__ can fail when no event loop is running
         self._client = None
         self._client_initialized = False
+
+    def _configure_qwen_batch_sizes(
+        self, model: str, rerank_model: str | None, batch_size: int
+    ) -> None:
+        """Configure Qwen-specific batch sizes if Qwen models detected.
+
+        Detects Qwen embedding and reranker models and applies model-specific
+        batch size limits to prevent OOM errors. Follows VoyageAI pattern.
+
+        Args:
+            model: Embedding model name
+            rerank_model: Optional reranker model name
+            batch_size: User-requested batch size
+        """
+        # Detect Qwen models
+        qwen_config = None
+        model_lower = model.lower()
+        rerank_model_lower = (rerank_model or "").lower()
+
+        # Check if embedding model is a Qwen model
+        if "qwen" in model_lower or model in QWEN_MODEL_CONFIG:
+            qwen_config = QWEN_MODEL_CONFIG.get(model)
+            if qwen_config:
+                logger.info(f"Detected Qwen embedding model: {model}")
+
+        # Check if rerank model is a Qwen model
+        qwen_rerank_config = None
+        if rerank_model and (
+            "qwen" in rerank_model_lower or rerank_model in QWEN_MODEL_CONFIG
+        ):
+            qwen_rerank_config = QWEN_MODEL_CONFIG.get(rerank_model)
+            if qwen_rerank_config:
+                logger.info(f"Detected Qwen reranker model: {rerank_model}")
+
+        # Apply Qwen batch size limits if detected
+        if qwen_config:
+            # Apply min(user_batch_size, model_max_batch) pattern from VoyageAI
+            effective_batch_size = min(batch_size, qwen_config["max_texts_per_batch"])
+            if effective_batch_size < batch_size:
+                logger.info(
+                    f"Limiting batch size to {effective_batch_size} "
+                    f"(model max: {qwen_config['max_texts_per_batch']})"
+                )
+            self._batch_size = effective_batch_size
+            self._qwen_model_config = qwen_config
+        else:
+            self._batch_size = batch_size
+            self._qwen_model_config = None
+
+        # Store rerank config separately for get_max_rerank_batch_size()
+        self._qwen_rerank_config = qwen_rerank_config
 
     async def _ensure_client(self) -> None:
         """Ensure the OpenAI client is initialized (must be called from async context)."""
@@ -374,8 +578,8 @@ class OpenAIEmbeddingProvider:
                         f"[{datetime.now().isoformat()}] OPENAI-PROVIDER ERROR: texts={len(validated_texts)}, max_chars={max_chars}, error={e}\n"
                     )
                     f.flush()
-            except:
-                pass
+            except (IOError, OSError):
+                pass  # Debug logging is best-effort, OK to fail silently
 
             raise
 
@@ -705,6 +909,10 @@ class OpenAIEmbeddingProvider:
 
     def get_max_tokens_per_batch(self) -> int:
         """Get maximum tokens per batch for this provider."""
+        # Check Qwen config first (higher limits for Ollama endpoints)
+        if self._qwen_model_config:
+            return self._qwen_model_config["max_tokens_per_batch"]
+        # Fall back to OpenAI model config
         if self._model in self._model_config:
             return self._model_config[self._model]["max_tokens"]
         return 8191  # Default OpenAI limit
@@ -745,7 +953,28 @@ class OpenAIEmbeddingProvider:
 
     def get_max_documents_per_batch(self) -> int:
         """Get maximum documents per batch for OpenAI provider."""
+        # Qwen config is already applied to self._batch_size in __init__
         return self._batch_size
+
+    def get_max_rerank_batch_size(self) -> int:
+        """Get maximum documents per batch for reranking operations.
+
+        Returns model-specific batch limit for reranking to prevent OOM errors.
+        For Qwen3 rerankers: 64-128 based on model size (research-based).
+        For other models: uses embedding batch size as fallback.
+
+        Returns:
+            Maximum number of documents to rerank in a single batch
+        """
+        # Use rerank-specific config if available (Qwen models)
+        if self._qwen_rerank_config and "max_rerank_batch" in self._qwen_rerank_config:
+            return self._qwen_rerank_config["max_rerank_batch"]
+        # Fall back to embedding config if rerank model is same as embedding model
+        if self._qwen_model_config and "max_rerank_batch" in self._qwen_model_config:
+            return self._qwen_model_config["max_rerank_batch"]
+        # Conservative default: limit to batch_size to prevent unbounded requests
+        # Research shows 32-128 is optimal for GPU reranking
+        return min(self._batch_size, 128)
 
     def get_recommended_concurrency(self) -> int:
         """Get recommended number of concurrent batches for OpenAI.
@@ -845,10 +1074,164 @@ class OpenAIEmbeddingProvider:
     async def rerank(
         self, query: str, documents: list[str], top_k: int | None = None
     ) -> list[RerankResult]:
-        """Rerank documents using configured rerank model.
+        """Rerank documents using configured rerank model with automatic batch splitting.
+
+        Implements batch splitting to prevent OOM errors on large document sets.
+        For Qwen3 rerankers: uses model-specific batch limits (64-128).
+        Results are aggregated across batches and sorted by relevance score.
 
         Supports both Cohere and TEI (Text Embeddings Inference) formats.
         Format can be explicitly set or auto-detected from response.
+
+        Args:
+            query: The search query
+            documents: List of documents to rerank
+            top_k: Optional limit on number of results to return
+
+        Returns:
+            List of RerankResult objects sorted by relevance score (highest first)
+        """
+        if not documents:
+            return []
+
+        # Get model-specific batch size limit
+        batch_size_limit = self.get_max_rerank_batch_size()
+
+        # Single batch case - use original logic for efficiency
+        if len(documents) <= batch_size_limit:
+            logger.debug(f"Reranking {len(documents)} documents in single batch")
+            results = await self._rerank_single_batch(query, documents, top_k)
+
+            # Apply client-side top_k for formats without server-side support (TEI)
+            # Cohere includes top_n in request, but we apply this uniformly for consistency
+            if top_k is not None and len(results) > top_k:
+                # Results from _rerank_single_batch are already sorted descending by score
+                results = results[:top_k]
+                logger.debug(f"Applied client-side top_k filter: {len(results)} results")
+
+            return results
+
+        # Multiple batches required - split and aggregate
+        logger.info(
+            f"Splitting {len(documents)} documents into batches of {batch_size_limit} "
+            f"for reranking (model: {self._rerank_model})"
+        )
+
+        all_results = []
+        num_batches = math.ceil(len(documents) / batch_size_limit)
+        failed_batches = 0
+
+        for batch_idx in range(num_batches):
+            start_idx = batch_idx * batch_size_limit
+            end_idx = min(start_idx + batch_size_limit, len(documents))
+            batch_documents = documents[start_idx:end_idx]
+
+            logger.debug(
+                f"Reranking batch {batch_idx + 1}/{num_batches}: "
+                f"documents {start_idx}-{end_idx}"
+            )
+
+            # Retry logic for this batch (following VoyageAI pattern)
+            batch_results = None
+            for attempt in range(self._retry_attempts):
+                try:
+                    # Rerank this batch without top_k limit (we'll apply globally)
+                    batch_results = await self._rerank_single_batch(
+                        query, batch_documents, top_k=None
+                    )
+                    break  # Success - exit retry loop
+                except Exception as e:
+                    # Classify error as retryable or not
+                    error_str = str(e).lower()
+                    is_retryable = any([
+                        "timeout" in error_str,
+                        "connection" in error_str,
+                        "503" in error_str,  # Service unavailable
+                        "429" in error_str,  # Rate limit
+                    ])
+
+                    if is_retryable and attempt < self._retry_attempts - 1:
+                        # Exponential backoff
+                        delay = self._retry_delay * (2 ** attempt)
+                        logger.warning(
+                            f"Batch {batch_idx + 1} failed (attempt {attempt + 1}), "
+                            f"retrying in {delay}s: {e}"
+                        )
+                        await asyncio.sleep(delay)
+                        continue
+                    else:
+                        # Last attempt or non-retryable error
+                        logger.error(
+                            f"Batch {batch_idx + 1} failed after {attempt + 1} attempts: {e}"
+                        )
+                        # Continue to next batch instead of failing entire operation
+                        batch_results = []
+                        failed_batches += 1
+                        break
+
+            # Process results if batch succeeded
+            if batch_results:
+                # Adjust indices to be relative to original document list
+                # Use immutable pattern instead of mutation
+                for result in batch_results:
+                    # Validate index is within batch bounds (handles negative indices)
+                    if result.index < 0 or result.index >= len(batch_documents):
+                        logger.warning(
+                            f"Invalid index {result.index} from rerank API "
+                            f"(batch size: {len(batch_documents)}), skipping result"
+                        )
+                        continue
+
+                    # Create new RerankResult with adjusted index
+                    adjusted_result = RerankResult(
+                        index=result.index + start_idx,
+                        score=result.score
+                    )
+                    all_results.append(adjusted_result)
+
+        # Warn if any batches failed
+        if failed_batches > 0:
+            logger.warning(
+                f"Reranking completed with partial failures: {failed_batches} of "
+                f"{num_batches} batches failed. Results may be incomplete."
+            )
+
+        # Apply top_k selection efficiently using heapq when beneficial
+        if top_k is not None and top_k < len(all_results) * 0.5:
+            # Use heap-based selection for better performance when k << n
+            # heapq.nlargest is O(n log k) vs sort O(n log n)
+            all_results = heapq.nlargest(top_k, all_results, key=lambda r: r.score)
+        else:
+            # Sort all results when returning most/all of them
+            all_results.sort(key=lambda r: r.score, reverse=True)
+            if top_k is not None and top_k < len(all_results):
+                all_results = all_results[:top_k]
+
+        logger.debug(
+            f"Reranked {len(documents)} documents across {num_batches} batches "
+            f"({num_batches - failed_batches} succeeded), returning {len(all_results)} results"
+        )
+
+        return all_results
+
+    async def _rerank_single_batch(
+        self,
+        query: str,
+        documents: list[str],
+        top_k: int | None = None,
+    ) -> list[RerankResult]:
+        """Internal method to rerank a single batch of documents with format detection.
+
+        Supports both Cohere and TEI (Text Embeddings Inference) formats.
+        Format can be explicitly set or auto-detected from response.
+
+        Args:
+            query: The search query
+            documents: List of documents to rerank (single batch)
+            top_k: Optional limit on number of results
+
+        Returns:
+            List of RerankResult objects with indices relative to input documents
         """
         await self._ensure_client()
 
