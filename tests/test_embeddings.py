@@ -864,10 +864,6 @@ async def test_concurrent_rerank_calls():
 
         results_list = await asyncio.gather(*tasks, return_exceptions=True)
 
-        # Check if mock server returned empty results (HTTP parsing issue)
-        if all(len(r) == 0 for r in results_list if not isinstance(r, Exception)):
-            pytest.skip("Mock server HTTP parsing issue - returned empty results (use vLLM/TEI for full testing)")
-
         # All should succeed
         for i, results in enumerate(results_list):
             if isinstance(results, Exception):

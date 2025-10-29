@@ -8,11 +8,6 @@ This lightweight server provides a /rerank endpoint compatible with both:
 
 Auto-detects format from request for testing purposes without requiring
 heavy dependencies like vLLM or TEI servers.
-
-LIMITATIONS:
-- Simple HTTP parsing may fail with some HTTP clients (e.g., httpx in some configs)
-- For comprehensive testing, use a real reranking service (vLLM, TEI)
-- Suitable for basic format testing and development only
 """
 
 import asyncio
@@ -21,6 +16,7 @@ import sys
 from typing import Any
 
 import httpx
+from aiohttp import web
 from loguru import logger
 
 # Configure logger for testing
@@ -29,19 +25,20 @@ logger.add(sys.stderr, level="INFO", format="{time:HH:mm:ss} | {level} | {messag
 
 
 class MockRerankServer:
-    """Mock reranking server with Cohere and TEI compatible API."""
+    """Mock reranking server with Cohere and TEI compatible API using aiohttp."""
 
     def __init__(self, host: str = "127.0.0.1", port: int = 8001):
         self.host = host
         self.port = port
-        self.server = None
+        self.app = None
+        self.runner = None
         self.site = None
-        
-    async def health_handler(self, request: dict) -> dict:
+
+    async def health_handler(self, request: web.Request) -> web.Response:
         """Handle health check requests."""
-        return {"healthy": True, "service": "mock-rerank-server"}
-    
-    async def rerank_handler(self, request: dict) -> dict:
+        return web.json_response({"healthy": True, "service": "mock-rerank-server"})
+
+    async def rerank_handler(self, request: web.Request) -> web.Response:
         """Handle reranking requests with Cohere and TEI compatible API.
 
         Auto-detects format from request:
@@ -50,7 +47,7 @@ class MockRerankServer:
         """
         try:
             # Parse request body
-            body = request.get("body", {})
+            body = await request.json()
 
             # Extract parameters and detect format
             query = body.get("query", "")
@@ -87,11 +84,11 @@ class MockRerankServer:
                 f"Reranked {len(documents)} documents, returning {len(results)} results ({format_name} format)"
             )
 
-            return {"results": results, "model": model, "meta": {"api_version": "v1"}}
+            return web.json_response({"results": results, "model": model, "meta": {"api_version": "v1"}})
 
         except Exception as e:
             logger.error(f"Error in rerank handler: {e}")
-            return {"error": str(e), "status": 400}
+            return web.json_response({"error": str(e)}, status=400)
     
     def _calculate_relevance(self, query: str, document: str) -> float:
         """
@@ -139,101 +136,46 @@ class MockRerankServer:
         # Ensure score is between 0 and 1
         return min(max(score, 0.0), 1.0)
     
-    async def handle_request(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-        """Handle incoming HTTP requests."""
-        try:
-            # Read request
-            request_data = await reader.read(65536)  # 64KB max
-            request_str = request_data.decode('utf-8')
-            
-            # Parse HTTP request
-            lines = request_str.split('\r\n')
-            if not lines:
-                return
-                
-            # Get request line
-            request_line = lines[0].split()
-            if len(request_line) < 2:
-                return
-                
-            method = request_line[0]
-            path = request_line[1]
-            
-            # Find body (after empty line)
-            body_str = ""
-            body_start = False
-            for line in lines:
-                if body_start:
-                    body_str += line
-                elif line == "":
-                    body_start = True
-            
-            # Parse JSON body if present
-            body = {}
-            if body_str:
-                try:
-                    body = json.loads(body_str)
-                except json.JSONDecodeError:
-                    pass
-            
-            # Route request
-            if path == "/health":
-                response_data = await self.health_handler({"method": method})
-            elif path == "/rerank":
-                response_data = await self.rerank_handler({"method": method, "body": body})
-            else:
-                response_data = {"error": "Not found", "status": 404}
-            
-            # Prepare response
-            status = response_data.pop("status", 200)
-            status_text = "OK" if status == 200 else "Bad Request" if status == 400 else "Not Found"
-            response_body = json.dumps(response_data)
-            
-            # Send HTTP response
-            response = f"HTTP/1.1 {status} {status_text}\r\n"
-            response += "Content-Type: application/json\r\n"
-            response += f"Content-Length: {len(response_body)}\r\n"
-            response += "Connection: close\r\n"
-            response += "\r\n"
-            response += response_body
-            
-            writer.write(response.encode('utf-8'))
-            await writer.drain()
-            
-        except Exception as e:
-            logger.error(f"Error handling request: {e}")
-        finally:
-            writer.close()
-            await writer.wait_closed()
-    
     async def start(self) -> None:
         """Start the mock server."""
         logger.info(f"Starting mock rerank server on {self.host}:{self.port}")
-        
-        self.server = await asyncio.start_server(
-            self.handle_request,
-            self.host,
-            self.port
-        )
-        
+
+        # Create aiohttp application
+        self.app = web.Application()
+        self.app.router.add_get("/health", self.health_handler)
+        self.app.router.add_post("/rerank", self.rerank_handler)
+
+        # Start server
+        self.runner = web.AppRunner(self.app)
+        await self.runner.setup()
+        self.site = web.TCPSite(self.runner, self.host, self.port)
+        await self.site.start()
+
         logger.info(f"Mock rerank server listening on http://{self.host}:{self.port}")
         logger.info(f"Endpoints: /health, /rerank")
-    
+
     async def stop(self) -> None:
         """Stop the mock server."""
-        if self.server:
+        if self.site:
             logger.info("Stopping mock rerank server")
-            self.server.close()
-            await self.server.wait_closed()
-            self.server = None
-    
+            await self.site.stop()
+            self.site = None
+        if self.runner:
+            await self.runner.cleanup()
+            self.runner = None
+        self.app = None
+
     async def serve_forever(self) -> None:
         """Run the server until interrupted."""
-        if not self.server:
+        if not self.runner:
             await self.start()
-        
-        async with self.server:
-            await self.server.serve_forever()
+
+        # Keep running until stopped
+        try:
+            while True:
+                await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            await self.stop()
 
 
 async def test_server():
