@@ -11,6 +11,8 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Sequence
+from bisect import bisect_left
+from time import perf_counter
 
 from chunkhound.core.models.chunk import Chunk
 from chunkhound.core.types.common import ChunkType, FileId, Language, LineNumber
@@ -51,6 +53,15 @@ class RapidYamlParser(LanguageParser):
         self._count_ryml_ok = 0
         self._count_ryml_fail = 0
         self._count_fallback_ts = 0
+        # Perf counters
+        self._t_sanitize = 0.0
+        self._t_parse_in_place = 0.0
+        self._t_emit_yaml = 0.0
+        self._t_locate = 0.0
+        self._emit_calls = 0
+        self._locate_calls = 0
+        self._rewrite_counts: Counter[str] = Counter()
+        self._pre_skip_reasons: Counter[str] = Counter()
 
         if self._enabled:
             try:
@@ -114,7 +125,9 @@ class RapidYamlParser(LanguageParser):
         if not self._can_use_rapid():
             return self._fallback.parse_content(content, file_path, file_id)
 
+        t0 = perf_counter()
         sanitized = sanitize_helm_templates(content)
+        self._t_sanitize += perf_counter() - t0
         effective_content = sanitized.text
         fallback_source = effective_content if sanitized.changed else content
         if sanitized.changed:
@@ -126,12 +139,27 @@ class RapidYamlParser(LanguageParser):
                 path_str,
                 summary,
             )
+            # Aggregate rewrite kinds for summary
+            try:
+                self._rewrite_counts.update(r.kind for r in sanitized.rewrites)
+            except Exception:
+                pass
 
         # If sanitizer advises pre-skip (eg, non-YAML fragments), avoid ryml churn
         if getattr(sanitized, "pre_skip", False):
+            # Pre-skip files: attempt one last parse via tree-sitter fallback only
             self._count_pre_skip += 1
+            try:
+                reason = getattr(sanitized, "pre_skip_reason", None) or "unknown"
+                self._pre_skip_reasons.update([str(reason)])
+            except Exception:
+                pass
             self._count_fallback_ts += 1
-            return []
+            try:
+                return self._fallback.parse_content(content, file_path, file_id)
+            except Exception:
+                # If fallback also fails, treat as empty
+                return []
 
         if _has_complex_keys(effective_content):
             path_str = str(file_path) if file_path else "<memory>"
@@ -147,13 +175,21 @@ class RapidYamlParser(LanguageParser):
             return []
 
         try:
+            perf = _RymlPerf()
             builder = _RapidYamlChunkBuilder(
                 self._ryml,
                 self._tree,
                 effective_content,
                 file_id or FileId(0),
+                perf=perf,
             )
             chunks = builder.build_chunks()
+            # Accumulate perf
+            self._t_parse_in_place += perf.parse_in_place
+            self._t_emit_yaml += perf.emit_yaml
+            self._t_locate += perf.locate
+            self._emit_calls += perf.emit_calls
+            self._locate_calls += perf.locate_calls
             self._count_ryml_ok += 1
             return chunks
         except Exception as exc:
@@ -198,14 +234,30 @@ class RapidYamlParser(LanguageParser):
 
     def cleanup(self) -> None:
         # Emit one-line summary for this parser instance
+        top_rewrites = ", ".join(
+            f"{k}={v}" for k, v in self._rewrite_counts.most_common(6)
+        ) or "-"
         logger.info(
-            "RapidYAML summary: sanitized=%d pre_skip=%d complex_skip=%d ryml_ok=%d ryml_fail=%d fallback_ts=%d",
+            (
+                "RapidYAML summary: sanitized=%d pre_skip=%d complex_skip=%d "
+                "ryml_ok=%d ryml_fail=%d fallback_ts=%d | "
+                "t_sanitize=%.2fs t_parse=%.2fs t_emit=%.2fs t_locate=%.2fs | "
+                "emits=%d locates=%d | top_rewrites=[%s] | pre_skip_reasons=%s"
+            ),
             self._count_sanitized,
             self._count_pre_skip,
             self._count_complex_skip,
             self._count_ryml_ok,
             self._count_ryml_fail,
             self._count_fallback_ts,
+            self._t_sanitize,
+            self._t_parse_in_place,
+            self._t_emit_yaml,
+            self._t_locate,
+            self._emit_calls,
+            self._locate_calls,
+            top_rewrites,
+            dict(self._pre_skip_reasons),
         )
         # Delegate cleanup if supported
         if hasattr(self._fallback, "cleanup"):
@@ -232,6 +284,15 @@ class RapidYamlParser(LanguageParser):
 
 
 @dataclass
+class _RymlPerf:
+    parse_in_place: float = 0.0
+    emit_yaml: float = 0.0
+    locate: float = 0.0
+    emit_calls: int = 0
+    locate_calls: int = 0
+
+
+@dataclass
 class _LineLocator:
     """Utility to approximate line ranges for emitted YAML blocks."""
 
@@ -239,19 +300,39 @@ class _LineLocator:
     depth_positions: List[int]
     fallback_line: int = 0
 
-    def __init__(self, content: str) -> None:
+    perf: _RymlPerf | None = None
+
+    def __init__(self, content: str, perf: _RymlPerf | None = None) -> None:
         self.lines = content.splitlines()
         self.depth_positions = [0]
         self.fallback_line = 0
+        self.perf = perf
+        # Precompute stripped lines to avoid repeated .strip()
+        self._stripped_lines: List[str] = [ln.strip() for ln in self.lines]
+        # Build an index map for exact-match lookups: stripped_line -> sorted list of indices
+        self._index_map: dict[str, List[int]] = {}
+        for idx, s in enumerate(self._stripped_lines):
+            if not s:
+                continue
+            bucket = self._index_map.get(s)
+            if bucket is None:
+                self._index_map[s] = [idx]
+            else:
+                bucket.append(idx)
 
     def truncate(self, depth: int) -> None:
         if depth + 1 < len(self.depth_positions):
             self.depth_positions = self.depth_positions[: depth + 1]
 
     def locate(self, first_line: str, depth: int) -> tuple[int, int]:
+        _t0 = perf_counter()
         if not self.lines:
             self.fallback_line += 1
-            return self.fallback_line, self.fallback_line
+            start, end = self.fallback_line, self.fallback_line
+            if self.perf is not None:
+                self.perf.locate += perf_counter() - _t0
+                self.perf.locate_calls += 1
+            return start, end
 
         while len(self.depth_positions) <= depth:
             self.depth_positions.append(self.depth_positions[-1])
@@ -269,18 +350,30 @@ class _LineLocator:
             self.depth_positions[i] = max(self.depth_positions[i], idx + 1)
 
         end_idx = self._compute_block_end(idx)
-        return idx + 1, end_idx + 1
+        start, end = idx + 1, end_idx + 1
+        if self.perf is not None:
+            self.perf.locate += perf_counter() - _t0
+            self.perf.locate_calls += 1
+        return start, end
 
     def _find_from(self, target_line: str, start: int) -> int | None:
         stripped_target = target_line.strip()
         if not stripped_target:
             return None
 
-        for idx in range(max(0, start), len(self.lines)):
-            candidate = self.lines[idx].strip()
-            if not candidate:
+        # Fast path: exact matches via pre-indexed positions
+        positions = self._index_map.get(stripped_target)
+        if positions:
+            pos = bisect_left(positions, max(0, start))
+            if pos < len(positions):
+                return positions[pos]
+
+        # Fallback: prefix match scan from start
+        for idx in range(max(0, start), len(self._stripped_lines)):
+            cand = self._stripped_lines[idx]
+            if not cand:
                 continue
-            if candidate == stripped_target or candidate.startswith(stripped_target):
+            if cand.startswith(stripped_target):
                 return idx
         return None
 
@@ -313,21 +406,25 @@ class _LineLocator:
 class _RapidYamlChunkBuilder:
     """Walks a RapidYAML tree and produces Chunk objects."""
 
-    def __init__(self, ryml_module, tree, content: str, file_id: FileId) -> None:
+    def __init__(self, ryml_module, tree, content: str, file_id: FileId, perf: _RymlPerf | None = None) -> None:
         self.ryml = ryml_module
         self.tree = tree
         self.file_id = file_id
         self.content = content
         self._buffer = bytearray(content.encode("utf-8"))
         self.lines = content.splitlines()
-        self.locator = _LineLocator(content)
+        self.perf = perf
+        self.locator = _LineLocator(content, perf=self.perf)
         self._decoder = ryml_module.u
 
     def build_chunks(self) -> list[Chunk]:
         self.tree.clear()
         self.tree.clear_arena()
         with _suppress_c_output():
+            _t0 = perf_counter()
             self.ryml.parse_in_place(self._buffer, tree=self.tree)
+            if self.perf is not None:
+                self.perf.parse_in_place += perf_counter() - _t0
 
         root = self.tree.root_id()
         chunks: list[Chunk] = []
@@ -366,7 +463,11 @@ class _RapidYamlChunkBuilder:
         self, node: int, node_type: str, symbol: str, depth: int
     ) -> Chunk | None:
         with _suppress_c_output():
+            _t0 = perf_counter()
             emitted = self.ryml.emit_yaml(self.tree, node)
+            if self.perf is not None:
+                self.perf.emit_yaml += perf_counter() - _t0
+                self.perf.emit_calls += 1
         normalized = emitted.lstrip("\n")
         first_line = normalized.splitlines()[0] if normalized else symbol
         start_line, end_line = self.locator.locate(first_line, depth)

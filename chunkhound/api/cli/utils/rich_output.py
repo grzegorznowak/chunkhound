@@ -268,6 +268,10 @@ class RichOutputFormatter:
     def create_progress_display(self) -> "ProgressManager":
         """Create a modern progress display with multiple bars."""
 
+        # Fallback: no Rich/TTY support → return a no-op manager
+        if not self._terminal_compatible or self.console is None:
+            return _NoRichProgressManager()
+
         # Create custom text columns that handle missing fields gracefully
         def render_field(
             task, field_name: str, default: str = "", style: str = ""
@@ -537,6 +541,83 @@ class ProgressManager:
     def get_progress_instance(self) -> Progress:
         """Get the underlying Progress instance for service layer use."""
         return self.progress
+
+
+class _NoRichProgressManager:
+    """No-op progress manager for terminals that don't support Rich/output encoding.
+
+    Provides the same methods but avoids creating any Rich objects. Used on
+    Windows consoles with non-UTF8 code pages and non-TTY environments to
+    prevent Unicode/encoding failures (e.g., bullets, box characters).
+    """
+
+    def __enter__(self) -> "_NoRichProgressManager":
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        return None
+
+    def add_task(self, *args, **kwargs):  # noqa: ANN001
+        return 0
+
+    def update_task(self, *args, **kwargs) -> None:  # noqa: ANN001
+        return None
+
+    def get_task_id(self, *args, **kwargs):  # noqa: ANN001
+        return None
+
+    def finish_task(self, *args, **kwargs) -> None:  # noqa: ANN001
+        return None
+
+    def add_subtask(self, *args, **kwargs):  # noqa: ANN001
+        return 0
+
+    def get_progress_instance(self):  # noqa: ANN001
+        # Return a minimal shim object that mimics the Rich Progress API
+        # used by service layers (add_task, advance, update, tasks mapping).
+        class _Shim:
+            def __init__(self) -> None:
+                self._next_id = 1
+                # Minimal task object with .total and .completed attributes
+                class _Task:
+                    def __init__(self, total: int | None = None) -> None:
+                        self.total = total
+                        self.completed = 0
+
+                self._Task = _Task
+                self.tasks: dict[int, _Task] = {}
+
+            def add_task(  # noqa: ANN001
+                self, description: str, total: int | None = None, **_: Any
+            ) -> int:
+                task_id = self._next_id
+                self._next_id += 1
+                self.tasks[task_id] = self._Task(total)
+                return task_id
+
+            def update(self, task_id: int, **kwargs: Any) -> None:  # noqa: ANN001, D401
+                # Support patterns used in codebase: advance, total, completed
+                task = self.tasks.get(task_id)
+                if not task:
+                    return
+                advance = int(kwargs.pop("advance", 0)) if "advance" in kwargs else 0
+                if advance:
+                    task.completed += advance
+                if "total" in kwargs and kwargs["total"] is not None:
+                    task.total = int(kwargs["total"])
+                if "completed" in kwargs and kwargs["completed"] is not None:
+                    task.completed = int(kwargs["completed"])
+                # Ignore any other Rich-specific fields (description, speed, info)
+                return None
+
+            def advance(self, task_id: int, step: int = 1) -> None:  # noqa: ANN001
+                task = self.tasks.get(task_id)
+                if not task:
+                    return
+                task.completed += int(step)
+                return None
+
+        return _Shim()
 
 
 def format_stats(stats: Any) -> str:

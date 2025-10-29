@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Callable
+import re
 
 _PLACEHOLDER_BLOCK = "__CH_TPL_BLOCK__"
 _PLACEHOLDER_ITEM = "__CH_TPL_ITEM__"
@@ -19,13 +20,6 @@ _BLOCK_TEMPLATE_HINTS = (
 )
 
 # Non-YAML fragments where RapidYAML brings little value and often fails
-_NON_YAML_MARKERS = (
-    "<?xml",
-    "server {",
-    "%%httpGet",
-)
-
-
 _CTRL_KEYWORDS = (
     "if",
     "else if",
@@ -37,16 +31,17 @@ _CTRL_KEYWORDS = (
     "define",
 )
 
-# Non-YAML fragments where RapidYAML brings little value and often fails
-_NON_YAML_MARKERS = (
-    "<?xml",
-    "server {",
-    "%%httpGet",
-)
+_NON_YAML_MARKERS = ("<?xml", "server {", "%%httpGet")
 
 # Threshold of templated lines inside a single block scalar beyond which
 # we pre-skip trying RapidYAML entirely.
 _BLOCK_SCALAR_TPL_THRESHOLD = 12
+
+# Pre-compiled regexes (performance)
+_TPL_QUOTED_KEY_RE = re.compile(r'"{{.*?}}"\s*:')
+# Broad match: any quoted key that contains a template anywhere inside quotes
+_TPL_QUOTED_ANY_RE = re.compile(r'"[^"\n]*{{[^"\n]*}}[^"\n]*"\s*:')
+_COMPLEX_KEY_SINGLE_RE = re.compile(r'^(?P<indent>\s*)\?\s*(?P<key>.+?):(\s*)(?P<rest>.*)$')
 
 
 @dataclass(frozen=True)
@@ -67,8 +62,6 @@ class SanitizedYaml:
     rewrites: list[TemplateRewrite] = field(default_factory=list)
     pre_skip: bool = False
     pre_skip_reason: str | None = None
-    pre_skip: bool = False
-    pre_skip_reason: str | None = None
 
     @property
     def changed(self) -> bool:
@@ -81,15 +74,10 @@ def sanitize_helm_templates(content: str) -> SanitizedYaml:
     if not content:
         return SanitizedYaml(text=content, rewrites=[])
 
-    lines = content.splitlines(keepends=True)
     sanitized: list[str] = []
     rewrites: list[TemplateRewrite] = []
 
-    in_block_scalar = False
-    block_scalar_indent = 0
-    in_template_comment = False
-
-    # Pre-skip for obvious non-YAML fragments
+    # Pre-skip for obvious non-YAML fragments (single pass)
     if any(marker in content for marker in _NON_YAML_MARKERS):
         return SanitizedYaml(
             text=content,
@@ -98,13 +86,25 @@ def sanitize_helm_templates(content: str) -> SanitizedYaml:
             pre_skip_reason="non_yaml_fragment",
         )
 
-    # Pre-skip: templated key (e.g., "{{ template ... }}": value)
-    for _ln in content.splitlines():
+    # Fast path: no templating markers at all → nothing to sanitize
+    # Avoids regex passes on the majority of plain YAML files.
+    if "{{" not in content and "}}" not in content:
+        return SanitizedYaml(text=content, rewrites=[])
+
+    # Only split lines if we will actually sanitize
+    lines = content.splitlines(keepends=True)
+
+    # Pre-skip: templated quoted key (robust to nested quotes around inner template)
+    for _ln in lines:
         s = _ln.strip()
-        # Find colon boundary and inspect the key portion
         if ":" in s:
             key_part = s.split(":", 1)[0].strip()
-            if (key_part.startswith(("'", '"')) and key_part.endswith(("'", '"')) and "{{" in key_part and "}}" in key_part):
+            if (
+                key_part.startswith(("'", '"'))
+                and key_part.endswith(("'", '"'))
+                and "{{" in key_part
+                and "}}" in key_part
+            ):
                 return SanitizedYaml(
                     text=content,
                     rewrites=[],
@@ -112,16 +112,67 @@ def sanitize_helm_templates(content: str) -> SanitizedYaml:
                     pre_skip_reason="templated_key",
                 )
 
-    # Pre-skip for files that clearly embed non-YAML fragments
-    if any(marker in content for marker in _NON_YAML_MARKERS):
-        return SanitizedYaml(
-            text=content,
-            rewrites=[],
-            pre_skip=True,
-            pre_skip_reason="non_yaml_fragment",
-        )
+    in_block_scalar = False
+    block_scalar_indent = 0
+    in_template_comment = False
 
     templated_lines_in_block = 0
+
+    # Heuristic salvage: templated/complex keys
+    # Compile patterns once at module import for speed.
+    templated_key_token = _TPL_QUOTED_KEY_RE
+    cx_single = _COMPLEX_KEY_SINGLE_RE
+
+    # Multiline complex key pattern: a line that's just '?' (possibly spaces)
+    i = 0
+    out_lines: list[str] = []
+    while i < len(lines):
+        core, nl = _split_newline(lines[i])
+        indent, stripped = _split_indent(core)
+
+        # Single-line complex key salvage
+        m = cx_single.match(core)
+        if m:
+            out_lines.append(f'{m.group("indent")}"__CH_TPL_CKEY__": {m.group("rest")}{nl}')
+            i += 1
+            continue
+
+        # Multiline complex key salvage
+        if stripped == "?":
+            base_indent = len(indent)
+            j = i + 1
+            colon_line = None
+            while j < len(lines):
+                c2, nl2 = _split_newline(lines[j])
+                ind2, strip2 = _split_indent(c2)
+                if len(ind2) <= base_indent:
+                    # Potential end; colon line must be here
+                    if ":" in strip2:
+                        colon_line = (c2, nl2)
+                        j += 1
+                    break
+                j += 1
+            if colon_line is not None:
+                c2, nl2 = colon_line
+                # Replace the whole region with a scalar key
+                after = c2.split(":", 1)[1]
+                out_lines.append(f'{indent}"__CH_TPL_CKEY__":{after}{nl2}')
+                i = j
+                continue
+            # If no colon found at same indent, fall through (keep as-is)
+
+        # Templated key token anywhere in line → salvage
+        if templated_key_token.search(core):
+            new_core = templated_key_token.sub('"__CH_TPL_KEY__":', core)
+            out_lines.append(new_core + nl if not core.endswith(nl) else new_core)
+            i += 1
+            continue
+
+        out_lines.append(lines[i])
+        i += 1
+
+    # Now process line-by-line with deeper rules
+    lines = out_lines
 
     for idx, original in enumerate(lines, start=1):
         core, newline = _split_newline(original)
