@@ -212,8 +212,8 @@ class TestServerStartup:
             )
 
             try:
-                # Wait for server startup with timeout
-                await asyncio.wait_for(asyncio.sleep(3), timeout=30.0)
+                # Wait for server startup with timeout (5s for slower CI environments)
+                await asyncio.wait_for(asyncio.sleep(5), timeout=30.0)
 
                 # Verify server is running
                 if proc.returncode is not None:
