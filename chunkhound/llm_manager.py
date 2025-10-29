@@ -5,7 +5,6 @@ from typing import Any
 from loguru import logger
 
 from chunkhound.interfaces.llm_provider import LLMProvider
-from chunkhound.providers.llm.anthropic_bedrock_provider import AnthropicBedrockProvider
 from chunkhound.providers.llm.claude_code_cli_provider import ClaudeCodeCLIProvider
 from chunkhound.providers.llm.openai_llm_provider import OpenAILLMProvider
 
@@ -22,7 +21,6 @@ class LLMManager:
     _providers: dict[str, type[LLMProvider]] = {
         "openai": OpenAILLMProvider,
         "claude-code-cli": ClaudeCodeCLIProvider,
-        "anthropic-bedrock": AnthropicBedrockProvider,
     }
 
     def __init__(
@@ -75,15 +73,6 @@ class LLMManager:
                 "timeout": config.get("timeout", 60),
                 "max_retries": config.get("max_retries", 3),
             }
-
-            # Add Bedrock-specific parameters (for anthropic-bedrock provider)
-            if "bedrock_region" in config:
-                provider_kwargs["bedrock_region"] = config["bedrock_region"]
-            if "aws_profile" in config:
-                # Map config field name to boto3 parameter name
-                # Config uses 'aws_profile' (matches AWS_PROFILE env var)
-                # boto3.Session expects 'profile_name' parameter
-                provider_kwargs["profile_name"] = config["aws_profile"]
 
             provider = provider_class(**provider_kwargs)
             return provider

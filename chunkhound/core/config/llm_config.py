@@ -41,8 +41,8 @@ class LLMConfig(BaseSettings):
     )
 
     # Provider Selection
-    provider: Literal["openai", "ollama", "claude-code-cli", "anthropic-bedrock"] = Field(
-        default="openai", description="LLM provider (openai, ollama, claude-code-cli, anthropic-bedrock)"
+    provider: Literal["openai", "ollama", "claude-code-cli"] = Field(
+        default="openai", description="LLM provider (openai, ollama, claude-code-cli)"
     )
 
     # Model Configuration (dual-model architecture)
@@ -64,21 +64,8 @@ class LLMConfig(BaseSettings):
         default=None,
         description=(
             "Provider-specific base URL: "
-            "OpenAI/Ollama: API endpoint (e.g., http://localhost:11434/v1); "
-            "Bedrock: VPC endpoint URL for private deployments "
-            "(e.g., https://vpce-123.bedrock-runtime.us-west-2.vpce.amazonaws.com)"
+            "OpenAI/Ollama: API endpoint (e.g., http://localhost:11434/v1)"
         ),
-    )
-
-    # AWS Bedrock configuration
-    bedrock_region: str | None = Field(
-        default=None,
-        description="AWS region for Bedrock (falls back to AWS_REGION env var if not set)",
-    )
-
-    aws_profile: str | None = Field(
-        default=None,
-        description="AWS profile name from ~/.aws/credentials (overrides AWS_PROFILE env var)",
     )
 
     # Internal settings
@@ -124,12 +111,6 @@ class LLMConfig(BaseSettings):
         if self.base_url:
             base_config["base_url"] = self.base_url
 
-        # Add Bedrock-specific configuration (for anthropic-bedrock provider)
-        if self.bedrock_region:
-            base_config["bedrock_region"] = self.bedrock_region
-        if self.aws_profile:
-            base_config["aws_profile"] = self.aws_profile
-
         # Build utility config
         utility_config = base_config.copy()
         utility_config["model"] = self.utility_model or utility_default
@@ -150,9 +131,6 @@ class LLMConfig(BaseSettings):
         # Provider-specific smart defaults
         if self.provider == "openai":
             return ("gpt-5-nano", "gpt-5")
-        elif self.provider == "anthropic-bedrock":
-            # Bedrock: Haiku 4.5 for both (synthesis-capable + cost-effective, unlike older Haiku)
-            return ("anthropic.claude-haiku-4-5-20251001-v1:0", "anthropic.claude-haiku-4-5-20251001-v1:0")
         elif self.provider == "ollama":
             # Ollama: use same model for both (local deployment)
             return ("llama3.2", "llama3.2")
@@ -170,10 +148,9 @@ class LLMConfig(BaseSettings):
         Returns:
             True if provider is properly configured
         """
-        if self.provider in ("ollama", "claude-code-cli", "anthropic-bedrock"):
+        if self.provider in ("ollama", "claude-code-cli"):
             # Ollama and Claude Code CLI don't require API key
             # Claude Code CLI uses subscription-based authentication
-            # Anthropic Bedrock uses AWS credentials
             return True
         else:
             # OpenAI and Anthropic require API key
@@ -189,7 +166,7 @@ class LLMConfig(BaseSettings):
         missing = []
 
         if (
-            self.provider not in ("ollama", "claude-code-cli", "anthropic-bedrock")
+            self.provider not in ("ollama", "claude-code-cli")
             and not self.api_key
         ):
             missing.append("api_key (set CHUNKHOUND_LLM_API_KEY)")
@@ -221,18 +198,8 @@ class LLMConfig(BaseSettings):
 
         parser.add_argument(
             "--llm-provider",
-            choices=["openai", "ollama", "claude-code-cli", "anthropic-bedrock"],
+            choices=["openai", "ollama", "claude-code-cli"],
             help="LLM provider (default: openai)",
-        )
-
-        parser.add_argument(
-            "--llm-bedrock-region",
-            help="AWS region for Bedrock provider (uses AWS_REGION if not specified)",
-        )
-
-        parser.add_argument(
-            "--llm-aws-profile",
-            help="AWS profile from ~/.aws/credentials (uses AWS_PROFILE if not specified)",
         )
 
     @classmethod
@@ -250,10 +217,6 @@ class LLMConfig(BaseSettings):
             config["utility_model"] = utility_model
         if synthesis_model := os.getenv("CHUNKHOUND_LLM_SYNTHESIS_MODEL"):
             config["synthesis_model"] = synthesis_model
-        if bedrock_region := os.getenv("CHUNKHOUND_LLM_BEDROCK_REGION"):
-            config["bedrock_region"] = bedrock_region
-        if aws_profile := os.getenv("CHUNKHOUND_LLM_AWS_PROFILE"):
-            config["aws_profile"] = aws_profile
 
         return config
 
@@ -272,10 +235,6 @@ class LLMConfig(BaseSettings):
             overrides["base_url"] = args.llm_base_url
         if hasattr(args, "llm_provider") and args.llm_provider:
             overrides["provider"] = args.llm_provider
-        if hasattr(args, "llm_bedrock_region") and args.llm_bedrock_region:
-            overrides["bedrock_region"] = args.llm_bedrock_region
-        if hasattr(args, "llm_aws_profile") and args.llm_aws_profile:
-            overrides["aws_profile"] = args.llm_aws_profile
 
         return overrides
 
