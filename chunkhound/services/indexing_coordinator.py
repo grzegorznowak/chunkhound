@@ -214,6 +214,79 @@ class IndexingCoordinator(BaseService):
         language = detect_language(file_path)
         return language if language != Language.UNKNOWN else None
 
+    def _determine_db_batch_size(self, pending_inserts: list[Chunk]) -> int:
+        """Compute an insert batch size using env/config or dynamic memory heuristics.
+
+        Priority:
+        - Env CHUNKHOUND_DB_BATCH_SIZE when set (>0)
+        - Config indexing.db_batch_size when set (>0)
+        - Dynamic: use a fraction of available memory with sane limits.
+        """
+        # 1) Environment override
+        try:
+            env_bs = int(os.environ.get("CHUNKHOUND_DB_BATCH_SIZE", "0") or "0")
+            if env_bs > 0:
+                return max(1, min(env_bs, 20000))
+        except Exception:
+            pass
+
+        # 2) Config override
+        try:
+            if self.config and getattr(self.config, "indexing", None):
+                cfg_bs = int(getattr(self.config.indexing, "db_batch_size", 0) or 0)
+                if cfg_bs > 0:
+                    return max(1, min(cfg_bs, 20000))
+        except Exception:
+            pass
+
+        # 3) Dynamic heuristic
+        # - Budget 10% of available RAM (min 64MB, max 512MB)
+        # - Estimate average bytes per chunk from a sample (code length dominates)
+        # - Constrain final batch size to [1000, 20000]
+        def _mem_available_bytes() -> int:
+            # Try psutil first
+            try:
+                import psutil  # type: ignore
+
+                return int(getattr(psutil.virtual_memory(), "available", 0)) or 0
+            except Exception:
+                pass
+            # Linux /proc/meminfo
+            try:
+                with open("/proc/meminfo", "r", encoding="utf-8", errors="ignore") as f:
+                    for line in f:
+                        if line.startswith("MemAvailable:"):
+                            parts = line.split()
+                            if len(parts) >= 2:
+                                return int(parts[1]) * 1024  # kB → B
+            except Exception:
+                pass
+            return 0
+
+        avail = _mem_available_bytes()
+        if avail <= 0:
+            # Fallback when unknown: adopt a conservative default
+            avail = 512 * 1024 * 1024  # 512MB
+
+        # Budget: 10% of available, clamped
+        budget = int(avail * 0.10)
+        budget = max(64 * 1024 * 1024, min(budget, 512 * 1024 * 1024))  # 64MB..512MB
+
+        # Estimate bytes per chunk from a small sample (code length dominates payload)
+        sample = pending_inserts[: min(200, len(pending_inserts))]
+        if not sample:
+            return 5000
+        total_bytes = 0
+        for ch in sample:
+            code = getattr(ch, "code", "") or ""
+            total_bytes += len(code.encode("utf-8", errors="ignore")) + 256  # overhead estimate
+        avg = max(512, total_bytes // len(sample))
+
+        # Compute batch size and clamp
+        est = max(1, budget // avg)
+        est = max(1000, min(int(est), 20000))
+        return est
+
     async def _get_file_lock(self, file_path: Path) -> asyncio.Lock:
         """Get or create a lock for the given file path.
 
@@ -525,86 +598,80 @@ class IndexingCoordinator(BaseService):
         # Track file_ids for single-file case
         file_ids = []
 
+        # Process each file independently (per-file transaction)
         for result in results:
-            # Handle errors
-            if result.status == "error":
-                stats["errors"].append(
-                    {"file": str(result.file_path), "error": result.error}
-                )
-                if file_task is not None and self.progress:
-                    self.progress.advance(file_task, 1)
-                    if cumulative_counters is not None:
-                        cumulative_counters['errors'] = cumulative_counters.get('errors', 0) + 1
-                        stored = cumulative_counters.get('stored', 0)
-                        skipped = cumulative_counters.get('skipped', 0)
-                        errs = cumulative_counters.get('errors', 0)
-                        chunks_so_far = cumulative_counters.get('chunks', 0)
-                        self.progress.update(file_task, info=f"stored {stored} | skipped {skipped} | err {errs} | {chunks_so_far} chunks")
-                continue
-
-            # Handle skipped files
-            if result.status == "skipped":
-                # Track skip reason in stats for single-file case
-                if "skip_reason" not in stats:
-                    stats["skip_reason"] = result.error
-                if file_task is not None and self.progress:
-                    self.progress.advance(file_task, 1)
-                    if cumulative_counters is not None:
-                        cumulative_counters['skipped'] = cumulative_counters.get('skipped', 0) + 1
-                        stored = cumulative_counters.get('stored', 0)
-                        skipped = cumulative_counters.get('skipped', 0)
-                        errs = cumulative_counters.get('errors', 0)
-                        chunks_so_far = cumulative_counters.get('chunks', 0)
-                        self.progress.update(file_task, info=f"stored {stored} | skipped {skipped} | err {errs} | {chunks_so_far} chunks")
-                continue
-
-            # Detect language for storage
-            language = result.language
-
-            # Store file record with transaction
-            self._db.begin_transaction()
-            try:
-                # Store file metadata
-                file_stat_dict = {
-                    "st_size": result.file_size,
-                    "st_mtime": result.file_mtime,
-                }
-
-                # Create mock stat object for _store_file_record
-                class StatResult:
-                    def __init__(self, size: int, mtime: float):
-                        self.st_size = size
-                        self.st_mtime = mtime
-
-                file_stat = StatResult(result.file_size, result.file_mtime)
-                # Extract content hash if available (from parsing result or precomputed)
-                content_hash = getattr(result, "content_hash", None)
-                file_id = self._store_file_record(result.file_path, file_stat, language, content_hash)
-
-                # Track file_id for single-file case
-                file_ids.append(file_id)
-
-                if file_id is None:
-                    self._db.rollback_transaction()
+                # Handle errors
+                if result.status == "error":
                     stats["errors"].append(
-                        {
-                            "file": str(result.file_path),
-                            "error": "Failed to store file record",
-                        }
+                        {"file": str(result.file_path), "error": result.error}
                     )
                     if file_task is not None and self.progress:
                         self.progress.advance(file_task, 1)
+                        if cumulative_counters is not None:
+                            cumulative_counters['errors'] = cumulative_counters.get('errors', 0) + 1
+                            stored = cumulative_counters.get('stored', 0)
+                            skipped = cumulative_counters.get('skipped', 0)
+                            errs = cumulative_counters.get('errors', 0)
+                            chunks_so_far = cumulative_counters.get('chunks', 0)
+                            self.progress.update(file_task, info=f"stored {stored} | skipped {skipped} | err {errs} | {chunks_so_far} chunks")
                     continue
 
-                # Check for existing chunks to enable smart diffing
-                relative_path = self._get_relative_path(result.file_path)
-                existing_file = self._db.get_file_by_path(relative_path.as_posix())
+                # Handle skipped files
+                if result.status == "skipped":
+                    # Track skip reason in stats for single-file case
+                    if "skip_reason" not in stats:
+                        stats["skip_reason"] = result.error
+                    if file_task is not None and self.progress:
+                        self.progress.advance(file_task, 1)
+                        if cumulative_counters is not None:
+                            cumulative_counters['skipped'] = cumulative_counters.get('skipped', 0) + 1
+                            stored = cumulative_counters.get('stored', 0)
+                            skipped = cumulative_counters.get('skipped', 0)
+                            errs = cumulative_counters.get('errors', 0)
+                            chunks_so_far = cumulative_counters.get('chunks', 0)
+                            self.progress.update(file_task, info=f"stored {stored} | skipped {skipped} | err {errs} | {chunks_so_far} chunks")
+                    continue
 
-                if existing_file:
-                    # Get existing chunks for diffing
-                    existing_chunks = self._db.get_chunks_by_file_id(
-                        file_id, as_model=True
-                    )
+                # Detect language for storage
+                language = result.language
+
+                # Per-file transaction boundaries
+                self._db.begin_transaction()
+                try:
+                    # Store file metadata
+                    file_stat_dict = {
+                        "st_size": result.file_size,
+                        "st_mtime": result.file_mtime,
+                    }
+
+                    # Create mock stat object for _store_file_record
+                    class StatResult:
+                        def __init__(self, size: int, mtime: float):
+                            self.st_size = size
+                            self.st_mtime = mtime
+
+                    file_stat = StatResult(result.file_size, result.file_mtime)
+                    # Extract content hash if available (from parsing result or precomputed)
+                    content_hash = getattr(result, "content_hash", None)
+                    file_id = self._store_file_record(result.file_path, file_stat, language, content_hash)
+
+                    # Track file_id for single-file case
+                    file_ids.append(file_id)
+
+                    if file_id is None:
+                        self._db.rollback_transaction()
+                        stats["errors"].append(
+                            {
+                                "file": str(result.file_path),
+                                "error": "Failed to store file record",
+                            }
+                        )
+                        if file_task is not None and self.progress:
+                            self.progress.advance(file_task, 1)
+                        continue
+                    # Check for existing chunks to enable smart diffing
+                    relative_path = self._get_relative_path(result.file_path)
+                    existing_file = self._db.get_file_by_path(relative_path.as_posix())
 
                     # Convert result chunks to Chunk models using from_dict()
                     new_chunk_models = [
@@ -612,83 +679,71 @@ class IndexingCoordinator(BaseService):
                         for chunk_data in result.chunks
                     ]
 
-                    if existing_chunks:
-                        # Smart diff to preserve embeddings
-                        chunk_diff = self._chunk_cache.diff_chunks(
-                            new_chunk_models, existing_chunks
+                    if existing_file:
+                        # Get existing chunks for diffing
+                        existing_chunks = self._db.get_chunks_by_file_id(
+                            file_id, as_model=True
                         )
 
-                        # Delete modified/removed chunks
-                        chunks_to_delete = chunk_diff.deleted + chunk_diff.modified
-                        if chunks_to_delete:
-                            chunk_ids_to_delete = [
-                                chunk.id
-                                for chunk in chunks_to_delete
-                                if chunk.id is not None
-                            ]
-                            for chunk_id in chunk_ids_to_delete:
-                                self._db.delete_chunk(chunk_id)
-
-                        # Store new/modified chunks (pass models directly)
-                        chunks_to_store = chunk_diff.added + chunk_diff.modified
-
-                        if chunks_to_store:
-                            chunk_ids_new = self._store_chunks(
-                                file_id, chunks_to_store, language
+                        if existing_chunks:
+                            # Smart diff to preserve embeddings
+                            chunk_diff = self._chunk_cache.diff_chunks(
+                                new_chunk_models, existing_chunks
                             )
+
+                            # Delete modified/removed chunks
+                            chunks_to_delete = chunk_diff.deleted + chunk_diff.modified
+                            if chunks_to_delete:
+                                chunk_ids_to_delete = [
+                                    chunk.id
+                                    for chunk in chunks_to_delete
+                                    if chunk.id is not None
+                                ]
+                                if chunk_ids_to_delete:
+                                    self._db.delete_chunks_batch(chunk_ids_to_delete)
+
+                            # Store new/modified chunks (pass models directly)
+                            chunks_to_store = chunk_diff.added + chunk_diff.modified
+                            ids = self._db.insert_chunks_batch(chunks_to_store) if chunks_to_store else []
                         else:
-                            chunk_ids_new = []
-
-                        # Track chunks needing embeddings (new + modified)
-                        stats["chunk_ids_needing_embeddings"].extend(chunk_ids_new)
-
-                        stats["total_chunks"] += len(result.chunks)
+                            # No existing chunks - store all as new
+                            ids = self._db.insert_chunks_batch(new_chunk_models)
                     else:
-                        # No existing chunks - store all as new (pass models directly)
-                        chunk_ids = self._store_chunks(
-                            file_id, new_chunk_models, language
-                        )
-                        stats["chunk_ids_needing_embeddings"].extend(chunk_ids)
-                        stats["total_chunks"] += len(chunk_ids)
-                else:
-                    # New file - convert dicts to models, then store
-                    chunk_models = [
-                        Chunk.from_dict({**chunk_data, "file_id": file_id})
-                        for chunk_data in result.chunks
-                    ]
-                    chunk_ids = self._store_chunks(file_id, chunk_models, language)
-                    stats["chunk_ids_needing_embeddings"].extend(chunk_ids)
-                    stats["total_chunks"] += len(chunk_ids)
+                        # New file - store all
+                        ids = self._db.insert_chunks_batch(new_chunk_models)
 
-                # Commit transaction; provider may ignore internal checkpointing
-                try:
-                    self._db.commit_transaction()
-                except TypeError:
-                    # Back-compat: some providers accept a force_checkpoint kwarg
+                    stats["chunk_ids_needing_embeddings"].extend(ids)
+                    stats["total_chunks"] += len(ids)
+
+                    # Commit per-file
                     try:
-                        self._db.commit_transaction(force_checkpoint=True)
-                    except Exception:
-                        pass
-                stats["total_files"] += 1
+                        self._db.commit_transaction()
+                    except TypeError:
+                        try:
+                            self._db.commit_transaction(force_checkpoint=True)
+                        except Exception:
+                            pass
 
-                # Update progress
-                if file_task is not None and self.progress:
-                    self.progress.advance(file_task, 1)
-                    if cumulative_counters is not None:
-                        cumulative_counters['stored'] = cumulative_counters.get('stored', 0) + 1
-                        # Display cumulative chunk count across batches if provided
-                        base = int(cumulative_counters.get('chunks', 0))
-                        display_chunks = base + stats["total_chunks"]
-                        stored = cumulative_counters.get('stored', 0)
-                        skipped = cumulative_counters.get('skipped', 0)
-                        errs = cumulative_counters.get('errors', 0)
-                        self.progress.update(file_task, info=f"stored {stored} | skipped {skipped} | err {errs} | {display_chunks} chunks")
+                    stats["total_files"] += 1
 
-            except Exception as e:
-                self._db.rollback_transaction()
-                stats["errors"].append({"file": str(result.file_path), "error": str(e)})
-                if file_task is not None and self.progress:
-                    self.progress.advance(file_task, 1)
+                    # Update progress
+                    if file_task is not None and self.progress:
+                        self.progress.advance(file_task, 1)
+                        if cumulative_counters is not None:
+                            cumulative_counters['stored'] = cumulative_counters.get('stored', 0) + 1
+                            base = int(cumulative_counters.get('chunks', 0))
+                            display_chunks = base + stats["total_chunks"]
+                            stored = cumulative_counters.get('stored', 0)
+                            skipped = cumulative_counters.get('skipped', 0)
+                            errs = cumulative_counters.get('errors', 0)
+                            self.progress.update(file_task, info=f"stored {stored} | skipped {skipped} | err {errs} | {display_chunks} chunks")
+
+                except Exception as e:
+                    self._db.rollback_transaction()
+                    stats["errors"].append({"file": str(result.file_path), "error": str(e)})
+                    if file_task is not None and self.progress:
+                        self.progress.advance(file_task, 1)
+                    continue
 
         # Update external cumulative counters
         if cumulative_counters is not None:

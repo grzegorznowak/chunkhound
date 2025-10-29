@@ -75,6 +75,21 @@ chunkhound index
 
 **For configuration, IDE setup, and advanced usage, see the [documentation](https://chunkhound.github.io).**
 
+## YAML Parsing Benchmarks
+
+Use the reproducible benchmark harness to compare PyYAML, tree-sitter/cAST, and RapidYAML bindings on representative YAML workloads.
+
+```bash
+# Default synthetic cases with all available backends
+uv run python scripts/bench_yaml.py
+
+# Use your own fixtures or disable specific backends
+uv run python scripts/bench_yaml.py \
+  --cases-dir ./benchmarks/yaml \
+  --backends pyyaml_safe_load tree_sitter_universal \
+  --iterations 10
+```
+
 ## Real-Time Indexing
 
 **Automatic File Watching**: MCP servers monitor your codebase and update the index automatically as you edit files. No manual re-indexing required.

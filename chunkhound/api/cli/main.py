@@ -1,6 +1,7 @@
 """New modular CLI entry point for ChunkHound."""
 
 import argparse
+import logging as _pylogging
 import asyncio
 import multiprocessing
 import sys
@@ -42,6 +43,8 @@ def setup_logging(verbose: bool = False) -> None:
                 "<level>{message}</level>"
             ),
         )
+    # Also set stdlib logging level to avoid mixed loggers being noisy
+    _pylogging.basicConfig(level=_pylogging.DEBUG if verbose else _pylogging.ERROR)
 
 
 def create_parser() -> argparse.ArgumentParser:
