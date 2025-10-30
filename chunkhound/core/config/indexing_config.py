@@ -8,7 +8,7 @@ import argparse
 import os
 from typing import Any
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 def _get_default_include_patterns() -> list[str]:
@@ -96,8 +96,13 @@ class IndexingConfig(BaseModel):
         description="Glob patterns for files to include (all supported languages)",
     )
 
-    exclude: list[str] = Field(
-        default_factory=lambda: [
+    # NOTE: For backwards-compatibility, users may set indexing.exclude to
+    # the sentinel strings ".gitignore" or ".chignore" in .chunkhound.json.
+    # We store the sentinel separately and keep `exclude` as a list to preserve
+    # existing type semantics across the codebase.
+    @staticmethod
+    def _default_excludes() -> list[str]:
+        return [
             # Virtual environments and package managers
             "**/node_modules/**",
             "**/.git/**",
@@ -181,9 +186,18 @@ class IndexingConfig(BaseModel):
             "**/assets.json",
             "**/*.map.json",
             "**/*.min.json",
-        ],
+        ]
+
+    exclude: list[str] = Field(
+        default_factory=_default_excludes,
         description="Glob patterns for files to exclude",
     )
+
+    # Private: sentinel value when user provides exclude as a string
+    exclude_sentinel: str | None = Field(default=None, repr=False)
+
+    # Root-level file name for ChunkHound-specific ignores (gitwildmatch syntax)
+    chignore_file: str = Field(default=".chignore")
 
     @field_validator("include", "exclude")
     def validate_patterns(cls, v: list[str]) -> list[str]:
@@ -343,6 +357,53 @@ class IndexingConfig(BaseModel):
                 pass
 
         return config
+
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce_exclude_sentinel(cls, data: Any) -> Any:
+        """Allow exclude to be a sentinel string ('.gitignore' or '.chignore').
+
+        We convert it into `exclude_sentinel` and normalize `exclude` to a list
+        to keep runtime type expectations stable.
+        """
+        try:
+            if isinstance(data, dict) and "exclude" in (data.get("indexing") or data):
+                # Support both nested under indexing and direct construction
+                if "indexing" in data:
+                    idx = data["indexing"] or {}
+                    exc = idx.get("exclude")
+                    if isinstance(exc, str) and exc in {".gitignore", ".chignore"}:
+                        idx["exclude_sentinel"] = exc
+                        idx["exclude"] = []
+                        data["indexing"] = idx
+                else:
+                    exc = data.get("exclude")
+                    if isinstance(exc, str) and exc in {".gitignore", ".chignore"}:
+                        data["exclude_sentinel"] = exc
+                        data["exclude"] = []
+        except Exception:
+            # Be permissive; validation will catch true errors later
+            pass
+        return data
+
+    # Convenience helper for callers to interpret ignore source selection
+    def resolve_ignore_sources(self) -> list[str]:
+        if self.exclude_sentinel == ".gitignore":
+            return ["gitignore"]
+        if self.exclude_sentinel == ".chignore":
+            return ["chignore"]
+        # Default: combine config array and gitignore
+        return ["config", "gitignore"]
+
+    def get_effective_config_excludes(self) -> list[str]:
+        """Return the config-driven exclude globs to apply.
+
+        If a sentinel is set (e.g., ".gitignore"), we still apply the default
+        exclude set to preserve expected behavior (e.g., node_modules).
+        """
+        if self.exclude_sentinel in {".gitignore", ".chignore"}:
+            return self._default_excludes()
+        return list(self.exclude or self._default_excludes())
 
     @classmethod
     def extract_cli_overrides(cls, args: Any) -> dict[str, Any]:

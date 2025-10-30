@@ -1421,6 +1421,16 @@ class IndexingCoordinator(BaseService):
                     exclude_patterns,
                     parent_gitignores,
                     use_inode_ordering,
+                    # Rebuild IgnoreEngine in worker based on current config (repo-aware)
+                    (
+                        {
+                            "mode": "repo_aware",
+                            "root": directory,
+                            "sources": (self.config.indexing.resolve_ignore_sources() if getattr(self, "config", None) and getattr(self.config, "indexing", None) else ["config"]),
+                            "chf": (getattr(self.config.indexing, "chignore_file", ".chignore") if getattr(self, "config", None) and getattr(self.config, "indexing", None) else ".chignore"),
+                            "cfg": list(exclude_patterns or []),
+                        }
+                    ),
                 )
                 for subtree in top_level_items
             ]
@@ -1443,8 +1453,20 @@ class IndexingCoordinator(BaseService):
 
         # Scan files in the root directory itself (not in subdirs) using helper
         root_gitignore_patterns = parent_gitignores.get(directory, [])
+        # Build local repo-aware engine for the root directory scan
+        local_engine = __import__("chunkhound.utils.ignore_engine", fromlist=["build_repo_aware_ignore_engine"]).build_repo_aware_ignore_engine(  # type: ignore
+            root=directory,
+            sources=(self.config.indexing.resolve_ignore_sources() if getattr(self, "config", None) and getattr(self.config, "indexing", None) else ["config"]),
+            chignore_file=(getattr(self.config.indexing, "chignore_file", ".chignore") if getattr(self, "config", None) and getattr(self.config, "indexing", None) else ".chignore"),
+            config_exclude=list(exclude_patterns or []),
+        )
+
         root_files = scan_directory_files(
-            directory, patterns, exclude_patterns, root_gitignore_patterns or None
+            directory,
+            patterns,
+            exclude_patterns,
+            None,
+            local_engine,
         )
 
         # Merge sorted worker results efficiently using heap-based merge
@@ -1514,12 +1536,39 @@ class IndexingCoordinator(BaseService):
         if not exclude_patterns:
             exclude_patterns = []
 
+        # Prepare IgnoreEngine parameters from config (repo-aware)
+        engine_args = None
+        ignore_engine_obj = None
+        if getattr(self, "config", None) is not None and getattr(self.config, "indexing", None) is not None:
+            sources = self.config.indexing.resolve_ignore_sources()
+            chf = getattr(self.config.indexing, "chignore_file", ".chignore")
+            from chunkhound.utils.ignore_engine import build_repo_aware_ignore_engine  # type: ignore
+
+            cfg_excludes = self.config.indexing.get_effective_config_excludes()
+            ignore_engine_obj = build_repo_aware_ignore_engine(
+                root=directory, sources=sources, chignore_file=chf, config_exclude=cfg_excludes
+            )
+            engine_args = {
+                "mode": "repo_aware",
+                "root": directory.resolve(),
+                "sources": sources,
+                "chf": chf,
+                "cfg": list(cfg_excludes),
+            }
+
         # Use default (enabled) if not explicitly specified
         if parallel_discovery is None:
             parallel_discovery = True  # Default: parallel discovery enabled
 
         # Resolve directory once for consistent path handling
         directory = directory.resolve()
+
+        # Normalize include patterns for consistent matching
+        try:
+            from chunkhound.utils.file_patterns import normalize_include_patterns as _norm
+            patterns = _norm(list(patterns)) if patterns else patterns
+        except Exception:
+            pass
 
         # Try parallel discovery if enabled
         if parallel_discovery:
@@ -1548,7 +1597,7 @@ class IndexingCoordinator(BaseService):
 
         # Sequential discovery (fallback or explicitly requested)
         discovered_files = self._walk_directory_with_excludes(
-            directory, patterns, exclude_patterns, use_inode_ordering
+            directory, patterns, exclude_patterns, use_inode_ordering, ignore_engine_obj, engine_args
         )
         return sorted(discovered_files)
 
@@ -1558,6 +1607,8 @@ class IndexingCoordinator(BaseService):
         patterns: list[str],
         exclude_patterns: list[str],
         use_inode_ordering: bool = False,
+        ignore_engine_obj: object | None = None,
+        ignore_engine_args: tuple | None = None,
     ) -> list[Path]:
         """Optimized directory walker using os.walk() with optional inode ordering.
 
@@ -1581,7 +1632,10 @@ class IndexingCoordinator(BaseService):
 
         # Pre-load root gitignore (consistent with parallel mode)
         parent_gitignores: dict[Path, list[str]] = {}
-        parent_gitignores[directory] = load_gitignore_patterns(directory, directory)
+        if ignore_engine_obj is None:
+            parent_gitignores[directory] = load_gitignore_patterns(directory, directory)
+        else:
+            parent_gitignores[directory] = []
 
         # Use shared directory traversal logic
         files, _ = walk_directory_tree(
@@ -1591,7 +1645,44 @@ class IndexingCoordinator(BaseService):
             exclude_patterns,
             parent_gitignores,
             use_inode_ordering,
+            ignore_engine=ignore_engine_obj,
         )
+
+        # Fallback: if repo-aware engine is present and no files were found, perform
+        # a conservative scan that filters files by engine and include patterns.
+        if not files and getattr(ignore_engine_obj, "matches", None):
+            try:
+                import os as _os
+                from chunkhound.utils.file_patterns import should_include_file as _inc
+                from chunkhound.utils.file_patterns import compile_pattern as _cp
+                from fnmatch import translate as _translate
+                from pathlib import Path as _Path
+
+                # Pre-compile include patterns for a minimal filter
+                pat_cache = {}
+                _ = [_cp(p, pat_cache) for p in (patterns or [])]
+
+                collected: list[Path] = []
+                for dp, dn, fn in _os.walk(directory, topdown=True):
+                    cur = _Path(dp)
+                    # Prune dirs by engine
+                    pruned = []
+                    for d in list(dn):
+                        if ignore_engine_obj.matches(cur / d, is_dir=True):  # type: ignore[attr-defined]
+                            pruned.append(d)
+                    for d in pruned:
+                        dn.remove(d)
+                    # Files
+                    for name in fn:
+                        fp = cur / name
+                        if ignore_engine_obj.matches(fp, is_dir=False):  # type: ignore[attr-defined]
+                            continue
+                        # Include filter
+                        if _inc(fp, directory, patterns or [], pat_cache):
+                            collected.append(fp)
+                files = collected
+            except Exception:
+                pass
 
         return files
 

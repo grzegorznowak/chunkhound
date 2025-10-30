@@ -14,7 +14,7 @@ import os
 import re
 from fnmatch import translate
 from pathlib import Path
-from typing import Pattern
+from typing import Pattern, Optional
 
 
 def compile_pattern(pattern: str, cache: dict[str, Pattern[str]]) -> Pattern[str]:
@@ -206,6 +206,7 @@ def scan_directory_files(
     patterns: list[str],
     exclude_patterns: list[str],
     gitignore_patterns: list[str] | None = None,
+    ignore_engine: Optional[object] = None,
 ) -> list[Path]:
     """Scan files in a single directory (non-recursive) with pattern filtering.
 
@@ -224,8 +225,14 @@ def scan_directory_files(
     try:
         for item in directory.iterdir():
             if item.is_file():
-                # Check against exclude patterns
-                if should_exclude_path(
+                # Check against exclude patterns or ignore engine
+                if ignore_engine is not None:
+                    try:
+                        if getattr(ignore_engine, "matches", None) and ignore_engine.matches(item, is_dir=False):  # type: ignore[attr-defined]
+                            continue
+                    except Exception:
+                        pass
+                elif should_exclude_path(
                     item, directory, exclude_patterns, pattern_cache
                 ):
                     continue
@@ -253,6 +260,7 @@ def walk_directory_tree(
     exclude_patterns: list[str],
     parent_gitignores: dict[Path, list[str]],
     use_inode_ordering: bool = False,
+    ignore_engine: Optional[object] = None,
 ) -> tuple[list[Path], dict[Path, list[str]]]:
     """Core directory traversal logic shared by sequential and parallel discovery.
 
@@ -288,9 +296,12 @@ def walk_directory_tree(
         current_dir = Path(dirpath)
 
         # Load gitignore for current directory
-        gitignore_patterns[current_dir] = load_gitignore_patterns(
-            current_dir, root_directory
-        )
+        if ignore_engine is None:
+            gitignore_patterns[current_dir] = load_gitignore_patterns(
+                current_dir, root_directory
+            )
+        else:
+            gitignore_patterns[current_dir] = []
 
         # Combine gitignore patterns from parents
         all_gitignore_patterns = []
@@ -307,14 +318,25 @@ def walk_directory_tree(
         dirs_to_remove = []
         for dirname in dirnames:
             dir_path = current_dir / dirname
-            if should_exclude_path(
-                dir_path, root_directory, exclude_patterns, pattern_cache
-            ) or (
-                all_gitignore_patterns
-                and should_exclude_path(
-                    dir_path, root_directory, all_gitignore_patterns, pattern_cache
-                )
-            ):
+            excluded = False
+            if ignore_engine is not None:
+                try:
+                    if getattr(ignore_engine, "matches", None) and ignore_engine.matches(dir_path, is_dir=True):  # type: ignore[attr-defined]
+                        excluded = True
+                except Exception:
+                    excluded = False
+            else:
+                if should_exclude_path(
+                    dir_path, root_directory, exclude_patterns, pattern_cache
+                ) or (
+                    all_gitignore_patterns
+                    and should_exclude_path(
+                        dir_path, root_directory, all_gitignore_patterns, pattern_cache
+                    )
+                ):
+                    excluded = True
+
+            if excluded:
                 dirs_to_remove.append(dirname)
 
         for dirname in dirs_to_remove:
@@ -332,15 +354,22 @@ def walk_directory_tree(
         for filename in filenames:
             file_path = current_dir / filename
 
-            if should_exclude_path(
+            if ignore_engine is not None:
+                try:
+                    if getattr(ignore_engine, "matches", None) and ignore_engine.matches(file_path, is_dir=False):  # type: ignore[attr-defined]
+                        continue
+                except Exception:
+                    pass
+            elif should_exclude_path(
                 file_path, root_directory, exclude_patterns, pattern_cache
             ):
                 continue
 
-            if all_gitignore_patterns and should_exclude_path(
-                file_path, root_directory, all_gitignore_patterns, pattern_cache
-            ):
-                continue
+            if ignore_engine is None:
+                if all_gitignore_patterns and should_exclude_path(
+                    file_path, root_directory, all_gitignore_patterns, pattern_cache
+                ):
+                    continue
 
             if should_include_file(file_path, root_directory, patterns, pattern_cache):
                 files.append(file_path)
@@ -374,6 +403,7 @@ def walk_subtree_worker(
     exclude_patterns: list[str],
     parent_gitignores: dict[Path, list[str]],
     use_inode_ordering: bool = False,
+    ignore_engine_args: Optional[object] = None,
 ) -> tuple[list[Path], list[str]]:
     """Worker function for parallel directory traversal (must be module-level for pickling).
 
@@ -396,7 +426,25 @@ def walk_subtree_worker(
     errors = []
 
     try:
-        # Use shared directory traversal logic
+        # Use shared directory traversal logic (optionally with IgnoreEngine)
+        ignore_engine_obj = None
+        if ignore_engine_args is not None:
+            try:
+                from .ignore_engine import build_ignore_engine, build_repo_aware_ignore_engine  # type: ignore
+                if isinstance(ignore_engine_args, dict) and ignore_engine_args.get("mode") == "repo_aware":
+                    ignore_engine_obj = build_repo_aware_ignore_engine(
+                        root=ignore_engine_args["root"],
+                        sources=ignore_engine_args["sources"],
+                        chignore_file=ignore_engine_args["chf"],
+                        config_exclude=ignore_engine_args["cfg"],
+                    )
+                else:
+                    root, sources, chf, cfg_ex = ignore_engine_args  # type: ignore
+                    ignore_engine_obj = build_ignore_engine(
+                        root=root, sources=sources, chignore_file=chf, config_exclude=cfg_ex
+                    )
+            except Exception:
+                ignore_engine_obj = None
         files, _ = walk_directory_tree(
             subtree_path,
             root_directory,
@@ -404,6 +452,7 @@ def walk_subtree_worker(
             exclude_patterns,
             parent_gitignores,
             use_inode_ordering,
+            ignore_engine=ignore_engine_obj,
         )
         return files, errors
     except (FileNotFoundError, NotADirectoryError) as e:

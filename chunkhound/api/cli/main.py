@@ -56,6 +56,7 @@ def create_parser() -> argparse.ArgumentParser:
     # Import parsers dynamically to avoid early loading
     from .parsers import create_main_parser, setup_subparsers
     from .parsers.calibrate_parser import add_calibrate_subparser
+    from .parsers.diagnose_parser import add_diagnose_subparser
     from .parsers.mcp_parser import add_mcp_subparser
     from .parsers.research_parser import add_research_subparser
     from .parsers.run_parser import add_run_subparser
@@ -69,6 +70,7 @@ def create_parser() -> argparse.ArgumentParser:
     add_mcp_subparser(subparsers)
     add_search_subparser(subparsers)
     add_research_subparser(subparsers)
+    add_diagnose_subparser(subparsers)
     add_calibrate_subparser(subparsers)
 
     return parser
@@ -87,6 +89,9 @@ async def async_main() -> None:
     setup_logging(getattr(args, "verbose", False))
 
     # Validate args and create config
+    # Special-case: --simulate should never require embeddings
+    if args.command == "index" and getattr(args, "simulate", False):
+        setattr(args, "no_embeddings", True)
     config, validation_errors = create_validated_config(args, args.command)
 
     if validation_errors:
@@ -154,6 +159,10 @@ async def async_main() -> None:
             from .commands.calibrate import calibrate_command
 
             await calibrate_command(args, config)
+        elif args.command == "diagnose":
+            from .commands.diagnose import diagnose_command
+
+            await diagnose_command(args, config)
         else:
             logger.error(f"Unknown command: {args.command}")
             sys.exit(1)

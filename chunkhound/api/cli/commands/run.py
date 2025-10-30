@@ -30,6 +30,13 @@ async def run_command(args: argparse.Namespace, config: Config) -> None:
         args: Parsed command-line arguments
         config: Pre-validated configuration instance
     """
+    # Simulate mode
+    if getattr(args, "simulate", False):
+        # Ensure simulate doesn't require embeddings
+        setattr(args, "no_embeddings", True)
+        await _simulate_index(args, config)
+        return
+
     # Initialize Rich output formatter
     formatter = RichOutputFormatter(verbose=args.verbose)
 
@@ -266,3 +273,49 @@ def _validate_run_arguments(
 
 
 __all__ = ["run_command"]
+
+
+async def _simulate_index(args: argparse.Namespace, config: Config) -> None:
+    """Dry-run discovery and print list of relative files.
+
+    Minimal implementation: perform discovery via the coordinator and print
+    the discovered files sorted. Later we may reflect change-detection.
+    """
+    base_dir = Path(args.path).resolve() if hasattr(args, "path") else Path.cwd().resolve()
+
+    # Configure registry and create services like real run
+    # Ensure database directory exists to allow provider to connect
+    try:
+        db_path = Path(config.database.path)
+        db_dir = db_path.parent
+        db_dir.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+
+    configure_registry(config)
+    indexing_coordinator = create_indexing_coordinator()
+
+    # Resolve patterns using the DirectoryIndexingService helper to keep logic aligned
+    from chunkhound.services.directory_indexing_service import DirectoryIndexingService
+
+    svc = DirectoryIndexingService(indexing_coordinator=indexing_coordinator, config=config)
+    include_patterns, exclude_patterns = svc._resolve_file_patterns()
+
+    # Normalize include patterns and call internal discovery
+    from chunkhound.utils.file_patterns import normalize_include_patterns
+
+    processed_patterns = normalize_include_patterns(include_patterns)
+
+    files = await indexing_coordinator._discover_files(  # type: ignore[attr-defined]
+        base_dir, processed_patterns, exclude_patterns
+    )
+
+    # Convert to relative, sort, and print
+    rels = sorted([p.resolve().relative_to(base_dir).as_posix() for p in files])
+
+    import json as _json
+    if getattr(args, "json", False):
+        print(_json.dumps({"files": rels}, indent=2))
+    else:
+        for r in rels:
+            print(r)

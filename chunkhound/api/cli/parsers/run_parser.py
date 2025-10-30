@@ -140,6 +140,23 @@ def add_run_subparser(subparsers: Any) -> argparse.ArgumentParser:
     # Add config-specific arguments
     add_config_arguments(run_parser, ["database", "embedding", "indexing", "mcp"])
 
+    # Simulate mode as a flag to preserve backward-compatible positional path usage
+    run_parser.add_argument(
+        "--simulate",
+        action="store_true",
+        help="Dry-run discovery; prints sorted relative file list",
+    )
+    run_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="With --simulate: output JSON instead of plain list",
+    )
+    run_parser.add_argument(
+        "--all-discovered",
+        action="store_true",
+        help="With --simulate: show discovered files before change-detection pruning",
+    )
+
     return cast(argparse.ArgumentParser, run_parser)
 
 
