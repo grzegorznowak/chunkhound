@@ -156,6 +156,17 @@ def add_run_subparser(subparsers: Any) -> argparse.ArgumentParser:
         action="store_true",
         help="With --simulate: show discovered files before change-detection pruning",
     )
+    run_parser.add_argument(
+        "--show-sizes",
+        action="store_true",
+        help="With --simulate: include file sizes in text output",
+    )
+    run_parser.add_argument(
+        "--sort",
+        choices=["path", "size", "size_desc"],
+        default="path",
+        help="With --simulate: sort output by path or size (desc for largest first)",
+    )
 
     return cast(argparse.ArgumentParser, run_parser)
 

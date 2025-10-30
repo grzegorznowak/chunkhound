@@ -310,12 +310,39 @@ async def _simulate_index(args: argparse.Namespace, config: Config) -> None:
         base_dir, processed_patterns, exclude_patterns
     )
 
-    # Convert to relative, sort, and print
-    rels = sorted([p.resolve().relative_to(base_dir).as_posix() for p in files])
+    # Gather sizes and relative paths
+    items: list[tuple[str, int]] = []
+    for p in files:
+        try:
+            st = p.stat()
+            size = int(st.st_size)
+        except Exception:
+            size = 0
+        rel = p.resolve().relative_to(base_dir).as_posix()
+        items.append((rel, size))
+
+    # Sort
+    sort_mode = getattr(args, "sort", "path") or "path"
+    if sort_mode == "size":
+        items.sort(key=lambda x: (x[1], x[0]))
+    elif sort_mode == "size_desc":
+        items.sort(key=lambda x: (-x[1], x[0]))
+    else:
+        items.sort(key=lambda x: x[0])
 
     import json as _json
     if getattr(args, "json", False):
-        print(_json.dumps({"files": rels}, indent=2))
+        print(
+            _json.dumps(
+                {"files": [{"path": rel, "size_bytes": size} for rel, size in items]},
+                indent=2,
+            )
+        )
     else:
-        for r in rels:
-            print(r)
+        show_sizes = bool(getattr(args, "show_sizes", False))
+        if show_sizes:
+            for rel, size in items:
+                print(f"{size:>10}  {rel}")
+        else:
+            for rel, _ in items:
+                print(rel)
