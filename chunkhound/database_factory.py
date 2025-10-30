@@ -67,8 +67,26 @@ def create_services(
     except Exception:
         existing_cfg = None
 
-    if existing_cfg is None:
-        configure_registry(config)
+    # Always (re)configure the registry with an effective per-call config so that
+    # tests using distinct temporary directories get an IndexingCoordinator whose
+    # base_directory matches the current tmp_path. This avoids cross-test leakage
+    # from the global registry's previous target_dir.
+    effective_config: dict[str, Any] | Any = config
+    try:
+        if isinstance(config, dict):
+            effective_config = dict(config)
+            db_dict = dict(effective_config.get("database", {}))
+            db_dict["path"] = Path(db_path)
+            db_dict.setdefault("provider", "duckdb")
+            effective_config["database"] = db_dict
+        else:
+            if hasattr(config, "database") and hasattr(config.database, "path"):
+                config.database.path = Path(db_path)
+            effective_config = config
+    except Exception:
+        effective_config = config
+
+    configure_registry(effective_config)
     # else: assume already configured by caller (e.g., CLI), do not reconfigure again
     # to prevent creating a second database provider connection in the same process.
 
