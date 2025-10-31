@@ -30,6 +30,13 @@ async def run_command(args: argparse.Namespace, config: Config) -> None:
         args: Parsed command-line arguments
         config: Pre-validated configuration instance
     """
+    # Ignore decision check (formerly top-level 'diagnose')
+    if getattr(args, "check_ignores", False):
+        # Ensure this mode doesn't require embeddings either
+        setattr(args, "no_embeddings", True)
+        await _check_ignores(args, config)
+        return
+
     # Simulate mode
     if getattr(args, "simulate", False):
         # Ensure simulate doesn't require embeddings
@@ -387,6 +394,99 @@ async def _simulate_index(args: argparse.Namespace, config: Config) -> None:
             else:
                 for rel, _ in items:
                     print(rel)
+        except BrokenPipeError:
+            # Allow piping to tools that close early without stacktrace
+            try:
+                sys.stdout.close()
+            except Exception:
+                pass
+            return
+
+
+async def _check_ignores(args: argparse.Namespace, config: Config) -> None:
+    """Compare ChunkHound ignore decisions with a sentinel (currently: Git)."""
+    base_dir = Path(args.path).resolve() if hasattr(args, "path") else Path.cwd().resolve()
+
+    vs = getattr(args, "vs", "git") or "git"
+    if vs != "git":
+        print(f"Unsupported --vs value: {vs}", file=sys.stderr)
+        sys.exit(2)
+
+    # Helper functions (inlined to keep this feature local to index command)
+    def _nearest_repo_root(path: Path, stop: Path) -> Path | None:
+        p = path.resolve()
+        stop = stop.resolve()
+        while True:
+            if (p / ".git").exists():
+                return p
+            if p == stop or p.parent == p:
+                return None
+            p = p.parent
+
+    def _git_ignored(repo_root: Path, rel_path: str) -> bool:
+        try:
+            proc = __import__("subprocess").run(
+                ["git", "check-ignore", "-q", "--no-index", rel_path],
+                cwd=str(repo_root),
+                text=True,
+                capture_output=True,
+            )
+            return proc.returncode == 0
+        except Exception:
+            return False
+
+    def _ch_ignored(root: Path, file_path: Path) -> bool:
+        try:
+            from chunkhound.utils.ignore_engine import build_repo_aware_ignore_engine
+
+            sources = config.indexing.resolve_ignore_sources()
+            cfg_ex = config.indexing.get_effective_config_excludes()
+            chf = config.indexing.chignore_file
+            eng = build_repo_aware_ignore_engine(root, sources, chf, cfg_ex)
+            return bool(eng.matches(file_path, is_dir=False))
+        except Exception:
+            return False
+
+    # Collect candidate files (intentionally unpruned; we care about diffs)
+    candidates: list[Path] = []
+    for p in base_dir.rglob("*"):
+        if p.is_file():
+            candidates.append(p)
+
+    mismatches: list[dict[str, Any]] = []
+    for fp in candidates:
+        repo = _nearest_repo_root(fp.parent, base_dir) or base_dir
+        try:
+            rel = fp.resolve().relative_to(repo if repo else base_dir).as_posix()
+        except Exception:
+            rel = fp.name
+        git_decision = _git_ignored(repo, rel) if repo else False
+        ch_decision = _ch_ignored(base_dir, fp)
+        if git_decision != ch_decision:
+            mismatches.append({
+                "path": fp.resolve().relative_to(base_dir).as_posix(),
+                "git": git_decision,
+                "ch": ch_decision,
+            })
+
+    import json as _json
+    report = {"mismatches": mismatches, "total": len(candidates), "base": base_dir.as_posix()}
+    if getattr(args, "json", False):
+        try:
+            print(_json.dumps(report, indent=2))
+        except BrokenPipeError:
+            try:
+                sys.stdout.close()
+            except Exception:
+                pass
+            return
+    else:
+        try:
+            print(f"Base: {report['base']}")
+            print(f"Paths scanned: {report['total']}")
+            print(f"Mismatches: {len(mismatches)}")
+            for m in mismatches[:20]:
+                print(f" - {m['path']}: CH={m['ch']} Git={m['git']}")
         except BrokenPipeError:
             # Allow piping to tools that close early without stacktrace
             try:

@@ -7,8 +7,9 @@ def _run(cmd: list[str], timeout: int = 20) -> subprocess.CompletedProcess[str]:
     return subprocess.run(["uv", "run", *cmd], text=True, capture_output=True, timeout=timeout)
 
 
-def test_diagnose_help() -> None:
-    proc = _run(["chunkhound", "diagnose", "--help"]) 
+def test_index_help_mentions_check_ignores() -> None:
+    proc = _run(["chunkhound", "index", "--help"]) 
     assert proc.returncode == 0, proc.stderr
-    assert "diagnose" in proc.stdout.lower()
+    # Ensure the help lists the new flag
+    assert "check-ignores" in proc.stdout
 

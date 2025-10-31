@@ -17,7 +17,7 @@ def test_diagnose_reports_mismatch_for_default_excludes(tmp_path: Path) -> None:
     (root / "other" / "build").mkdir(parents=True, exist_ok=True)
     (root / "other" / "build" / "tool.txt").write_text("x")
 
-    proc = _run(["chunkhound", "diagnose", str(root), "--json"], timeout=60)
+    proc = _run(["chunkhound", "index", "--check-ignores", str(root), "--vs", "git", "--json"], timeout=60)
     assert proc.returncode == 0, proc.stderr
     data = json.loads(proc.stdout or "{}")
     mismatches = data.get("mismatches", [])
@@ -25,4 +25,3 @@ def test_diagnose_reports_mismatch_for_default_excludes(tmp_path: Path) -> None:
     assert any(m.get("path") == "other/build/tool.txt" and m.get("ch") is True and m.get("git") is False for m in mismatches), (
         f"Unexpected mismatches: {mismatches}"
     )
-

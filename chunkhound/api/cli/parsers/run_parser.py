@@ -149,7 +149,7 @@ def add_run_subparser(subparsers: Any) -> argparse.ArgumentParser:
     run_parser.add_argument(
         "--json",
         action="store_true",
-        help="With --simulate: output JSON instead of plain list",
+        help="With --simulate or --check-ignores: output JSON",
     )
     run_parser.add_argument(
         "--all-discovered",
@@ -176,6 +176,19 @@ def add_run_subparser(subparsers: Any) -> argparse.ArgumentParser:
             "With --simulate: print CH root, active ignore sources, and first 10 "
             "default excludes to stderr for troubleshooting"
         ),
+    )
+
+    # Ignore decision diffing against external sentinels (initially: Git)
+    run_parser.add_argument(
+        "--check-ignores",
+        action="store_true",
+        help="Compare ChunkHound ignore decisions vs a sentinel (use --vs git)",
+    )
+    run_parser.add_argument(
+        "--vs",
+        choices=["git"],
+        default="git",
+        help="Sentinel to compare against for --check-ignores (default: git)",
     )
 
     return cast(argparse.ArgumentParser, run_parser)

@@ -1728,10 +1728,17 @@ class IndexingCoordinator(BaseService):
             # Find orphaned files (in DB but not on disk or excluded by patterns)
             orphaned_files = []
             if not exclude_patterns:
-                from chunkhound.core.config.config import Config
-
-                config = Config.from_environment()
-                patterns_to_check = config.indexing.get_default_exclude_patterns()
+                # Prefer the coordinator's current config; fall back to defaults
+                try:
+                    cfg = self.config if getattr(self, "config", None) else None
+                    if cfg is None:
+                        from chunkhound.core.config.config import Config as _Cfg
+                        cfg = _Cfg()
+                    patterns_to_check = cfg.indexing.get_effective_config_excludes()
+                except Exception:
+                    # Final fallback to static defaults
+                    from chunkhound.core.config.indexing_config import IndexingConfig as _Idx
+                    patterns_to_check = _Idx._default_excludes()
             else:
                 patterns_to_check = exclude_patterns
 

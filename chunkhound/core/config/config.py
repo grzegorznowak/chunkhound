@@ -260,6 +260,15 @@ class Config(BaseModel):
         """Convert configuration to dictionary."""
         return self.model_dump(exclude_none=True)
 
+    @classmethod
+    def from_environment(cls) -> "Config":
+        """Construct Config using environment and defaults (no CLI args).
+
+        Convenience for legacy call sites expecting a simple way to obtain a
+        fully-initialized Config without command-specific CLI parsing.
+        """
+        return cls(args=None)
+
     def validate_for_command(self, command: str) -> list[str]:
         """
         Validate configuration for a specific command.
