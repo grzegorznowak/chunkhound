@@ -168,6 +168,16 @@ def add_run_subparser(subparsers: Any) -> argparse.ArgumentParser:
         help="With --simulate: sort output by path or size (desc for largest first)",
     )
 
+    # Debug ignores: print ignore context for troubleshooting without breaking JSON output
+    run_parser.add_argument(
+        "--debug-ignores",
+        action="store_true",
+        help=(
+            "With --simulate: print CH root, active ignore sources, and first 10 "
+            "default excludes to stderr for troubleshooting"
+        ),
+    )
+
     return cast(argparse.ArgumentParser, run_parser)
 
 

@@ -283,6 +283,38 @@ async def _simulate_index(args: argparse.Namespace, config: Config) -> None:
     """
     base_dir = Path(args.path).resolve() if hasattr(args, "path") else Path.cwd().resolve()
 
+    # Optional debug output about ignore configuration (stderr to avoid breaking JSON piping)
+    try:
+        if getattr(args, "debug_ignores", False):
+            from chunkhound.core.config.indexing_config import IndexingConfig as _IdxCfg
+
+            sources = []
+            try:
+                sources = list(config.indexing.resolve_ignore_sources())
+            except Exception:
+                # Best-effort; keep empty on error
+                sources = []
+
+            defaults = []
+            try:
+                defaults = list(_IdxCfg._default_excludes())
+            except Exception:
+                defaults = []
+
+            print(f"[debug-ignores] CH root: {base_dir}", file=sys.stderr)
+            print(f"[debug-ignores] Active sources: {sources}", file=sys.stderr)
+            # Show first 10 normalized default excludes to quickly confirm runtime defaults
+            first_n = defaults[:10]
+            print("[debug-ignores] Default excludes (first 10):", file=sys.stderr)
+            for pat in first_n:
+                print(f"  - {pat}", file=sys.stderr)
+    except BrokenPipeError:
+        # If stderr is piped and consumer exits early (e.g., `| head`), exit quietly
+        try:
+            sys.stderr.close()
+        except Exception:
+            pass
+
     # Configure registry and create services like real run
     # Ensure database directory exists to allow provider to connect
     try:
@@ -332,17 +364,33 @@ async def _simulate_index(args: argparse.Namespace, config: Config) -> None:
 
     import json as _json
     if getattr(args, "json", False):
-        print(
-            _json.dumps(
-                {"files": [{"path": rel, "size_bytes": size} for rel, size in items]},
-                indent=2,
+        try:
+            print(
+                _json.dumps(
+                    {"files": [{"path": rel, "size_bytes": size} for rel, size in items]},
+                    indent=2,
+                )
             )
-        )
+        except BrokenPipeError:
+            # Common when piping to `head`; exit without noisy stacktrace
+            try:
+                sys.stdout.close()
+            except Exception:
+                pass
+            return
     else:
         show_sizes = bool(getattr(args, "show_sizes", False))
-        if show_sizes:
-            for rel, size in items:
-                print(f"{size:>10}  {rel}")
-        else:
-            for rel, _ in items:
-                print(rel)
+        try:
+            if show_sizes:
+                for rel, size in items:
+                    print(f"{size:>10}  {rel}")
+            else:
+                for rel, _ in items:
+                    print(rel)
+        except BrokenPipeError:
+            # Allow piping to tools that close early without stacktrace
+            try:
+                sys.stdout.close()
+            except Exception:
+                pass
+            return
