@@ -88,6 +88,12 @@ async def run_command(args: argparse.Namespace, config: Config) -> None:
             # Pass progress to the coordinator after creation
             if hasattr(indexing_coordinator, "progress"):
                 indexing_coordinator.progress = progress_instance
+            # Pass startup profiling flag
+            if getattr(args, "profile_startup", False):
+                try:
+                    setattr(indexing_coordinator, "profile_startup", True)
+                except Exception:
+                    pass
 
             # Get initial stats
             initial_stats = await indexing_coordinator.get_stats()
@@ -113,6 +119,16 @@ async def run_command(args: argparse.Namespace, config: Config) -> None:
 
         # Display results
         _print_completion_summary(stats, formatter)
+
+        # Emit startup profiling timings if requested
+        if getattr(args, "profile_startup", False):
+            try:
+                import json as _json
+                prof = getattr(indexing_coordinator, "_startup_profile", None)
+                if prof:
+                    print(_json.dumps({"startup_profile": prof}, indent=2), file=sys.stderr)
+            except Exception:
+                pass
 
         # Offer to add timed-out files to exclusion list in local config
         try:

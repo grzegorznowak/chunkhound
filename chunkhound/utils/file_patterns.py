@@ -430,14 +430,28 @@ def walk_subtree_worker(
         ignore_engine_obj = None
         if ignore_engine_args is not None:
             try:
-                from .ignore_engine import build_ignore_engine, build_repo_aware_ignore_engine  # type: ignore
+                from .ignore_engine import (
+                    build_ignore_engine,
+                    build_repo_aware_ignore_engine,
+                    build_repo_aware_ignore_engine_from_roots,
+                )  # type: ignore
                 if isinstance(ignore_engine_args, dict) and ignore_engine_args.get("mode") == "repo_aware":
-                    ignore_engine_obj = build_repo_aware_ignore_engine(
-                        root=ignore_engine_args["root"],
-                        sources=ignore_engine_args["sources"],
-                        chignore_file=ignore_engine_args["chf"],
-                        config_exclude=ignore_engine_args["cfg"],
-                    )
+                    roots = ignore_engine_args.get("roots")
+                    if roots:
+                        ignore_engine_obj = build_repo_aware_ignore_engine_from_roots(
+                            root=ignore_engine_args["root"],
+                            repo_roots=list(roots),
+                            sources=ignore_engine_args["sources"],
+                            chignore_file=ignore_engine_args["chf"],
+                            config_exclude=ignore_engine_args["cfg"],
+                        )
+                    else:
+                        ignore_engine_obj = build_repo_aware_ignore_engine(
+                            root=ignore_engine_args["root"],
+                            sources=ignore_engine_args["sources"],
+                            chignore_file=ignore_engine_args["chf"],
+                            config_exclude=ignore_engine_args["cfg"],
+                        )
                 else:
                     root, sources, chf, cfg_ex = ignore_engine_args  # type: ignore
                     ignore_engine_obj = build_ignore_engine(

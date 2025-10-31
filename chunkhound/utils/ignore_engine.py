@@ -273,4 +273,35 @@ def _transform_gitignore_line(dir_rel: str, line: str) -> list[str]:
     return parts
 
 
-__all__ = ["IgnoreEngine", "MatchInfo", "build_ignore_engine"]
+def detect_repo_roots(root: Path, config_exclude: Optional[Iterable[str]] = None) -> list[Path]:
+    """Public helper to detect repo roots under a workspace root.
+
+    Applies pruning using config_exclude (gitwildmatch semantics) to avoid
+    descending into heavy trees (e.g., node_modules) while scanning.
+    """
+    pre_spec = _compile_gitwildmatch(config_exclude or []) if config_exclude else None
+    return _detect_repo_roots(root, pre_spec)
+
+
+def build_repo_aware_ignore_engine_from_roots(
+    root: Path,
+    repo_roots: list[Path],
+    sources: list[str],
+    chignore_file: str = ".chignore",
+    config_exclude: Optional[Iterable[str]] = None,
+) -> RepoAwareIgnoreEvaluator:
+    """Build a repo-aware evaluator from a precomputed list of repo roots.
+
+    Avoids re-scanning the entire workspace per worker when running in parallel.
+    """
+    return RepoAwareIgnoreEvaluator(root, repo_roots, sources, chignore_file, config_exclude)
+
+
+__all__ = [
+    "IgnoreEngine",
+    "MatchInfo",
+    "build_ignore_engine",
+    "build_repo_aware_ignore_engine",
+    "build_repo_aware_ignore_engine_from_roots",
+    "detect_repo_roots",
+]

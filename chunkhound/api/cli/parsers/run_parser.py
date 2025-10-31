@@ -191,6 +191,16 @@ def add_run_subparser(subparsers: Any) -> argparse.ArgumentParser:
         help="Sentinel to compare against for --check-ignores (default: git)",
     )
 
+    # Startup profiling (timings for discovery, cleanup, change-scan)
+    run_parser.add_argument(
+        "--profile-startup",
+        action="store_true",
+        help=(
+            "Emit startup phase timings (discovery/cleanup/change-scan) as JSON to stderr; "
+            "minimal overhead when enabled"
+        ),
+    )
+
     return cast(argparse.ArgumentParser, run_parser)
 
 
