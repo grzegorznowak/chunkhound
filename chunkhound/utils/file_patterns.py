@@ -13,8 +13,14 @@
 import os
 import re
 from fnmatch import translate
+from functools import lru_cache
 from pathlib import Path
 from typing import Pattern, Optional
+
+
+@lru_cache(maxsize=4096)
+def _compile_pattern_global(pattern: str) -> Pattern[str]:
+    return re.compile(translate(pattern))
 
 
 def compile_pattern(pattern: str, cache: dict[str, Pattern[str]]) -> Pattern[str]:
@@ -31,9 +37,52 @@ def compile_pattern(pattern: str, cache: dict[str, Pattern[str]]) -> Pattern[str
         Modifies cache as side effect for performance
     """
     if pattern not in cache:
-        regex_pattern = translate(pattern)
-        cache[pattern] = re.compile(regex_pattern)
+        # Prefer a small per-process LRU to avoid recompiling identical patterns
+        cache[pattern] = _compile_pattern_global(pattern)
     return cache[pattern]
+
+
+def _summarize_include_patterns(patterns: list[str]) -> tuple[set[str], set[str], bool]:
+    """Derive fast-path include sets from simple patterns.
+
+    Returns:
+        (allowed_exts, allowed_names, has_complex)
+
+    - allowed_exts captures patterns like "**/*.py" or "*.py" -> {".py"}
+    - allowed_names captures exact filename includes like "**/Makefile" or "Makefile"
+    - has_complex true when any pattern isn't a pure extension or exact name
+    """
+    exts: set[str] = set()
+    names: set[str] = set()
+    complex_pat = False
+
+    def is_simple_ext(s: str) -> str | None:
+        # Accept forms like "*.py" exactly (no other wildcards or path separators)
+        if s.startswith("*.") and ("*" not in s[2:]) and ("?" not in s) and ("[" not in s) and ("/" not in s):
+            return s[1:]
+        return None
+
+    def is_exact_name(s: str) -> str | None:
+        # No wildcards and no path separators
+        if ("*" not in s) and ("?" not in s) and ("[" not in s) and ("/" not in s) and s:
+            return s
+        return None
+
+    for p in patterns or []:
+        q = p
+        if q.startswith("**/"):
+            q = q[3:]
+        ext = is_simple_ext(q)
+        if ext is not None:
+            exts.add(ext)
+            continue
+        nm = is_exact_name(q)
+        if nm is not None:
+            names.add(nm)
+            continue
+        complex_pat = True
+
+    return exts, names, complex_pat
 
 
 def should_exclude_path(
@@ -243,6 +292,13 @@ def scan_directory_files(
                 ):
                     continue
 
+                # Fast include prefilter: avoid regex matching when file can't possibly match
+                allow_exts, allow_names, has_complex = _summarize_include_patterns(patterns)
+                if not has_complex:
+                    fname = item.name
+                    if (fname not in allow_names) and (item.suffix not in allow_exts):
+                        continue
+
                 # Check against include patterns
                 if should_include_file(item, directory, patterns, pattern_cache):
                     files.append(item)
@@ -291,6 +347,9 @@ def walk_directory_tree(
     except (FileNotFoundError, NotADirectoryError, PermissionError) as e:
         # Directory deleted, became a file, or permission denied before walk started
         return files, gitignore_patterns
+
+    # Precompute include summary once for this walk
+    inc_allow_exts, inc_allow_names, inc_has_complex = _summarize_include_patterns(patterns)
 
     for dirpath, dirnames, filenames in walk_iter:
         current_dir = Path(dirpath)
@@ -371,6 +430,11 @@ def walk_directory_tree(
                 ):
                     continue
 
+            # Fast include prefilter: skip files that cannot match simple include patterns
+            if not inc_has_complex:
+                if (filename not in inc_allow_names) and (file_path.suffix not in inc_allow_exts):
+                    continue
+
             if should_include_file(file_path, root_directory, patterns, pattern_cache):
                 files.append(file_path)
 
@@ -437,6 +501,7 @@ def walk_subtree_worker(
                 )  # type: ignore
                 if isinstance(ignore_engine_args, dict) and ignore_engine_args.get("mode") == "repo_aware":
                     roots = ignore_engine_args.get("roots")
+                    backend = ignore_engine_args.get("backend", "python")
                     if roots:
                         ignore_engine_obj = build_repo_aware_ignore_engine_from_roots(
                             root=ignore_engine_args["root"],
@@ -444,6 +509,7 @@ def walk_subtree_worker(
                             sources=ignore_engine_args["sources"],
                             chignore_file=ignore_engine_args["chf"],
                             config_exclude=ignore_engine_args["cfg"],
+                            backend=backend,
                         )
                     else:
                         ignore_engine_obj = build_repo_aware_ignore_engine(
@@ -451,6 +517,7 @@ def walk_subtree_worker(
                             sources=ignore_engine_args["sources"],
                             chignore_file=ignore_engine_args["chf"],
                             config_exclude=ignore_engine_args["cfg"],
+                            backend=backend,
                         )
                 else:
                     root, sources, chf, cfg_ex = ignore_engine_args  # type: ignore

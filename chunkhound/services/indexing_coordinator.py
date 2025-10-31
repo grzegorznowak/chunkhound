@@ -222,26 +222,27 @@ class IndexingCoordinator(BaseService):
     # Ignore engine caching helpers (per-run, process-local)
     # ------------------------------------------------------------------
     def _engine_cache_key(
-        self, root: Path, sources: list[str], chf: str, cfg: list[str] | tuple[str, ...]
-    ) -> tuple[str, tuple[str, ...], str, tuple[str, ...]]:
+        self, root: Path, sources: list[str], chf: str, cfg: list[str] | tuple[str, ...], backend: str = "python"
+    ) -> tuple[str, tuple[str, ...], str, tuple[str, ...], str]:
         return (
             str(root.resolve()),
             tuple(sources),
             chf,
             tuple(cfg),
+            backend,
         )
 
     def _get_or_build_ignore_engine(
-        self, root: Path, sources: list[str], chf: str, cfg: list[str] | tuple[str, ...]
+        self, root: Path, sources: list[str], chf: str, cfg: list[str] | tuple[str, ...], backend: str = "python"
     ) -> object:
-        key = self._engine_cache_key(root, sources, chf, cfg)
+        key = self._engine_cache_key(root, sources, chf, cfg, backend)
         eng = self._ignore_engine_cache.get(key)
         if eng is not None:
             return eng
         try:
             from chunkhound.utils.ignore_engine import build_repo_aware_ignore_engine as _bre
 
-            eng = _bre(root=root, sources=sources, chignore_file=chf, config_exclude=list(cfg))
+            eng = _bre(root=root, sources=sources, chignore_file=chf, config_exclude=list(cfg), backend=backend)
             self._ignore_engine_cache[key] = eng
             return eng
         except Exception:
@@ -1568,6 +1569,7 @@ class IndexingCoordinator(BaseService):
             sources=(self.config.indexing.resolve_ignore_sources() if getattr(self, "config", None) and getattr(self.config, "indexing", None) else ["config"]),
             chf=(getattr(self.config.indexing, "chignore_file", ".chignore") if getattr(self, "config", None) and getattr(self.config, "indexing", None) else ".chignore"),
             cfg=list(effective_excludes),
+            backend=(getattr(self.config.indexing, "gitignore_backend", "python") if getattr(self, "config", None) and getattr(self.config, "indexing", None) else "python"),
         )
 
         root_files = scan_directory_files(
@@ -1652,12 +1654,14 @@ class IndexingCoordinator(BaseService):
             sources = self.config.indexing.resolve_ignore_sources()
             chf = getattr(self.config.indexing, "chignore_file", ".chignore")
             cfg_excludes = self.config.indexing.get_effective_config_excludes()
+            backend = getattr(self.config.indexing, "gitignore_backend", "python")
             engine_args = {
                 "mode": "repo_aware",
                 "root": directory.resolve(),
                 "sources": sources,
                 "chf": chf,
                 "cfg": list(cfg_excludes),
+                "backend": backend,
             }
 
         # Use default (enabled) if not explicitly specified
@@ -1713,6 +1717,7 @@ class IndexingCoordinator(BaseService):
                     sources=engine_args["sources"],
                     chf=engine_args["chf"],
                     cfg=engine_args["cfg"],
+                    backend=engine_args.get("backend", "python"),
                 )
             except Exception:
                 ignore_engine_obj = None

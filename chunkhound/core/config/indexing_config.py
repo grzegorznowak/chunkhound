@@ -203,6 +203,13 @@ class IndexingConfig(BaseModel):
     # Root-level file name for ChunkHound-specific ignores (gitwildmatch syntax)
     chignore_file: str = Field(default=".chignore")
 
+    # Backend for .gitignore evaluation when repo-aware engine is used
+    # - "python": use pathspec-based evaluator (default)
+    # - "libgit2": use libgit2/pygit2 for native ignore decisions (optional)
+    gitignore_backend: str = Field(
+        default="python", description="Backend for gitignore evaluation: python|libgit2"
+    )
+
     # When true, also load the CH root's .gitignore as a global overlay in addition
     # to per-repo .gitignore files. This does not affect Git itself; it is a CH-only
     # convenience to apply workspace-wide rules across external repos.
@@ -367,6 +374,10 @@ class IndexingConfig(BaseModel):
                 config["max_concurrent"] = int(maxc)
             except ValueError:
                 pass
+
+        # Gitignore backend selection
+        if backend := os.getenv("CHUNKHOUND_INDEXING__GITIGNORE_BACKEND"):
+            config["gitignore_backend"] = backend
 
         return config
 

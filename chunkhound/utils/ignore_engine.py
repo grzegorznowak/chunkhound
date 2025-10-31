@@ -217,9 +217,14 @@ def build_repo_aware_ignore_engine(
     sources: list[str],
     chignore_file: str = ".chignore",
     config_exclude: Optional[Iterable[str]] = None,
+    backend: str = "python",
 ) -> RepoAwareIgnoreEvaluator:
     pre_spec = _compile_gitwildmatch(config_exclude or []) if (config_exclude) else None
     repo_roots = _detect_repo_roots(root, pre_spec)
+    if backend == "libgit2":
+        eng = _try_build_libgit2_repo_aware(root, repo_roots, sources, chignore_file, config_exclude)
+        if eng is not None:
+            return eng
     return RepoAwareIgnoreEvaluator(root, repo_roots, sources, chignore_file, config_exclude)
 
 
@@ -250,25 +255,38 @@ def _transform_gitignore_line(dir_rel: str, line: str) -> list[str]:
             p = "!" + p
         parts.append(p)
 
-    # Resolve directory prefix
+    # Resolve directory prefix with Git semantics
+    # Rules (simplified from gitignore docs):
+    # - Leading '/' anchors to the directory containing the .gitignore.
+    # - A pattern that contains a '/' (after trimming trailing '/') is anchored to that directory.
+    # - A pattern without any '/' matches in any directory under the .gitignore directory.
+    core = line
+    has_slash = "/" in core
+
     if dir_rel == ".":
-        # root-level
-        if line.startswith("/"):
-            # Keep leading slash to enforce root anchoring semantics
-            add(line)
+        # Root-level .gitignore
+        if core.startswith("/"):
+            # Anchored to root; keep leading slash to prevent filename-only matches
+            add(core)
+        elif has_slash:
+            # Contains '/', anchored to root
+            add(core)
         else:
-            # both direct and nested under root
-            add(line)
-            add(f"**/{line}")
+            # No '/', match anywhere (root and nested)
+            add(core)
+            add(f"**/{core}")
     else:
-        # subdirectory scope
-        if line.startswith("/"):
-            # anchored to this directory
-            add(f"{dir_rel}/{line[1:]}")
+        # Subdirectory .gitignore
+        if core.startswith("/"):
+            # Anchored to this directory
+            add(f"{dir_rel}/{core[1:]}")
+        elif has_slash:
+            # Contains '/', anchored to this directory
+            add(f"{dir_rel}/{core}")
         else:
-            # both direct and nested within this subtree
-            add(f"{dir_rel}/{line}")
-            add(f"{dir_rel}/**/{line}")
+            # No '/', match anywhere under this directory (direct and nested)
+            add(f"{dir_rel}/{core}")
+            add(f"{dir_rel}/**/{core}")
 
     return parts
 
@@ -289,12 +307,128 @@ def build_repo_aware_ignore_engine_from_roots(
     sources: list[str],
     chignore_file: str = ".chignore",
     config_exclude: Optional[Iterable[str]] = None,
+    backend: str = "python",
 ) -> RepoAwareIgnoreEvaluator:
     """Build a repo-aware evaluator from a precomputed list of repo roots.
 
     Avoids re-scanning the entire workspace per worker when running in parallel.
     """
+    if backend == "libgit2":
+        eng = _try_build_libgit2_repo_aware(root, repo_roots, sources, chignore_file, config_exclude)
+        if eng is not None:
+            return eng
     return RepoAwareIgnoreEvaluator(root, repo_roots, sources, chignore_file, config_exclude)
+
+
+# --------------------------- Optional libgit2 backend ---------------------------
+class RepoAwareLibgit2Evaluator:
+    """Repo-aware evaluator using libgit2 (pygit2) for gitignore decisions.
+
+    Falls back to Python engine semantics if pygit2 isn't available or a call fails.
+    Always applies config_exclude (pathspec) first as a hard exclude layer.
+    """
+
+    def __init__(
+        self,
+        workspace_root: Path,
+        repo_roots: list[Path],
+        sources: list[str],
+        chignore_file: str,
+        config_exclude: Optional[Iterable[str]] = None,
+    ) -> None:
+        self.root = workspace_root.resolve()
+        self.repo_roots = sorted([p.resolve() for p in repo_roots], key=lambda p: len(p.as_posix()), reverse=True)
+        self.sources = sources
+        self.chignore_file = chignore_file
+        self.config_exclude = list(config_exclude or [])
+
+        # Precompile config_exclude with pathspec for fast hard excludes
+        self._cfg_spec = _compile_gitwildmatch(self.config_exclude) if self.config_exclude else None
+
+        # Open libgit2 repos
+        self._repos: Dict[Path, object] = {}
+        try:
+            import pygit2  # type: ignore
+            self._pygit2 = pygit2
+        except Exception:
+            self._pygit2 = None
+
+        if self._pygit2 is not None:
+            for rr in self.repo_roots:
+                try:
+                    # pygit2 accepts workdir path (not .git) for Repository()
+                    self._repos[rr] = self._pygit2.Repository(str(rr))
+                except Exception:
+                    # Ignore repos we can't open; they'll be handled by cfg spec only
+                    continue
+
+    def _nearest_repo(self, path: Path) -> Optional[Path]:
+        p = path.resolve()
+        for rr in self.repo_roots:
+            try:
+                p.relative_to(rr)
+                return rr
+            except Exception:
+                continue
+        return None
+
+    def _cfg_excluded(self, rel: str, is_dir: bool) -> bool:
+        if self._cfg_spec is None:
+            return False
+        return self._cfg_spec.match_file(rel) or (is_dir and self._cfg_spec.match_file(rel + "/"))
+
+    def matches(self, path: Path, is_dir: bool) -> Optional[MatchInfo]:
+        # Hard exclude via config_exclude first
+        try:
+            rel_cfg = path.resolve().relative_to(self.root).as_posix()
+        except Exception:
+            rel_cfg = path.name
+        if self._cfg_excluded(rel_cfg, is_dir):
+            return MatchInfo(matched=True, source=self.root, pattern=None)
+
+        rr = self._nearest_repo(path)
+        if rr is None or self._pygit2 is None:
+            return None
+        repo = self._repos.get(rr)
+        if repo is None:
+            return None
+
+        # Compute repo-relative path
+        try:
+            rel = path.resolve().relative_to(rr).as_posix()
+        except Exception:
+            rel = path.name
+
+        # Try common pygit2 ignore API methods (varies by version)
+        try:
+            fn = getattr(repo, "is_path_ignored", None) or getattr(repo, "path_is_ignored", None)
+            if callable(fn):
+                ign = bool(fn(rel if not is_dir else (rel + "/")))
+                if ign:
+                    return MatchInfo(matched=True, source=rr, pattern=None)
+        except Exception:
+            return None
+        return None
+
+
+def _try_build_libgit2_repo_aware(
+    root: Path,
+    repo_roots: list[Path],
+    sources: list[str],
+    chignore_file: str,
+    config_exclude: Optional[Iterable[str]] = None,
+) -> Optional[RepoAwareLibgit2Evaluator]:
+    # Only attempt when gitignore is part of sources
+    if "gitignore" not in (sources or []):
+        return None
+    try:
+        import pygit2  # noqa: F401
+    except Exception:
+        return None
+    try:
+        return RepoAwareLibgit2Evaluator(root, repo_roots, sources, chignore_file, config_exclude)
+    except Exception:
+        return None
 
 
 __all__ = [
