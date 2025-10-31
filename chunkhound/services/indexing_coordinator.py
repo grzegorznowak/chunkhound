@@ -1348,6 +1348,10 @@ class IndexingCoordinator(BaseService):
         # Get top-level directories (first level subdirectories)
         # RACE CONDITION SAFETY: Handle directories deleted/modified during iteration
         top_level_items = []
+        # Use effective config excludes (includes defaults even when sentinel is set)
+        effective_excludes = list(
+            (self.config.indexing.get_effective_config_excludes() if self.config and getattr(self.config, "indexing", None) else [])
+        )
         try:
             for item in directory.iterdir():
                 try:
@@ -1358,7 +1362,9 @@ class IndexingCoordinator(BaseService):
                     # Check if this directory should be excluded
                     rel_path = item.relative_to(directory)
                     should_skip = False
-                    for pattern in exclude_patterns:
+                    # Prefer effective_excludes for early pruning; fall back to provided list
+                    prune_patterns = effective_excludes or exclude_patterns
+                    for pattern in prune_patterns:
                         if pattern.startswith("**/") and pattern.endswith("/**"):
                             target_dir = pattern[3:-3]
                             if target_dir in rel_path.parts:
@@ -1428,7 +1434,8 @@ class IndexingCoordinator(BaseService):
                             "root": directory,
                             "sources": (self.config.indexing.resolve_ignore_sources() if getattr(self, "config", None) and getattr(self.config, "indexing", None) else ["config"]),
                             "chf": (getattr(self.config.indexing, "chignore_file", ".chignore") if getattr(self, "config", None) and getattr(self.config, "indexing", None) else ".chignore"),
-                            "cfg": list(exclude_patterns or []),
+                            # Use effective config excludes so defaults (.chunkhound*, node_modules, etc.) apply in parallel too
+                            "cfg": list(effective_excludes),
                         }
                     ),
                 )
@@ -1458,7 +1465,8 @@ class IndexingCoordinator(BaseService):
             root=directory,
             sources=(self.config.indexing.resolve_ignore_sources() if getattr(self, "config", None) and getattr(self.config, "indexing", None) else ["config"]),
             chignore_file=(getattr(self.config.indexing, "chignore_file", ".chignore") if getattr(self, "config", None) and getattr(self.config, "indexing", None) else ".chignore"),
-            config_exclude=list(exclude_patterns or []),
+            # Apply effective default excludes in the root scan too
+            config_exclude=list(effective_excludes),
         )
 
         root_files = scan_directory_files(
