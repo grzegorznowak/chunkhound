@@ -244,7 +244,15 @@ def build_repo_aware_ignore_engine(
         gi = root.resolve() / ".gitignore"
         if gi.exists():
             try:
-                overlay_patterns = gi.read_text(encoding="utf-8", errors="ignore").splitlines()
+                raw_lines = gi.read_text(encoding="utf-8", errors="ignore").splitlines()
+                # Transform overlay lines using the same normalization as .gitignore collection
+                transformed: list[str] = []
+                for raw in raw_lines:
+                    line = raw.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    transformed.extend(_transform_gitignore_line('.', line))
+                overlay_patterns = transformed
             except Exception:
                 overlay_patterns = None
     return RepoAwareIgnoreEvaluator(root, repo_roots, sources, chignore_file, config_exclude, overlay_patterns)

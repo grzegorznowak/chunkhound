@@ -121,7 +121,8 @@ class SimpleEventHandler(FileSystemEventHandler):
                 sources = self.config.indexing.resolve_ignore_sources()
                 cfg_ex = self.config.indexing.get_effective_config_excludes()
                 chf = self.config.indexing.chignore_file
-                self._engine = build_repo_aware_ignore_engine(self._root, sources, chf, cfg_ex)
+                overlay = bool(getattr(self.config.indexing, "workspace_gitignore_overlay", False))
+                self._engine = build_repo_aware_ignore_engine(self._root, sources, chf, cfg_ex, workspace_overlay=overlay)
         except Exception:
             self._engine = None
 
