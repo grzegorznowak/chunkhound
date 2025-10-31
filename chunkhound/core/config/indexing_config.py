@@ -112,6 +112,7 @@ class IndexingConfig(BaseModel):
             # ChunkHound config and working directory
             "**/.chunkhound/**",
             "**/.chunkhound.json",
+            ".chunkhound.json",
             "**/.mypy_cache/**",
             # Build artifacts and distributions
             "**/dist/**",
