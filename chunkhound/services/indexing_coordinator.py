@@ -1494,6 +1494,23 @@ class IndexingCoordinator(BaseService):
         effective_excludes = list(
             (self.config.indexing.get_effective_config_excludes() if self.config and getattr(self.config, "indexing", None) else [])
         )
+        # Also add dynamic DB path exclusion when DB lives under the directory
+        try:
+            dbp = getattr(self._db, "db_path", None)
+            if dbp:
+                dbp_res = Path(dbp).resolve()
+                dir_res = directory.resolve()
+                try:
+                    rel = dbp_res.relative_to(dir_res)
+                    if dbp_res.is_dir():
+                        rp = rel.as_posix()
+                        effective_excludes.extend([rp, f"{rp}/**"])  # safe duplicates
+                    else:
+                        effective_excludes.append(rel.as_posix())
+                except Exception:
+                    pass
+        except Exception:
+            pass
         try:
             for item in directory.iterdir():
                 try:
@@ -1719,6 +1736,26 @@ class IndexingCoordinator(BaseService):
             sources = self.config.indexing.resolve_ignore_sources()
             chf = getattr(self.config.indexing, "chignore_file", ".chignore")
             cfg_excludes = self.config.indexing.get_effective_config_excludes()
+            # Dynamically exclude the database path when it lives under the target directory
+            try:
+                dbp = getattr(self._db, "db_path", None)
+                if dbp:
+                    dbp_res = Path(dbp).resolve()
+                    dir_res = directory.resolve()
+                    try:
+                        rel = dbp_res.relative_to(dir_res)
+                        # If DB path is a directory, exclude the whole subtree; if file, exclude the file
+                        if dbp_res.is_dir():
+                            rp = rel.as_posix()
+                            cfg_excludes.extend([rp, f"{rp}/**"])  # idempotent later by validator
+                            exclude_patterns.extend([rp, f"{rp}/**"])  # local excludes too
+                        else:
+                            cfg_excludes.append(rel.as_posix())
+                            exclude_patterns.append(rel.as_posix())
+                    except Exception:
+                        pass
+            except Exception:
+                pass
             backend = getattr(self.config.indexing, "gitignore_backend", "python")
             engine_args = {
                 "mode": "repo_aware",

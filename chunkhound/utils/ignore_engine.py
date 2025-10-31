@@ -12,6 +12,7 @@ from dataclasses import dataclass
 import os
 from pathlib import Path
 from typing import Iterable, Optional, Dict, List, Tuple
+from loguru import logger
 
 try:
     from pathspec import PathSpec
@@ -418,16 +419,32 @@ def _try_build_libgit2_repo_aware(
     chignore_file: str,
     config_exclude: Optional[Iterable[str]] = None,
 ) -> Optional[RepoAwareLibgit2Evaluator]:
+    # Warn exactly once per process when we cannot honor libgit2 backend
+    global _LIBGIT2_WARNED
+    try:
+        _LIBGIT2_WARNED
+    except NameError:
+        _LIBGIT2_WARNED = False  # type: ignore[var-annotated]
     # Only attempt when gitignore is part of sources
     if "gitignore" not in (sources or []):
         return None
     try:
         import pygit2  # noqa: F401
     except Exception:
+        if not _LIBGIT2_WARNED and not os.environ.get("CHUNKHOUND_MCP_MODE"):
+            logger.warning(
+                "gitignore_backend=libgit2 requested but pygit2 is not available; falling back to python backend"
+            )
+            _LIBGIT2_WARNED = True  # type: ignore[assignment]
         return None
     try:
         return RepoAwareLibgit2Evaluator(root, repo_roots, sources, chignore_file, config_exclude)
     except Exception:
+        if not _LIBGIT2_WARNED and not os.environ.get("CHUNKHOUND_MCP_MODE"):
+            logger.warning(
+                "gitignore_backend=libgit2 requested but initialization failed; falling back to python backend"
+            )
+            _LIBGIT2_WARNED = True  # type: ignore[assignment]
         return None
 
 
