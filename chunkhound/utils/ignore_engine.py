@@ -181,7 +181,6 @@ class RepoAwareIgnoreEvaluator:
         sources: list[str],
         chignore_file: str,
         config_exclude: Optional[Iterable[str]] = None,
-        overlay_patterns: Optional[Iterable[str]] = None,
     ) -> None:
         self.root = workspace_root.resolve()
         self.repo_roots = sorted([p.resolve() for p in repo_roots], key=lambda p: len(p.as_posix()), reverse=True)
@@ -193,16 +192,8 @@ class RepoAwareIgnoreEvaluator:
         self._per_repo: Dict[Path, IgnoreEngine] = {}
         for rr in self.repo_roots:
             self._per_repo[rr] = build_ignore_engine(rr, sources, chignore_file, self.config_exclude)
-        # Workspace engine for non-repo areas (may include workspace-level .gitignore)
+        # Workspace engine for non-repo areas
         self._workspace_engine = build_ignore_engine(self.root, sources, chignore_file, self.config_exclude)
-
-        # Optional workspace overlay: a global PathSpec compiled from the CH root .gitignore
-        self._overlay_spec = None
-        if overlay_patterns:
-            try:
-                self._overlay_spec = _compile_gitwildmatch(list(overlay_patterns))
-            except Exception:
-                self._overlay_spec = None
 
     def _nearest_repo(self, path: Path) -> Optional[Path]:
         p = path.resolve()
@@ -215,15 +206,6 @@ class RepoAwareIgnoreEvaluator:
         return None
 
     def matches(self, path: Path, is_dir: bool) -> Optional[MatchInfo]:
-        # Global overlay first (non-negatable by repo rules)
-        try:
-            if self._overlay_spec is not None:
-                rel = path.resolve().relative_to(self.root).as_posix()
-                if self._overlay_spec.match_file(rel) or (is_dir and self._overlay_spec.match_file(rel + "/")):
-                    return MatchInfo(matched=True, source=self.root / ".gitignore", pattern=None)
-        except Exception:
-            pass
-
         rr = self._nearest_repo(path)
         if rr is not None:
             return self._per_repo[rr].matches(path, is_dir)
@@ -235,27 +217,10 @@ def build_repo_aware_ignore_engine(
     sources: list[str],
     chignore_file: str = ".chignore",
     config_exclude: Optional[Iterable[str]] = None,
-    workspace_overlay: bool = False,
 ) -> RepoAwareIgnoreEvaluator:
     pre_spec = _compile_gitwildmatch(config_exclude or []) if (config_exclude) else None
     repo_roots = _detect_repo_roots(root, pre_spec)
-    overlay_patterns = None
-    if workspace_overlay:
-        gi = root.resolve() / ".gitignore"
-        if gi.exists():
-            try:
-                raw_lines = gi.read_text(encoding="utf-8", errors="ignore").splitlines()
-                # Transform overlay lines using the same normalization as .gitignore collection
-                transformed: list[str] = []
-                for raw in raw_lines:
-                    line = raw.strip()
-                    if not line or line.startswith("#"):
-                        continue
-                    transformed.extend(_transform_gitignore_line('.', line))
-                overlay_patterns = transformed
-            except Exception:
-                overlay_patterns = None
-    return RepoAwareIgnoreEvaluator(root, repo_roots, sources, chignore_file, config_exclude, overlay_patterns)
+    return RepoAwareIgnoreEvaluator(root, repo_roots, sources, chignore_file, config_exclude)
 
 
 

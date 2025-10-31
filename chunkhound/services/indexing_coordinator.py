@@ -1545,9 +1545,8 @@ class IndexingCoordinator(BaseService):
             from chunkhound.utils.ignore_engine import build_repo_aware_ignore_engine  # type: ignore
 
             cfg_excludes = self.config.indexing.get_effective_config_excludes()
-            overlay = bool(getattr(self.config.indexing, "workspace_gitignore_overlay", False))
             ignore_engine_obj = build_repo_aware_ignore_engine(
-                root=directory, sources=sources, chignore_file=chf, config_exclude=cfg_excludes, workspace_overlay=overlay
+                root=directory, sources=sources, chignore_file=chf, config_exclude=cfg_excludes
             )
             engine_args = {
                 "mode": "repo_aware",
@@ -1555,7 +1554,6 @@ class IndexingCoordinator(BaseService):
                 "sources": sources,
                 "chf": chf,
                 "cfg": list(cfg_excludes),
-                "overlay": overlay,
             }
 
         # Use default (enabled) if not explicitly specified
