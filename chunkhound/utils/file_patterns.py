@@ -437,6 +437,7 @@ def walk_subtree_worker(
                         sources=ignore_engine_args["sources"],
                         chignore_file=ignore_engine_args["chf"],
                         config_exclude=ignore_engine_args["cfg"],
+                        workspace_overlay=bool(ignore_engine_args.get("overlay", False)),
                     )
                 else:
                     root, sources, chf, cfg_ex = ignore_engine_args  # type: ignore

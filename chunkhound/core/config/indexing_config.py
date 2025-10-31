@@ -199,6 +199,14 @@ class IndexingConfig(BaseModel):
     # Root-level file name for ChunkHound-specific ignores (gitwildmatch syntax)
     chignore_file: str = Field(default=".chignore")
 
+    # When true, also load the CH root's .gitignore as a global overlay in addition
+    # to per-repo .gitignore files. This does not affect Git itself; it is a CH-only
+    # convenience to apply workspace-wide rules across external repos.
+    workspace_gitignore_overlay: bool = Field(
+        default=False,
+        description="Apply CH root .gitignore as global overlay across repos",
+    )
+
     @field_validator("include", "exclude")
     def validate_patterns(cls, v: list[str]) -> list[str]:
         """Validate glob patterns."""
