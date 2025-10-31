@@ -147,6 +147,10 @@ class IndexingCoordinator(BaseService):
         # Chunk cache service for content-based comparison
         self._chunk_cache = ChunkCacheService()
 
+        # Per-run cache for repo-aware ignore engines to avoid repeated tree scans
+        # Key: (root, tuple(sources), chignore_file, tuple(cfg_excludes))
+        self._ignore_engine_cache: dict[tuple[str, tuple[str, ...], str, tuple[str, ...]], object] = {}
+
         # SECTION: File_Level_Locking
         # CRITICAL: Prevents race conditions during concurrent file processing
         # PATTERN: Lazy lock creation within event loop context
@@ -213,6 +217,35 @@ class IndexingCoordinator(BaseService):
         """
         language = detect_language(file_path)
         return language if language != Language.UNKNOWN else None
+
+    # ------------------------------------------------------------------
+    # Ignore engine caching helpers (per-run, process-local)
+    # ------------------------------------------------------------------
+    def _engine_cache_key(
+        self, root: Path, sources: list[str], chf: str, cfg: list[str] | tuple[str, ...]
+    ) -> tuple[str, tuple[str, ...], str, tuple[str, ...]]:
+        return (
+            str(root.resolve()),
+            tuple(sources),
+            chf,
+            tuple(cfg),
+        )
+
+    def _get_or_build_ignore_engine(
+        self, root: Path, sources: list[str], chf: str, cfg: list[str] | tuple[str, ...]
+    ) -> object:
+        key = self._engine_cache_key(root, sources, chf, cfg)
+        eng = self._ignore_engine_cache.get(key)
+        if eng is not None:
+            return eng
+        try:
+            from chunkhound.utils.ignore_engine import build_repo_aware_ignore_engine as _bre
+
+            eng = _bre(root=root, sources=sources, chignore_file=chf, config_exclude=list(cfg))
+            self._ignore_engine_cache[key] = eng
+            return eng
+        except Exception:
+            return None
 
     def _determine_db_batch_size(self, pending_inserts: list[Chunk]) -> int:
         """Compute an insert batch size using env/config or dynamic memory heuristics.
@@ -1460,13 +1493,12 @@ class IndexingCoordinator(BaseService):
 
         # Scan files in the root directory itself (not in subdirs) using helper
         root_gitignore_patterns = parent_gitignores.get(directory, [])
-        # Build local repo-aware engine for the root directory scan
-        local_engine = __import__("chunkhound.utils.ignore_engine", fromlist=["build_repo_aware_ignore_engine"]).build_repo_aware_ignore_engine(  # type: ignore
+        # Build or reuse local repo-aware engine for the root directory scan
+        local_engine = self._get_or_build_ignore_engine(
             root=directory,
             sources=(self.config.indexing.resolve_ignore_sources() if getattr(self, "config", None) and getattr(self.config, "indexing", None) else ["config"]),
-            chignore_file=(getattr(self.config.indexing, "chignore_file", ".chignore") if getattr(self, "config", None) and getattr(self.config, "indexing", None) else ".chignore"),
-            # Apply effective default excludes in the root scan too
-            config_exclude=list(effective_excludes),
+            chf=(getattr(self.config.indexing, "chignore_file", ".chignore") if getattr(self, "config", None) and getattr(self.config, "indexing", None) else ".chignore"),
+            cfg=list(effective_excludes),
         )
 
         root_files = scan_directory_files(
@@ -1544,18 +1576,13 @@ class IndexingCoordinator(BaseService):
         if not exclude_patterns:
             exclude_patterns = []
 
-        # Prepare IgnoreEngine parameters from config (repo-aware)
+        # Prepare IgnoreEngine parameters (defer heavy engine build unless sequential path is taken)
         engine_args = None
         ignore_engine_obj = None
         if getattr(self, "config", None) is not None and getattr(self.config, "indexing", None) is not None:
             sources = self.config.indexing.resolve_ignore_sources()
             chf = getattr(self.config.indexing, "chignore_file", ".chignore")
-            from chunkhound.utils.ignore_engine import build_repo_aware_ignore_engine  # type: ignore
-
             cfg_excludes = self.config.indexing.get_effective_config_excludes()
-            ignore_engine_obj = build_repo_aware_ignore_engine(
-                root=directory, sources=sources, chignore_file=chf, config_exclude=cfg_excludes
-            )
             engine_args = {
                 "mode": "repo_aware",
                 "root": directory.resolve(),
@@ -1604,6 +1631,18 @@ class IndexingCoordinator(BaseService):
                 # Fall through to sequential
 
         # Sequential discovery (fallback or explicitly requested)
+        # Build the ignore engine only now (avoid heavy pre-build when parallel succeeds)
+        if engine_args is not None and ignore_engine_obj is None:
+            try:
+                ignore_engine_obj = self._get_or_build_ignore_engine(
+                    root=engine_args["root"],
+                    sources=engine_args["sources"],
+                    chf=engine_args["chf"],
+                    cfg=engine_args["cfg"],
+                )
+            except Exception:
+                ignore_engine_obj = None
+
         discovered_files = self._walk_directory_with_excludes(
             directory, patterns, exclude_patterns, use_inode_ordering, ignore_engine_obj, engine_args
         )
