@@ -58,11 +58,13 @@ def _simulate_with_profile(dir_path: Path, backend: str, pushdown: bool | None, 
 
 def test_git_pathspec_pushdown_reduces_rows_and_preserves_coverage(tmp_path: Path):
     repo = tmp_path / "repo"
-    # Create many non-included files and some included files
-    for i in range(400):
-        _w(repo / "data" / f"blob{i:03d}.txt")
-    for i in range(50):
-        _w(repo / "src" / f"m{i:03d}.py", f"print({i})\n")
+    # Create many non-included files and a larger set of included files
+    # Increased scale to reduce timing flakiness on macOS where process/FS jitter
+    # can dominate small benchmarks. Pushdown benefit becomes more pronounced.
+    for i in range(1200):
+        _w(repo / "data" / f"blob{i:04d}.txt")
+    for i in range(200):
+        _w(repo / "src" / f"m{i:04d}.py", f"print({i})\n")
     _git_init_and_commit(repo)
 
     # Baseline without pushdown
@@ -83,4 +85,3 @@ def test_git_pathspec_pushdown_reduces_rows_and_preserves_coverage(tmp_path: Pat
     d_yes = float(prof_yes.get("discovery_ms", 0))
     d_no = float(prof_no.get("discovery_ms", 0))
     assert d_yes <= d_no * 1.2
-

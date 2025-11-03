@@ -238,11 +238,11 @@ class IndexingConfig(BaseModel):
         description="Apply CH root .gitignore as global overlay across repos",
     )
 
-    # Apply the CH root's .gitignore to NON‑REPO paths only. Repo subtrees
+    # Apply the CH root's .gitignore to NON-REPO paths only. Repo subtrees
     # continue to follow their native Git rules. Off by default.
     workspace_gitignore_nonrepo: bool = Field(
         default=True,
-        description="Use CH root .gitignore only for non‑repo paths",
+        description="Use CH root .gitignore only for non-repo paths",
     )
 
     @field_validator("include", "exclude")
@@ -352,7 +352,7 @@ class IndexingConfig(BaseModel):
             "--nonrepo-gitignore",
             action="store_true",
             help=(
-                "Apply the CH root's .gitignore to NON‑REPO paths only; repo subtrees "
+                "Apply the CH root's .gitignore to NON-REPO paths only; repo subtrees "
                 "continue to follow their native Git rules"
             ),
         )
