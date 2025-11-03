@@ -201,6 +201,14 @@ def add_run_subparser(subparsers: Any) -> argparse.ArgumentParser:
         ),
     )
 
+    # Discovery backend (A/B experiments): default remains python
+    run_parser.add_argument(
+        "--discovery-backend",
+        choices=["auto", "python", "git", "git_only"],
+        default=None,
+        help="Override discovery backend for this run: auto|python|git|git_only",
+    )
+
     return cast(argparse.ArgumentParser, run_parser)
 
 

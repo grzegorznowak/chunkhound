@@ -121,7 +121,8 @@ class SimpleEventHandler(FileSystemEventHandler):
                 sources = self.config.indexing.resolve_ignore_sources()
                 cfg_ex = self.config.indexing.get_effective_config_excludes()
                 chf = self.config.indexing.chignore_file
-                self._engine = build_repo_aware_ignore_engine(self._root, sources, chf, cfg_ex)
+                overlay = bool(getattr(self.config.indexing, "workspace_gitignore_nonrepo", False))
+                self._engine = build_repo_aware_ignore_engine(self._root, sources, chf, cfg_ex, workspace_root_only_gitignore=overlay)
         except Exception:
             self._engine = None
 
@@ -683,8 +684,18 @@ class RealtimeIndexingService:
                 # Process the file
                 logger.debug(f"Processing {file_path} (priority: {priority})")
 
-                # For initial scan, skip embeddings for speed
-                skip_embeddings = priority == "initial"
+                # Fast path for embedding pass: generate missing embeddings for all chunks
+                # without re-parsing the file. Keeps the loop snappy and avoids diffing.
+                if priority == "embed":
+                    try:
+                        await self.services.indexing_coordinator.generate_missing_embeddings()
+                    except Exception as e:
+                        logger.warning(f"Embedding generation failed in realtime (embed pass): {e}")
+                    continue
+
+                # Skip embeddings for initial and change events to keep loop responsive.
+                # An explicit 'embed' follow-up event will generate embeddings.
+                skip_embeddings = True
 
                 # Use existing indexing coordinator
                 result = await self.services.indexing_coordinator.process_file(

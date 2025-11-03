@@ -124,3 +124,133 @@ uv run python scripts/bench_yaml.py \
 ## License
 
 MIT
+
+## Startup profile (discovery diagnostics)
+
+Use `--profile-startup` to emit a JSON block with discovery and startup timing diagnostics to stderr. This works for both simulate and full index runs.
+
+Examples:
+
+```bash
+# Simulate (discovery only) — file list on stdout, JSON profile on stderr
+CHUNKHOUND_NO_RICH=1 \
+chunkhound index --simulate . --sort path --profile-startup 2>profile.json
+
+# Full run (no embeddings) — JSON profile on stderr
+CHUNKHOUND_NO_RICH=1 \
+chunkhound index . --no-embeddings --profile-startup 2>profile.json
+```
+
+Fields in `startup_profile` (JSON):
+
+- `discovery_ms` — discovery time in milliseconds
+- `cleanup_ms` — orphan cleanup time in milliseconds
+- `change_scan_ms` — change-scan time in milliseconds
+- `resolved_backend` — discovery backend actually used: `python | git | git_only`
+- `resolved_reasons` — reasons for the decision (e.g., `no_repos`, `all_repos`, `mixed`, `explicit`)
+- `git_rows_tracked` — number of paths from `git ls-files` (tracked)
+- `git_rows_others` — number of paths from `git ls-files --others --exclude-standard`
+- `git_rows_total` — sum of the two above
+- `git_pathspecs` — number of pathspecs (`:(glob) ...`) pushed down to Git for pre-filtering
+
+Notes:
+
+- `git_*` counters appear only when the backend is `git` or `git_only`.
+- In `auto` mode, the backend is chosen heuristically (`git_only` for all‑repo trees, `git` for mixed trees, `python` when no repos are found).
+- For scripting, set `CHUNKHOUND_NO_RICH=1` and read stderr; each JSON block appears on its own line near the end of the run.
+
+Example snippet:
+
+```json
+{
+  "startup_profile": {
+    "discovery_ms": 154.2,
+    "cleanup_ms": 12.7,
+    "change_scan_ms": 3.1,
+    "resolved_backend": "git_only",
+    "resolved_reasons": ["all_repos"],
+    "git_rows_tracked": 420,
+    "git_rows_others": 17,
+    "git_rows_total": 437,
+    "git_pathspecs": 4
+  }
+}
+```
+
+## Exclusions (gitignore, config, defaults)
+
+ChunkHound combines repository–aware ignores with safe defaults. The behavior depends on how you set `indexing.exclude` in `.chunkhound.json`:
+
+- Not set (default) → gitignore only
+  - The `.gitignore` files inside repositories are honored (repo‑aware engine). Default ChunkHound excludes (e.g., `.git/`, `node_modules/`, `.chunkhound/`, caches) still apply to prevent self‑indexing and noise.
+- String sentinel `.gitignore` → gitignore only
+  - Same as the default: only `.gitignore` rules are used as the “exclusion source” (plus ChunkHound’s default excludes).
+- Explicit list (array) → config only
+  - Only your glob patterns in `indexing.exclude` are used as the “exclusion source” (plus ChunkHound’s default excludes). Repository `.gitignore` is not consulted in this mode.
+
+Workspace overlay for non‑repo paths (default: on)
+- When the directory you index contains non‑repo subtrees, ChunkHound can apply the root workspace `.gitignore` only to those non‑repo paths. This is controlled by `indexing.workspace_gitignore_nonrepo` (default: `true`).
+- Repository subtrees always use their own `.gitignore` and Git’s native semantics.
+
+Examples
+
+```jsonc
+// Default: gitignore only (+ safe defaults)
+{
+  "indexing": {
+    // exclude omitted
+    "workspace_gitignore_nonrepo": true
+  }
+}
+
+// Gitignore only (explicit sentinel)
+{
+  "indexing": {
+    "exclude": ".gitignore",
+    "workspace_gitignore_nonrepo": true
+  }
+}
+
+// Config only (user patterns) — gitignore not consulted here
+{
+  "indexing": {
+    "exclude": ["**/dist/**", "**/*.min.js"],
+    "workspace_gitignore_nonrepo": false
+  }
+}
+```
+
+CLI toggle for the workspace overlay
+- `--nonrepo-gitignore` enables the root `.gitignore` overlay for non‑repo paths for the current run.
+- To disable overlay persistently, set `"workspace_gitignore_nonrepo": false` in `.chunkhound.json`.
+
+## Simulate and diagnostics
+
+Simulate a discovery run without writing to the database. Useful for verifying include/exclude rules, sorting, and sizes.
+
+```bash
+# List discovered files (sorted by path)
+chunkhound index --simulate . --sort path
+
+# Show sizes and sort by size (descending)
+chunkhound index --simulate . --show-sizes --sort size_desc
+
+# Emit JSON instead of plain text
+chunkhound index --simulate . --json > files.json
+
+# Add discovery timing/profile to stderr (JSON)
+CHUNKHOUND_NO_RICH=1 chunkhound index --simulate . --profile-startup 2>profile.json
+
+# Print debug info about ignores (to stderr): CH root, sources, first N defaults
+chunkhound index --simulate . --debug-ignores
+```
+
+Diagnostics (ignore decisions):
+
+```bash
+# Compare ChunkHound’s ignore decision vs Git for the current tree
+chunkhound index --check-ignores --vs git --json > ignore_diff.json
+```
+
+Notes:
+- When piping simulate output to tools like `head`, BrokenPipe is handled gracefully; prefer `CHUNKHOUND_NO_RICH=1` for easy JSON parsing.

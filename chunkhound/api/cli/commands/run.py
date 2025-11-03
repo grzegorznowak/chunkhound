@@ -124,7 +124,30 @@ async def run_command(args: argparse.Namespace, config: Config) -> None:
         if getattr(args, "profile_startup", False):
             try:
                 import json as _json
-                prof = getattr(indexing_coordinator, "_startup_profile", None)
+                prof = getattr(indexing_coordinator, "_startup_profile", None) or {}
+                if isinstance(prof, dict):
+                    prof = dict(prof)
+                # Attach resolved discovery backend + reasons if available
+                rb = getattr(indexing_coordinator, "_resolved_discovery_backend", None)
+                rr = getattr(indexing_coordinator, "_resolved_discovery_reasons", None)
+                if rb and isinstance(prof, dict):
+                    prof["resolved_backend"] = rb
+                if rr and isinstance(prof, dict):
+                    prof["resolved_reasons"] = rr
+                # Attach git enumerator counters if available
+                grt = getattr(indexing_coordinator, "_git_rows_tracked", None)
+                gro = getattr(indexing_coordinator, "_git_rows_others", None)
+                grtot = getattr(indexing_coordinator, "_git_rows_total", None)
+                gps = getattr(indexing_coordinator, "_git_pathspecs", None)
+                if grtot is not None or grt is not None or gro is not None:
+                    if grt is not None:
+                        prof["git_rows_tracked"] = int(grt)
+                    if gro is not None:
+                        prof["git_rows_others"] = int(gro)
+                    if grtot is not None:
+                        prof["git_rows_total"] = int(grtot)
+                    if gps is not None:
+                        prof["git_pathspecs"] = int(gps)
                 if prof:
                     print(_json.dumps({"startup_profile": prof}, indent=2), file=sys.stderr)
             except Exception:
@@ -339,16 +362,36 @@ async def _simulate_index(args: argparse.Namespace, config: Config) -> None:
             pass
 
     # Configure registry and create services like real run
-    # Ensure database directory exists to allow provider to connect
+    # For simulate, avoid touching on-disk DBs. Use in-memory DuckDB when possible.
     try:
-        db_path = Path(config.database.path)
-        db_dir = db_path.parent
-        db_dir.mkdir(parents=True, exist_ok=True)
+        # Prefer an in-memory DB to keep simulate side-effect free
+        # Only override when path is unset or points to a non-existent parent.
+        db_path = Path(getattr(config.database, "path", Path(":memory:")) or Path(":memory:"))
+        if str(db_path) != ":memory":  # typos
+            if str(db_path) != ":memory:" and not db_path.parent.exists():
+                # If parent path doesn't exist, switch to in-memory
+                try:
+                    config.database.path = Path(":memory:")  # type: ignore[attr-defined]
+                except Exception:
+                    pass
+        # If still not in-memory, ensure parent exists
+        dbp = getattr(config.database, "path", None)
+        if dbp and str(dbp) != ":memory:":
+            Path(dbp).parent.mkdir(parents=True, exist_ok=True)
     except Exception:
-        pass
+        # As a last resort, in-memory
+        try:
+            config.database.path = Path(":memory:")  # type: ignore[attr-defined]
+        except Exception:
+            pass
 
     configure_registry(config)
     indexing_coordinator = create_indexing_coordinator()
+    # Ensure coordinator has access to the effective Config for discovery
+    try:
+        setattr(indexing_coordinator, "config", config)
+    except Exception:
+        pass
 
     # Resolve patterns using the DirectoryIndexingService helper to keep logic aligned
     from chunkhound.services.directory_indexing_service import DirectoryIndexingService
@@ -361,9 +404,75 @@ async def _simulate_index(args: argparse.Namespace, config: Config) -> None:
 
     processed_patterns = normalize_include_patterns(include_patterns)
 
-    files = await indexing_coordinator._discover_files(  # type: ignore[attr-defined]
-        base_dir, processed_patterns, exclude_patterns
-    )
+    # Optional profiling for discovery during simulate
+    files = []
+    if getattr(args, "profile_startup", False):
+        import time as _t
+        _t0 = _t.perf_counter()
+        files = await indexing_coordinator._discover_files(  # type: ignore[attr-defined]
+            base_dir, processed_patterns, exclude_patterns
+        )
+        _t1 = _t.perf_counter()
+        try:
+            import json as _json
+            prof = {
+                "discovery_ms": round((_t1 - _t0) * 1000.0, 3),
+                "files_discovered": len(files),
+                "backend": (getattr(config.indexing, "discovery_backend", "python") if getattr(config, "indexing", None) else "python"),
+            }
+            rb = getattr(indexing_coordinator, "_resolved_discovery_backend", None)
+            if rb:
+                prof["resolved_backend"] = rb
+            rr = getattr(indexing_coordinator, "_resolved_discovery_reasons", None)
+            if rr:
+                prof["resolved_reasons"] = rr
+            # Attach git enumerator counters if available
+            grt = getattr(indexing_coordinator, "_git_rows_tracked", None)
+            gro = getattr(indexing_coordinator, "_git_rows_others", None)
+            grtot = getattr(indexing_coordinator, "_git_rows_total", None)
+            gps = getattr(indexing_coordinator, "_git_pathspecs", None)
+            if grtot is not None or grt is not None or gro is not None:
+                if grt is not None:
+                    prof["git_rows_tracked"] = int(grt)
+                if gro is not None:
+                    prof["git_rows_others"] = int(gro)
+                if grtot is not None:
+                    prof["git_rows_total"] = int(grtot)
+                if gps is not None:
+                    prof["git_pathspecs"] = int(gps)
+            print(_json.dumps(prof), file=sys.stderr)
+        except Exception:
+            pass
+    else:
+        files = await indexing_coordinator._discover_files(  # type: ignore[attr-defined]
+            base_dir, processed_patterns, exclude_patterns
+        )
+
+    # Defensive: ensure simulate exactly mirrors real-flow ignore decisions.
+    # If no git repos are present and gitignore source is active, build a
+    # workspace-root engine that collects .gitignore rules from the tree
+    # (root + nested) and apply it once. This mirrors the sequential walker’s
+    # behavior for non-repo overlays and fixes edge cases where discovery took
+    # a path without the engine wired.
+    try:
+        sources = config.indexing.resolve_ignore_sources()
+        if "gitignore" in (sources or []):
+            from chunkhound.utils.ignore_engine import (
+                detect_repo_roots as _detect_roots,
+                build_ignore_engine as _build_root_engine,
+            )
+            roots = _detect_roots(base_dir, config.indexing.get_effective_config_excludes())
+            if not roots:
+                eng = _build_root_engine(
+                    root=base_dir,
+                    sources=["gitignore"],
+                    chignore_file=getattr(config.indexing, "chignore_file", ".chignore"),
+                    config_exclude=config.indexing.get_effective_config_excludes(),
+                )
+                files = [p for p in files if not eng.matches(p, is_dir=False)]
+    except Exception:
+        # Soft-fail; simulate is best-effort
+        pass
 
     # Gather sizes and relative paths
     items: list[tuple[str, int]] = []
@@ -441,12 +550,8 @@ async def _check_ignores(args: argparse.Namespace, config: Config) -> None:
 
     def _git_ignored(repo_root: Path, rel_path: str) -> bool:
         try:
-            proc = __import__("subprocess").run(
-                ["git", "check-ignore", "-q", "--no-index", rel_path],
-                cwd=str(repo_root),
-                text=True,
-                capture_output=True,
-            )
+            from chunkhound.utils.git_safe import run_git
+            proc = run_git(["check-ignore", "-q", "--no-index", rel_path], cwd=repo_root, timeout_s=5.0)
             return proc.returncode == 0
         except Exception:
             return False
@@ -457,7 +562,7 @@ async def _check_ignores(args: argparse.Namespace, config: Config) -> None:
 
             sources = config.indexing.resolve_ignore_sources()
             cfg_ex = config.indexing.get_effective_config_excludes()
-            chf = config.indexing.chignore_file
+            chf = config.indexing.chignore_file  # deprecated; ignored
             eng = build_repo_aware_ignore_engine(root, sources, chf, cfg_ex)
             return bool(eng.matches(file_path, is_dir=False))
         except Exception:

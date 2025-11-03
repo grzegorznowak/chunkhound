@@ -85,6 +85,64 @@ def _summarize_include_patterns(patterns: list[str]) -> tuple[set[str], set[str]
     return exts, names, complex_pat
 
 
+# --------------------------- Prune helpers (performance) ---------------------------
+
+def _extract_include_prefixes(patterns: list[str]) -> set[str]:
+    """Extract anchored directory prefixes from include patterns.
+
+    Examples:
+    - "src/**/*.ts"         -> {"src"}
+    - "docs/api/**/*.md"    -> {"docs/api"}
+    - "**/*.py"             -> set()   (no anchor)
+    - "README"              -> set()   (filename pattern)
+    - "**/Makefile"         -> set()   (filename pattern)
+    """
+    prefixes: set[str] = set()
+    for pat in patterns or []:
+        p = pat
+        if p.startswith("**/"):
+            p = p[3:]
+        # No directory component or immediate wildcard → no stable anchor
+        if not p or p.startswith("*") or ("/" not in p):
+            continue
+        segs = p.split("/")
+        acc: list[str] = []
+        for seg in segs:
+            if any(ch in seg for ch in "*?["):
+                break
+            acc.append(seg)
+        if acc:
+            prefixes.add("/".join(acc))
+    return prefixes
+
+
+def _can_prune_dir_by_prefix(include_prefixes: set[str], current_rel: str) -> bool:
+    """Return True if directory `current_rel` (root-relative) is outside all include anchors."""
+    if not include_prefixes:
+        return False
+    if current_rel in ("", "."):
+        return False
+    rel = current_rel.strip("/")
+    for p in include_prefixes:
+        if p == rel:
+            return False
+        if p.startswith(rel + "/"):
+            return False
+        if rel.startswith(p + "/"):
+            return False
+    return True
+
+
+def _should_prune_heavy_dir(heavy_names: set[str], include_prefixes: set[str], current_name: str) -> bool:
+    """Return True to prune a heavy directory by name when not explicitly anchored."""
+    if current_name not in heavy_names:
+        return False
+    for p in include_prefixes:
+        if p == current_name or p.startswith(current_name + "/"):
+            return False
+    return True
+
+
 def should_exclude_path(
     path: Path,
     base_dir: Path,
@@ -364,6 +422,8 @@ def walk_directory_tree(
 
     # Precompute include summary once for this walk
     inc_allow_exts, inc_allow_names, inc_has_complex = _summarize_include_patterns(patterns)
+    include_prefixes = _extract_include_prefixes(patterns)
+    HEAVY_DIRS = {".git", "node_modules", ".venv", "venv", "dist", "build", "target"}
 
     for dirpath, dirnames, filenames in walk_iter:
         current_dir = Path(dirpath)
@@ -392,6 +452,20 @@ def walk_directory_tree(
         for dirname in dirnames:
             dir_path = current_dir / dirname
             excluded = False
+
+            # Fast prune by include anchors (only when we have anchored prefixes)
+            try:
+                rel_child = (dir_path.relative_to(root_directory)).as_posix()
+            except Exception:
+                rel_child = dirname
+            if _can_prune_dir_by_prefix(include_prefixes, rel_child):
+                dirs_to_remove.append(dirname)
+                continue
+
+            # Fast prune heavy directories when not explicitly anchored
+            if _should_prune_heavy_dir(HEAVY_DIRS, include_prefixes, dirname):
+                dirs_to_remove.append(dirname)
+                continue
             if ignore_engine is not None:
                 try:
                     if getattr(ignore_engine, "matches", None) and ignore_engine.matches(dir_path, is_dir=True):  # type: ignore[attr-defined]
@@ -516,6 +590,7 @@ def walk_subtree_worker(
                 if isinstance(ignore_engine_args, dict) and ignore_engine_args.get("mode") == "repo_aware":
                     roots = ignore_engine_args.get("roots")
                     backend = ignore_engine_args.get("backend", "python")
+                    overlay = bool(ignore_engine_args.get("workspace_nonrepo_overlay", False))
                     if roots:
                         ignore_engine_obj = build_repo_aware_ignore_engine_from_roots(
                             root=ignore_engine_args["root"],
@@ -524,6 +599,7 @@ def walk_subtree_worker(
                             chignore_file=ignore_engine_args["chf"],
                             config_exclude=ignore_engine_args["cfg"],
                             backend=backend,
+                            workspace_root_only_gitignore=overlay,
                         )
                     else:
                         ignore_engine_obj = build_repo_aware_ignore_engine(
@@ -532,6 +608,7 @@ def walk_subtree_worker(
                             chignore_file=ignore_engine_args["chf"],
                             config_exclude=ignore_engine_args["cfg"],
                             backend=backend,
+                            workspace_root_only_gitignore=overlay,
                         )
                 else:
                     root, sources, chf, cfg_ex = ignore_engine_args  # type: ignore

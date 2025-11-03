@@ -151,6 +151,10 @@ class IndexingCoordinator(BaseService):
         # Key: (root, tuple(sources), chignore_file, tuple(cfg_excludes))
         self._ignore_engine_cache: dict[tuple[str, tuple[str, ...], str, tuple[str, ...]], object] = {}
 
+        # Per-run cache for repo root detection to avoid repeated directory walks
+        # Key: (root_path, tuple(sorted(cfg_excludes))) -> list[Path]
+        self._repo_roots_cache: dict[tuple[str, tuple[str, ...]], list[Path]] = {}
+
         # SECTION: File_Level_Locking
         # CRITICAL: Prevents race conditions during concurrent file processing
         # PATTERN: Lazy lock creation within event loop context
@@ -222,27 +226,28 @@ class IndexingCoordinator(BaseService):
     # Ignore engine caching helpers (per-run, process-local)
     # ------------------------------------------------------------------
     def _engine_cache_key(
-        self, root: Path, sources: list[str], chf: str, cfg: list[str] | tuple[str, ...], backend: str = "python"
-    ) -> tuple[str, tuple[str, ...], str, tuple[str, ...], str]:
+        self, root: Path, sources: list[str], chf: str, cfg: list[str] | tuple[str, ...], backend: str = "python", overlay: bool | None = None
+    ) -> tuple[str, tuple[str, ...], str, tuple[str, ...], str, int]:
         return (
             str(root.resolve()),
             tuple(sources),
             chf,
             tuple(cfg),
             backend,
+            1 if overlay else 0,
         )
 
     def _get_or_build_ignore_engine(
-        self, root: Path, sources: list[str], chf: str, cfg: list[str] | tuple[str, ...], backend: str = "python"
+        self, root: Path, sources: list[str], chf: str, cfg: list[str] | tuple[str, ...], backend: str = "python", overlay: bool | None = None
     ) -> object:
-        key = self._engine_cache_key(root, sources, chf, cfg, backend)
+        key = self._engine_cache_key(root, sources, chf, cfg, backend, overlay)
         eng = self._ignore_engine_cache.get(key)
         if eng is not None:
             return eng
         try:
             from chunkhound.utils.ignore_engine import build_repo_aware_ignore_engine as _bre
 
-            eng = _bre(root=root, sources=sources, chignore_file=chf, config_exclude=list(cfg), backend=backend)
+            eng = _bre(root=root, sources=sources, chignore_file=chf, config_exclude=list(cfg), backend=backend, workspace_root_only_gitignore=overlay)
             self._ignore_engine_cache[key] = eng
             return eng
         except Exception:
@@ -965,6 +970,21 @@ class IndexingCoordinator(BaseService):
                     try:
                         rel = self._get_relative_path(f).as_posix()
                         db_tuple = db_meta_map.get(rel)
+                        if db_tuple is None:
+                            # Fallback for providers without execute_query() (e.g., fake or limited providers)
+                            try:
+                                rec = self._db.get_file_by_path(rel, as_model=False)
+                                if rec:
+                                    sz = rec.get("size") if isinstance(rec, dict) else None
+                                    mt = rec.get("modified_time") if isinstance(rec, dict) else None
+                                    try:
+                                        mtv = float(mt.timestamp()) if hasattr(mt, "timestamp") else float(mt)
+                                    except Exception:
+                                        mtv = None
+                                    ch = rec.get("content_hash") if isinstance(rec, dict) else None
+                                    db_tuple = (int(sz) if sz is not None else None, mtv, ch)
+                            except Exception:
+                                db_tuple = None
                         st = f.stat()
                         if db_tuple is not None:
                             db_size, stored_mtime, db_hash = db_tuple
@@ -1619,7 +1639,7 @@ class IndexingCoordinator(BaseService):
                             "mode": "repo_aware",
                             "root": directory,
                             "sources": (self.config.indexing.resolve_ignore_sources() if getattr(self, "config", None) and getattr(self.config, "indexing", None) else ["config"]),
-                            "chf": (getattr(self.config.indexing, "chignore_file", ".chignore") if getattr(self, "config", None) and getattr(self.config, "indexing", None) else ".chignore"),
+                            "chf": (getattr(self.config.indexing, "chignore_file", ".chignore") if getattr(self, "config", None) and getattr(self.config, "indexing", None) else ".chignore"),  # deprecated; ignored
                             "cfg": list(effective_excludes),
                             "roots": roots_for_subtree,
                         }
@@ -1649,7 +1669,7 @@ class IndexingCoordinator(BaseService):
         local_engine = self._get_or_build_ignore_engine(
             root=directory,
             sources=(self.config.indexing.resolve_ignore_sources() if getattr(self, "config", None) and getattr(self.config, "indexing", None) else ["config"]),
-            chf=(getattr(self.config.indexing, "chignore_file", ".chignore") if getattr(self, "config", None) and getattr(self.config, "indexing", None) else ".chignore"),
+            chf=(getattr(self.config.indexing, "chignore_file", ".chignore") if getattr(self, "config", None) and getattr(self.config, "indexing", None) else ".chignore"),  # deprecated; ignored
             cfg=list(effective_excludes),
             backend=(getattr(self.config.indexing, "gitignore_backend", "python") if getattr(self, "config", None) and getattr(self.config, "indexing", None) else "python"),
         )
@@ -1733,9 +1753,20 @@ class IndexingCoordinator(BaseService):
         engine_args = None
         ignore_engine_obj = None
         if getattr(self, "config", None) is not None and getattr(self.config, "indexing", None) is not None:
-            sources = self.config.indexing.resolve_ignore_sources()
-            chf = getattr(self.config.indexing, "chignore_file", ".chignore")
-            cfg_excludes = self.config.indexing.get_effective_config_excludes()
+            # Resolve ignore sources/config with backward-compatible fallbacks
+            _idx = getattr(self, "config", None)
+            _idx = getattr(_idx, "indexing", None)
+            if _idx is not None and callable(getattr(_idx, "resolve_ignore_sources", None)):
+                sources = _idx.resolve_ignore_sources()
+            else:
+                # Default to gitignore-only semantics when unspecified
+                sources = ["gitignore"]
+            chf = getattr(_idx, "chignore_file", ".chignore") if _idx is not None else ".chignore"
+            if _idx is not None and callable(getattr(_idx, "get_effective_config_excludes", None)):
+                cfg_excludes = _idx.get_effective_config_excludes()
+            else:
+                from chunkhound.core.config.indexing_config import IndexingConfig as _Idx
+                cfg_excludes = _Idx._default_excludes()
             # Dynamically exclude the database path when it lives under the target directory
             try:
                 dbp = getattr(self._db, "db_path", None)
@@ -1756,7 +1787,7 @@ class IndexingCoordinator(BaseService):
                         pass
             except Exception:
                 pass
-            backend = getattr(self.config.indexing, "gitignore_backend", "python")
+            backend = getattr(_idx, "gitignore_backend", "python") if _idx is not None else "python"
             engine_args = {
                 "mode": "repo_aware",
                 "root": directory.resolve(),
@@ -1764,7 +1795,16 @@ class IndexingCoordinator(BaseService):
                 "chf": chf,
                 "cfg": list(cfg_excludes),
                 "backend": backend,
+                "workspace_nonrepo_overlay": bool(getattr(_idx, "workspace_gitignore_nonrepo", False)) if _idx is not None else False,
             }
+            # Provide precomputed repo roots to parallel workers so they can
+            # avoid re-detecting per process
+            try:
+                roots = self._get_or_detect_repo_roots(directory.resolve(), list(cfg_excludes))
+                if roots:
+                    engine_args["roots"] = roots
+            except Exception:
+                pass
 
         # Use default (enabled) if not explicitly specified
         if parallel_discovery is None:
@@ -1779,6 +1819,95 @@ class IndexingCoordinator(BaseService):
             patterns = _norm(list(patterns)) if patterns else patterns
         except Exception:
             pass
+
+        # If configured, try Git-backed discovery first (fast path)
+        try:
+            _disc_backend = (
+                getattr(self.config.indexing, "discovery_backend", "auto")
+                if getattr(self, "config", None) and getattr(self.config, "indexing", None)
+                else "auto"
+            )
+        except Exception:
+            _disc_backend = "auto"
+
+        # Resolve 'auto' to a concrete backend using a fast heuristic
+        def _decide_backend() -> tuple[str, list[str]]:
+            reasons: list[str] = []
+            try:
+                eff = (self.config.indexing.get_effective_config_excludes() if getattr(self, "config", None) and getattr(self.config, "indexing", None) else [])
+                repo_roots = self._get_or_detect_repo_roots(directory, eff)
+            except Exception:
+                repo_roots = []
+            if not repo_roots:
+                reasons.append("no_repos")
+                return "python", reasons
+            # Count non-repo top-level entries (dirs/files) that are not excluded
+            non_repo_items = 0
+            try:
+                for item in directory.iterdir():
+                    try:
+                        if any((item.resolve().is_relative_to(rr.resolve()) for rr in repo_roots)):
+                            continue
+                    except Exception:
+                        try:
+                            _ = [item.resolve().relative_to(rr.resolve()) for rr in repo_roots]
+                            # if any succeeded, it's in a repo
+                            inside = False
+                            for rr in repo_roots:
+                                try:
+                                    item.resolve().relative_to(rr.resolve())
+                                    inside = True
+                                    break
+                                except Exception:
+                                    pass
+                            if inside:
+                                continue
+                        except Exception:
+                            pass
+                    non_repo_items += 1
+                    if non_repo_items > 1:
+                        break
+            except Exception:
+                pass
+            if non_repo_items == 0:
+                reasons.append("all_repos")
+                return "git_only", reasons
+            reasons.append("mixed")
+            return "git", reasons
+
+        if _disc_backend == "auto":
+            _resolved, _reasons = _decide_backend()
+        else:
+            _resolved, _reasons = _disc_backend, ["explicit"]
+
+        # Expose resolved backend for diagnostics/profiling
+        try:
+            setattr(self, "_resolved_discovery_backend", _resolved)
+            setattr(self, "_resolved_discovery_reasons", _reasons)
+        except Exception:
+            pass
+
+        use_git_backend = _resolved in ("git", "git_only")
+        git_only_mode = _resolved == "git_only"
+
+        if use_git_backend:
+            files_git = self._discover_files_via_git(
+                directory, patterns, exclude_patterns, fallback_to_python=(not git_only_mode)
+            )
+            # If Git enumeration succeeded and produced files, return them.
+            # If it returned an empty list in git_only mode (e.g., fake repos with only
+            # a .git directory but no initialized repo), fall back to Python traversal
+            # to honor repo-boundary ignore semantics used in tests, but only when repos
+            # were actually detected. When truly no repos exist, git_only should yield
+            # an empty result by design.
+            if files_git is not None:
+                repo_detected = bool(getattr(self, "_git_repo_roots_detected", False))
+                if files_git or (not git_only_mode) or (git_only_mode and not repo_detected):
+                    try:
+                        setattr(self, "_profile_parallel_used", False)
+                    except Exception:
+                        pass
+                    return sorted(files_git)
 
         # Try parallel discovery if enabled
         if parallel_discovery:
@@ -1820,6 +1949,7 @@ class IndexingCoordinator(BaseService):
                     chf=engine_args["chf"],
                     cfg=engine_args["cfg"],
                     backend=engine_args.get("backend", "python"),
+                    overlay=engine_args.get("workspace_nonrepo_overlay", False),
                 )
             except Exception:
                 ignore_engine_obj = None
@@ -1832,6 +1962,260 @@ class IndexingCoordinator(BaseService):
         except Exception:
             pass
         return sorted(discovered_files)
+
+    def _discover_files_via_git(
+        self,
+        directory: Path,
+        patterns: list[str] | None,
+        exclude_patterns: list[str] | None,
+        fallback_to_python: bool = True,
+    ) -> list[Path] | None:
+        """Enumerate files using `git ls-files` per repo when available.
+
+        Falls back (returns None) when Git is missing, errors occur, or no repos are found.
+        Always applies ChunkHound include patterns and config/default excludes on top
+        of Git results. Non-repo portions of the directory are scanned using the
+        Python walker while pruning repo subtrees.
+        """
+        from fnmatch import fnmatch as _fnmatch
+        try:
+            # Quick probe: ensure git exists
+            import shutil as _sh
+
+            if _sh.which("git") is None:
+                return None
+        except Exception:
+            return None
+
+        try:
+            from chunkhound.utils.git_discovery import list_repo_files_via_git as _git_list
+            from chunkhound.utils.file_patterns import (
+                walk_directory_tree as _walk,
+                load_gitignore_patterns as _load_gi,
+            )
+        except Exception:
+            return None
+
+        patterns = list(patterns or [])
+        exclude_patterns_local = list(exclude_patterns or [])
+
+        # Effective config excludes (includes defaults even with sentinel)
+        try:
+            _idx = getattr(self, "config", None)
+            _idx = getattr(_idx, "indexing", None)
+            if _idx is not None and callable(getattr(_idx, "get_effective_config_excludes", None)):
+                effective_excludes = list(_idx.get_effective_config_excludes())
+            else:
+                from chunkhound.core.config.indexing_config import IndexingConfig as _Idx
+                effective_excludes = _Idx._default_excludes()
+        except Exception:
+            from chunkhound.core.config.indexing_config import IndexingConfig as _Idx
+            effective_excludes = _Idx._default_excludes()
+        # Also exclude dynamic DB path when it lives under directory
+        try:
+            dbp = getattr(self._db, "db_path", None)
+            if dbp:
+                dbp_res = Path(dbp).resolve()
+                dir_res = directory.resolve()
+                try:
+                    rel = dbp_res.relative_to(dir_res)
+                    if dbp_res.is_dir():
+                        rp = rel.as_posix()
+                        effective_excludes.extend([rp, f"{rp}/**"])  # safe duplicates
+                        exclude_patterns_local.extend([rp, f"{rp}/**"])  # local excludes too
+                    else:
+                        effective_excludes.append(rel.as_posix())
+                        exclude_patterns_local.append(rel.as_posix())
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # Detect repo roots under directory (pruned by effective_excludes) with cache reuse
+        try:
+            repo_roots = self._get_or_detect_repo_roots(directory, effective_excludes)
+        except Exception:
+            repo_roots = []
+        # Expose whether any repos were detected for caller decisions
+        try:
+            setattr(self, "_git_repo_roots_detected", bool(repo_roots))
+        except Exception:
+            pass
+
+        # If no repos detected
+        if not repo_roots:
+            return None if fallback_to_python else []
+
+        results: list[Path] = []
+        # Instrumentation totals across repos
+        tot_rows_tracked = 0
+        tot_rows_others = 0
+        tot_pathspecs = 0
+
+        # For each repo, list files via Git, restricted to the subtree being indexed
+        for rr in repo_roots:
+            try:
+                # Determine the subtree to list for this repo root
+                # If the requested directory is an ancestor of the repo root, list the whole repo (start at rr)
+                # If the repo root is an ancestor of the requested directory, limit to that subdir
+                # Otherwise (disjoint), skip (shouldn't occur with our detection)
+                start_for_repo = rr
+                try:
+                    directory.resolve().relative_to(rr.resolve())
+                    # directory is inside rr
+                    start_for_repo = directory
+                except Exception:
+                    try:
+                        rr.resolve().relative_to(directory.resolve())
+                        # rr is inside directory → start at rr
+                        start_for_repo = rr
+                    except Exception:
+                        # Disjoint; skip
+                        continue
+
+                repo_files, stats = _git_list(
+                    rr,
+                    start_dir=start_for_repo,
+                    include_patterns=patterns,
+                    config_excludes=effective_excludes,
+                )
+                tot_rows_tracked += int(stats.get("git_rows_tracked", 0))
+                tot_rows_others += int(stats.get("git_rows_others", 0))
+                tot_pathspecs += int(stats.get("git_pathspecs", 0))
+                results.extend(repo_files)
+            except Exception:
+                # If any repo fails, skip it (we'll still scan non-repo areas)
+                continue
+
+        # Scan non-repo areas by pruning repo subtrees during walk
+        if fallback_to_python:
+            try:
+                # Build a fast set of immediate children to prune, but do a general prune inside walker too
+                parent_gitignores: dict[Path, list[str]] = {directory: _load_gi(directory, directory)}
+                # Build a repo-aware engine so we can control whether the workspace (non-repo)
+                # side honors the CH root .gitignore (root-only) or ignores it entirely.
+                try:
+                    wr_only = bool(getattr(self.config.indexing, "workspace_gitignore_nonrepo", False)) if getattr(self, "config", None) and getattr(self.config, "indexing", None) else False
+                except Exception:
+                    wr_only = False
+                # Simple overlay prefixes (directory-only) parsed from root .gitignore (best-effort)
+                overlay_prefixes: list[str] = []
+                if wr_only:
+                    try:
+                        gi = directory / ".gitignore"
+                        if gi.exists():
+                            for raw in gi.read_text(encoding="utf-8", errors="ignore").splitlines():
+                                if not raw or raw.lstrip().startswith("#"):
+                                    continue
+                                ln = raw.strip()
+                                if ln.endswith("/"):
+                                    ln = ln[:-1]
+                                    if ln.startswith("/"):
+                                        ln = ln[1:]
+                                    overlay_prefixes.append(ln.strip("/"))
+                    except Exception:
+                        overlay_prefixes = []
+                # Reuse same sources selection; engine respects config overlay flag
+                local_engine = self._get_or_build_ignore_engine(
+                    root=directory,
+                    sources=(self.config.indexing.resolve_ignore_sources() if getattr(self, "config", None) and getattr(self.config, "indexing", None) else ["config"]),
+                    chf=(getattr(self.config.indexing, "chignore_file", ".chignore") if getattr(self, "config", None) and getattr(self.config, "indexing", None) else ".chignore"),
+                    cfg=list(effective_excludes),
+                    backend=(getattr(self.config.indexing, "gitignore_backend", "python") if getattr(self, "config", None) and getattr(self.config, "indexing", None) else "python"),
+                    overlay=wr_only,
+                )
+                non_repo_files, _ = _walk(
+                    directory,
+                    directory,
+                    patterns,
+                    exclude_patterns_local,
+                    parent_gitignores,
+                    False,
+                    ignore_engine=local_engine,
+                )
+
+                # Remove any files that are inside detected repo roots to avoid duplicates
+                pruned_non_repo: list[Path] = []
+                for fp in non_repo_files:
+                    try:
+                        inside_repo = False
+                        for rr in repo_roots:
+                            try:
+                                fp.resolve().relative_to(rr.resolve())
+                                inside_repo = True
+                                break
+                            except Exception:
+                                continue
+                        if not inside_repo:
+                            # Overlay prefix shortcut (best-effort) for non-repo files
+                            try:
+                                rel = fp.resolve().relative_to(directory.resolve()).as_posix()
+                            except Exception:
+                                rel = fp.name
+                            if overlay_prefixes:
+                                skip = False
+                                for pref in overlay_prefixes:
+                                    if rel == pref or rel.startswith(pref + "/"):
+                                        skip = True
+                                        break
+                                if skip:
+                                    continue
+                            # Apply workspace overlay engine to non-repo files
+                            try:
+                                if local_engine and getattr(local_engine, "matches", None) and local_engine.matches(fp, is_dir=False):  # type: ignore[attr-defined]
+                                    continue
+                            except Exception:
+                                pass
+                            pruned_non_repo.append(fp)
+                    except Exception:
+                        pruned_non_repo.append(fp)
+                results.extend(pruned_non_repo)
+            except Exception:
+                # Ignore non-repo scan errors; we still return repo files
+                pass
+
+        # Dedup and return
+        seen = set()
+        uniq: list[Path] = []
+        for p in results:
+            s = str(p)
+            if s not in seen:
+                seen.add(s)
+                uniq.append(p)
+        # Expose instrumentation for simulate/run
+        try:
+            setattr(self, "_git_rows_tracked", int(tot_rows_tracked))
+            setattr(self, "_git_rows_others", int(tot_rows_others))
+            setattr(self, "_git_rows_total", int(tot_rows_tracked + tot_rows_others))
+            setattr(self, "_git_pathspecs", int(tot_pathspecs))
+        except Exception:
+            pass
+        return uniq
+
+    # --------------------------- Repo-roots caching ---------------------------
+    def _repo_roots_cache_key(self, root: Path, cfg_excludes: list[str] | tuple[str, ...]) -> tuple[str, tuple[str, ...]]:
+        try:
+            base = str(root.resolve())
+        except Exception:
+            base = str(root)
+        try:
+            items = tuple(sorted([str(x) for x in (list(cfg_excludes) if not isinstance(cfg_excludes, tuple) else list(cfg_excludes))]))
+        except Exception:
+            items = tuple()
+        return (base, items)
+
+    def _get_or_detect_repo_roots(self, root: Path, cfg_excludes: list[str] | tuple[str, ...]) -> list[Path]:
+        key = self._repo_roots_cache_key(root, cfg_excludes)
+        cached = self._repo_roots_cache.get(key)
+        if cached is not None:
+            return cached
+        try:
+            from chunkhound.utils.ignore_engine import detect_repo_roots as _detect
+            roots = _detect(root, cfg_excludes)  # type: ignore[arg-type]
+        except Exception:
+            roots = []
+        self._repo_roots_cache[key] = roots
+        return roots
 
     def _walk_directory_with_excludes(
         self,

@@ -1,6 +1,6 @@
 """IgnoreEngine: central exclusion logic with gitwildmatch semantics.
 
-Initial implementation supports root-level .gitignore and .chignore files
+Initial implementation supports root-level .gitignore files
 via the `pathspec` library using gitwildmatch patterns. This is sufficient to
 make the initial tests pass; we will extend it to per-directory inheritance
 and richer rule origins in follow-up steps.
@@ -67,7 +67,6 @@ def build_ignore_engine(
 
     Currently supports:
     - gitignore: uses only the root-level .gitignore file
-    - chignore: uses a root-level .chignore file
     - config: uses provided glob-like patterns (gitwildmatch semantics)
     """
     compiled: list[tuple[Path, PathSpec]] = []
@@ -86,10 +85,7 @@ def build_ignore_engine(
             pats = _collect_gitignore_patterns(root, pre_spec)
             if pats:
                 compiled.append((root / ".gitignore", _compile_gitwildmatch(pats)))
-        elif src == "chignore":
-            ci = root / chignore_file
-            if ci.exists():
-                compiled.append((ci, _compile_gitwildmatch(ci.read_text().splitlines())))
+        # "chignore" source is no longer supported.
         elif src == "config":
             pats = list(config_exclude or [])
             if pats:
@@ -182,6 +178,7 @@ class RepoAwareIgnoreEvaluator:
         sources: list[str],
         chignore_file: str,
         config_exclude: Optional[Iterable[str]] = None,
+        workspace_root_only_gitignore: bool = False,
     ) -> None:
         self.root = workspace_root.resolve()
         self.repo_roots = sorted([p.resolve() for p in repo_roots], key=lambda p: len(p.as_posix()), reverse=True)
@@ -194,7 +191,31 @@ class RepoAwareIgnoreEvaluator:
         for rr in self.repo_roots:
             self._per_repo[rr] = build_ignore_engine(rr, sources, chignore_file, self.config_exclude)
         # Workspace engine for non-repo areas
-        self._workspace_engine = build_ignore_engine(self.root, sources, chignore_file, self.config_exclude)
+        if workspace_root_only_gitignore:
+            # Workspace (non-repo) overlay: honor .gitignore files under the root
+            # using the same collection logic as repo mode (root + nested files).
+            # This preserves Git anchoring semantics and nested inheritance even
+            # when the workspace itself is not a Git repository.
+            compiled: list[tuple[Path, PathSpec]] = []
+            if self.config_exclude:
+                compiled.append((self.root, _compile_gitwildmatch(self.config_exclude)))
+            try:
+                pre = _compile_gitwildmatch(self.config_exclude) if self.config_exclude else None
+            except Exception:
+                pre = None
+            try:
+                pats = _collect_gitignore_patterns(self.root, pre)
+            except Exception:
+                pats = []
+            if pats:
+                compiled.append((self.root / ".gitignore", _compile_gitwildmatch(pats)))
+            self._workspace_engine = IgnoreEngine(self.root, compiled)
+        else:
+            # Default: do NOT apply workspace .gitignore at all; only config_exclude
+            compiled: list[tuple[Path, PathSpec]] = []
+            if self.config_exclude:
+                compiled.append((self.root, _compile_gitwildmatch(self.config_exclude)))
+            self._workspace_engine = IgnoreEngine(self.root, compiled)
 
     def _nearest_repo(self, path: Path) -> Optional[Path]:
         p = path.resolve()
@@ -219,6 +240,7 @@ def build_repo_aware_ignore_engine(
     chignore_file: str = ".chignore",
     config_exclude: Optional[Iterable[str]] = None,
     backend: str = "python",
+    workspace_root_only_gitignore: Optional[bool] = None,
 ) -> RepoAwareIgnoreEvaluator:
     pre_spec = _compile_gitwildmatch(config_exclude or []) if (config_exclude) else None
     repo_roots = _detect_repo_roots(root, pre_spec)
@@ -226,7 +248,30 @@ def build_repo_aware_ignore_engine(
         eng = _try_build_libgit2_repo_aware(root, repo_roots, sources, chignore_file, config_exclude)
         if eng is not None:
             return eng
-    return RepoAwareIgnoreEvaluator(root, repo_roots, sources, chignore_file, config_exclude)
+    # Determine workspace-root-only behavior.
+    # Priority:
+    # 1) Explicit parameter from config
+    # 2) If sources include gitignore and there are NO repos in the workspace,
+    #    default to True to honor a root .gitignore for non‑repo trees
+    # 3) Legacy ENV override (kept for backward compatibility)
+    if workspace_root_only_gitignore is not None:
+        wr_only = bool(workspace_root_only_gitignore)
+    else:
+        if ("gitignore" in (sources or [])) and (not repo_roots):
+            wr_only = True
+        else:
+            try:
+                wr_only = os.environ.get("CHUNKHOUND_INDEXING__WORKSPACE_GITIGNORE_NONREPO", "").strip() not in ("", "0", "false", "no")
+            except Exception:
+                wr_only = False
+    return RepoAwareIgnoreEvaluator(
+        root,
+        repo_roots,
+        sources,
+        chignore_file,
+        config_exclude,
+        workspace_root_only_gitignore=wr_only,
+    )
 
 
 
@@ -309,6 +354,7 @@ def build_repo_aware_ignore_engine_from_roots(
     chignore_file: str = ".chignore",
     config_exclude: Optional[Iterable[str]] = None,
     backend: str = "python",
+    workspace_root_only_gitignore: Optional[bool] = None,
 ) -> RepoAwareIgnoreEvaluator:
     """Build a repo-aware evaluator from a precomputed list of repo roots.
 
@@ -318,7 +364,14 @@ def build_repo_aware_ignore_engine_from_roots(
         eng = _try_build_libgit2_repo_aware(root, repo_roots, sources, chignore_file, config_exclude)
         if eng is not None:
             return eng
-    return RepoAwareIgnoreEvaluator(root, repo_roots, sources, chignore_file, config_exclude)
+    if workspace_root_only_gitignore is None:
+        try:
+            wr_only = os.environ.get("CHUNKHOUND_INDEXING__WORKSPACE_GITIGNORE_NONREPO", "").strip() not in ("", "0", "false", "no")
+        except Exception:
+            wr_only = False
+    else:
+        wr_only = bool(workspace_root_only_gitignore)
+    return RepoAwareIgnoreEvaluator(root, repo_roots, sources, chignore_file, config_exclude, workspace_root_only_gitignore=wr_only)
 
 
 # --------------------------- Optional libgit2 backend ---------------------------
