@@ -107,6 +107,7 @@ def list_repo_files_via_git(
     include_patterns: Sequence[str],
     config_excludes: Sequence[str] | None = None,
     pushdown: bool | None = None,
+    filter_root: Path | None = None,
 ):
     """Enumerate files under start_dir (inside repo_root) using git ls-files.
 
@@ -172,6 +173,11 @@ def list_repo_files_via_git(
     norm_includes = list(include_patterns)
     out: list[Path] = []
     pcache: dict[str, object] = {}
+    # Evaluate includes/excludes relative to filter_root (CH root) when provided; otherwise start_dir
+    try:
+        base_for_filters = (filter_root or start_dir).resolve()
+    except Exception:
+        base_for_filters = (filter_root or start_dir)
 
     for rel in rel_paths:
         abs_path = (repo_root / rel).resolve()
@@ -183,11 +189,11 @@ def list_repo_files_via_git(
             continue
 
         # Apply ChunkHound config/default excludes on top of Git results
-        if config_excludes and should_exclude_path(abs_path, start_dir, list(config_excludes), pcache):
+        if config_excludes and should_exclude_path(abs_path, base_for_filters, list(config_excludes), pcache):
             continue
 
         # Apply include patterns
-        if should_include_file(abs_path, start_dir, list(norm_includes), pcache):
+        if should_include_file(abs_path, base_for_filters, list(norm_includes), pcache):
             out.append(abs_path)
 
     stats = {

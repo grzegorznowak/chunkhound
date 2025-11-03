@@ -2078,6 +2078,7 @@ class IndexingCoordinator(BaseService):
                     start_dir=start_for_repo,
                     include_patterns=patterns,
                     config_excludes=effective_excludes,
+                    filter_root=directory,
                 )
                 tot_rows_tracked += int(stats.get("git_rows_tracked", 0))
                 tot_rows_others += int(stats.get("git_rows_others", 0))
