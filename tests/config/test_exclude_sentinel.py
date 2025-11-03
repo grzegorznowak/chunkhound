@@ -26,9 +26,15 @@ def test_exclude_sentinel_chignore_now_ignored() -> None:
     assert sources == ["gitignore"]
 
 
-def test_exclude_list_uses_config_only() -> None:
+def test_exclude_list_defaults_to_combined_sources() -> None:
     cfg = Config(**{"indexing": {"exclude": ["**/dist/**", "**/*.min.js"]}})
 
+    sources = cfg.indexing.resolve_ignore_sources()  # type: ignore[attr-defined]
+    assert sources == ["gitignore", "config"]
+
+
+def test_exclude_list_can_force_config_only_mode() -> None:
+    cfg = Config(**{"indexing": {"exclude": ["**/dist/**"], "exclude_mode": "config_only"}})
     sources = cfg.indexing.resolve_ignore_sources()  # type: ignore[attr-defined]
     assert sources == ["config"]
 

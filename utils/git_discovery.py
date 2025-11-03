@@ -140,10 +140,24 @@ def list_repo_files_via_git(
     if pushdown:
         try:
             specs = build_git_pathspecs(rel_prefix, include_patterns)
-            if specs:
-                pathspecs = specs
-            elif rel_prefix:
-                pathspecs = [rel_prefix]
+            # Apply CAP to avoid excessive number of :(glob) specs
+            cap_env = os.environ.get("CHUNKHOUND_INDEXING__GIT_PATHSPEC_CAP", "")
+            try:
+                cap = int(cap_env) if cap_env.strip() else 128
+                if cap < 1:
+                    cap = 128
+            except Exception:
+                cap = 128
+            capped = False
+            if specs and len(specs) > cap:
+                # Fallback to subtree-only restriction to guarantee correctness
+                pathspecs = [rel_prefix] if rel_prefix else None
+                capped = True
+            else:
+                if specs:
+                    pathspecs = specs
+                elif rel_prefix:
+                    pathspecs = [rel_prefix]
         except Exception:
             pathspecs = ([rel_prefix] if rel_prefix else None)
     else:
@@ -183,6 +197,12 @@ def list_repo_files_via_git(
         "git_pathspecs": int(len(pathspecs)) if pathspecs is not None else 0,
         "git_pushdown": bool(pushdown),
     }
+    # Optionally surface whether CAP fallback was applied (best-effort)
+    try:
+        if "capped" in locals() and capped:
+            stats["git_pathspecs_capped"] = True
+    except Exception:
+        pass
     return out, stats
 
 
@@ -190,4 +210,3 @@ __all__ = [
     "list_repo_files_via_git",
     "build_git_pathspecs",
 ]
-

@@ -152,6 +152,7 @@ Fields in `startup_profile` (JSON):
 - `git_rows_others` — number of paths from `git ls-files --others --exclude-standard`
 - `git_rows_total` — sum of the two above
 - `git_pathspecs` — number of pathspecs (`:(glob) ...`) pushed down to Git for pre-filtering
+  - CAP: set `CHUNKHOUND_INDEXING__GIT_PATHSPEC_CAP` (default: 128). If the number of synthesized specs would exceed the cap, ChunkHound falls back to a subtree-only pathspec to guarantee coverage. The profile reflects the actual `git_pathspecs` used; an optional `git_pathspecs_capped: true` may appear.
 
 Notes:
 
@@ -182,11 +183,12 @@ Example snippet:
 ChunkHound combines repository–aware ignores with safe defaults. The behavior depends on how you set `indexing.exclude` in `.chunkhound.json`:
 
 - Not set (default) → gitignore only
-  - The `.gitignore` files inside repositories are honored (repo‑aware engine). Default ChunkHound excludes (e.g., `.git/`, `node_modules/`, `.chunkhound/`, caches) still apply to prevent self‑indexing and noise.
+  - The `.gitignore` files inside repositories are honored (repo‑aware engine). Default ChunkHound excludes (e.g., `.git/`, `node_modules/`, `.chunkhound/`, caches) always apply to prevent self‑indexing and noise.
 - String sentinel `.gitignore` → gitignore only
-  - Same as the default: only `.gitignore` rules are used as the “exclusion source” (plus ChunkHound’s default excludes).
-- Explicit list (array) → config only
-  - Only your glob patterns in `indexing.exclude` are used as the “exclusion source” (plus ChunkHound’s default excludes). Repository `.gitignore` is not consulted in this mode.
+  - Same as the default: only `.gitignore` rules are used as the exclusion source (plus ChunkHound’s default excludes).
+- Explicit list (array) → combined (gitignore + config) [default]
+  - Your glob patterns in `indexing.exclude` are layered on top of `.gitignore` rather than replacing it. ChunkHound’s default excludes are also applied. This avoids surprising loss of `.gitignore` behavior when you accept prompts to add slow files to excludes.
+  - To restore legacy behavior, set `indexing.exclude_mode: "config_only"`. To force only gitignore even when a list exists, set `indexing.exclude_mode: "gitignore_only"` (rare).
 
 Workspace overlay for non‑repo paths (default: on)
 - When the directory you index contains non‑repo subtrees, ChunkHound can apply the root workspace `.gitignore` only to those non‑repo paths. This is controlled by `indexing.workspace_gitignore_nonrepo` (default: `true`).
@@ -211,11 +213,27 @@ Examples
   }
 }
 
-// Config only (user patterns) — gitignore not consulted here
+// Explicit list layered ON TOP of gitignore (default)
 {
   "indexing": {
     "exclude": ["**/dist/**", "**/*.min.js"],
     "workspace_gitignore_nonrepo": false
+  }
+}
+
+// Legacy behavior: config only (gitignore ignored)
+{
+  "indexing": {
+    "exclude": ["**/dist/**", "**/*.min.js"],
+    "exclude_mode": "config_only"
+  }
+}
+
+// Force gitignore-only even with a list (rare)
+{
+  "indexing": {
+    "exclude": ["**/dist/**"],
+    "exclude_mode": "gitignore_only"
   }
 }
 ```

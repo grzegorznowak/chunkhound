@@ -201,6 +201,12 @@ class IndexingConfig(BaseModel):
     exclude_sentinel: str | None = Field(default=None, repr=False)
     # Private: whether user explicitly supplied an exclude list in input
     exclude_user_supplied: bool = Field(default=False, repr=False)
+    # Optional: control how exclude list combines with gitignore
+    # - None (default): if user supplies a list, combine with gitignore (overlay)
+    # - "combined": same as default behavior
+    # - "config_only": use only config excludes (legacy behavior)
+    # - "gitignore_only": use only gitignore (rare; sentinel also forces this)
+    exclude_mode: str | None = Field(default=None, description="Exclude source mode: combined|config_only|gitignore_only")
 
     # Root-level file name for ChunkHound-specific ignores (gitwildmatch syntax)
     chignore_file: str = Field(default=".chignore")
@@ -412,6 +418,12 @@ class IndexingConfig(BaseModel):
         if dback := os.getenv("CHUNKHOUND_INDEXING__DISCOVERY_BACKEND"):
             config["discovery_backend"] = dback
 
+        # Exclude mode (combined | config_only | gitignore_only)
+        if em := os.getenv("CHUNKHOUND_INDEXING__EXCLUDE_MODE"):
+            val = em.strip().lower()
+            if val in ("combined", "config_only", "gitignore_only"):
+                config["exclude_mode"] = val
+
         # Non‑repo workspace .gitignore toggle
         if wr := os.getenv("CHUNKHOUND_INDEXING__WORKSPACE_GITIGNORE_NONREPO"):
             config["workspace_gitignore_nonrepo"] = wr.strip().lower() not in ("0", "false", "no")
@@ -437,12 +449,11 @@ class IndexingConfig(BaseModel):
                         idx["exclude"] = []
                         data["indexing"] = idx
                     elif isinstance(exc, str) and exc == ".chignore":
-                        # No longer supported: treat as regular (no sentinel)
-                        idx["exclude"] = []
+                        # No longer supported: drop the key so defaults apply
+                        idx.pop("exclude", None)
                         data["indexing"] = idx
                     elif isinstance(exc, list):
-                        # Mark that user explicitly supplied exclude list
-                        idx["exclude_user_supplied"] = True
+                        # Keep as-is; we infer user-intent later by comparing to defaults
                         data["indexing"] = idx
                 else:
                     exc = data.get("exclude")
@@ -450,10 +461,11 @@ class IndexingConfig(BaseModel):
                         data["exclude_sentinel"] = exc
                         data["exclude"] = []
                     elif isinstance(exc, str) and exc == ".chignore":
-                        # No longer supported: treat as regular (no sentinel)
-                        data["exclude"] = []
+                        # No longer supported: drop the key so defaults apply
+                        data.pop("exclude", None)
                     elif isinstance(exc, list):
-                        data["exclude_user_supplied"] = True
+                        # Keep as-is; we infer user-intent later by comparing to defaults
+                        pass
         except Exception:
             # Be permissive; validation will catch true errors later
             pass
@@ -461,12 +473,16 @@ class IndexingConfig(BaseModel):
 
     # Convenience helper for callers to interpret ignore source selection
     def resolve_ignore_sources(self) -> list[str]:
-        # 1) Sentinel -> strictly gitignore
-        if self.exclude_sentinel == ".gitignore":
+        # 1) Sentinel or explicit mode -> gitignore only
+        if self.exclude_sentinel == ".gitignore" or (self.exclude_mode and self.exclude_mode.lower() == "gitignore_only"):
             return ["gitignore"]
-        # 2) User provided exclude list explicitly -> use config only
+        # 2) User provided exclude list (detect either explicit flag or any deviation from defaults)
         if getattr(self, "exclude_user_supplied", False):
-            return ["config"]
+            mode = (self.exclude_mode or "combined").lower()
+            if mode == "config_only":
+                return ["config"]
+            # default and "combined": overlay gitignore + config
+            return ["gitignore", "config"]
         # 3) Not provided at all -> default to gitignore only
         return ["gitignore"]
 
@@ -476,9 +492,16 @@ class IndexingConfig(BaseModel):
         If a sentinel is set (e.g., ".gitignore"), we still apply the default
         exclude set to preserve expected behavior (e.g., node_modules).
         """
+        # Always include safe defaults; overlay user list unless gitignore-only sentinel
+        defaults = list(self._default_excludes())
         if self.exclude_sentinel in {".gitignore"}:
-            return self._default_excludes()
-        return list(self.exclude or self._default_excludes())
+            return defaults
+        # Merge user-provided excludes on top of defaults (preserve order, dedupe)
+        out = list(defaults)
+        for pat in list(self.exclude or []):
+            if pat not in out:
+                out.append(pat)
+        return out
 
     @classmethod
     def extract_cli_overrides(cls, args: Any) -> dict[str, Any]:

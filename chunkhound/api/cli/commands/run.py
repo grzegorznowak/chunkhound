@@ -474,6 +474,36 @@ async def _simulate_index(args: argparse.Namespace, config: Config) -> None:
         # Soft-fail; simulate is best-effort
         pass
 
+    # Respect config_file_size_threshold_kb for structured config languages to mirror real indexing
+    try:
+        from chunkhound.core.types.common import Language as _Lang
+        if getattr(config, "indexing", None) is not None:
+            _thr = getattr(config.indexing, "config_file_size_threshold_kb", 20)
+            try:
+                threshold_kb = int(_thr) if _thr is not None else 20
+            except Exception:
+                threshold_kb = 20
+        else:
+            threshold_kb = 20
+    except Exception:
+        threshold_kb = 20
+    if threshold_kb is not None and threshold_kb > 0:
+        filtered: list[Path] = []
+        for p in files:
+            try:
+                lang = _Lang.from_file_extension(p)
+                if getattr(lang, "is_structured_config_language", False):
+                    try:
+                        if (p.stat().st_size / 1024.0) > float(threshold_kb):
+                            # Skip oversized structured config/data files
+                            continue
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            filtered.append(p)
+        files = filtered
+
     # Gather sizes and relative paths
     items: list[tuple[str, int]] = []
     for p in files:
