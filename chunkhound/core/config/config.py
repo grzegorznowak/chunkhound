@@ -94,6 +94,15 @@ class Config(BaseModel):
                 with open(config_file) as f:
                     file_config = json.load(f)
                     self._deep_merge(config_data, file_config)
+                    # Mark exclude list as user-supplied when present in file
+                    try:
+                        idx = config_data.get("indexing") or {}
+                        exc = idx.get("exclude") if isinstance(idx, dict) else None
+                        if isinstance(exc, list):
+                            idx["exclude_user_supplied"] = True
+                            config_data["indexing"] = idx
+                    except Exception:
+                        pass
             except json.JSONDecodeError as e:
                 raise ValueError(
                     f"Invalid JSON in config file {config_file}: {e}. "
@@ -110,6 +119,15 @@ class Config(BaseModel):
                     with open(local_config_path) as f:
                         local_config = json.load(f)
                         self._deep_merge(config_data, local_config)
+                        # Mark exclude list as user-supplied when present in local file
+                        try:
+                            idx = config_data.get("indexing") or {}
+                            exc = idx.get("exclude") if isinstance(idx, dict) else None
+                            if isinstance(exc, list):
+                                idx["exclude_user_supplied"] = True
+                                config_data["indexing"] = idx
+                        except Exception:
+                            pass
                 except json.JSONDecodeError as e:
                     raise ValueError(
                         f"Invalid JSON in config file {local_config_path}: {e}. "

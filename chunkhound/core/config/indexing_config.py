@@ -452,9 +452,6 @@ class IndexingConfig(BaseModel):
                         # No longer supported: drop the key so defaults apply
                         idx.pop("exclude", None)
                         data["indexing"] = idx
-                    elif isinstance(exc, list):
-                        # Keep as-is; we infer user-intent later by comparing to defaults
-                        data["indexing"] = idx
                 else:
                     exc = data.get("exclude")
                     if isinstance(exc, str) and exc in {".gitignore"}:
@@ -463,9 +460,6 @@ class IndexingConfig(BaseModel):
                     elif isinstance(exc, str) and exc == ".chignore":
                         # No longer supported: drop the key so defaults apply
                         data.pop("exclude", None)
-                    elif isinstance(exc, list):
-                        # Keep as-is; we infer user-intent later by comparing to defaults
-                        pass
         except Exception:
             # Be permissive; validation will catch true errors later
             pass
