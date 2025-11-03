@@ -2051,6 +2051,7 @@ class IndexingCoordinator(BaseService):
         tot_rows_tracked = 0
         tot_rows_others = 0
         tot_pathspecs = 0
+        tot_capped = False
 
         # For each repo, list files via Git, restricted to the subtree being indexed
         for rr in repo_roots:
@@ -2083,6 +2084,8 @@ class IndexingCoordinator(BaseService):
                 tot_rows_tracked += int(stats.get("git_rows_tracked", 0))
                 tot_rows_others += int(stats.get("git_rows_others", 0))
                 tot_pathspecs += int(stats.get("git_pathspecs", 0))
+                if bool(stats.get("git_pathspecs_capped")):
+                    tot_capped = True
                 results.extend(repo_files)
             except Exception:
                 # If any repo fails, skip it (we'll still scan non-repo areas)
@@ -2189,6 +2192,8 @@ class IndexingCoordinator(BaseService):
             setattr(self, "_git_rows_others", int(tot_rows_others))
             setattr(self, "_git_rows_total", int(tot_rows_tracked + tot_rows_others))
             setattr(self, "_git_pathspecs", int(tot_pathspecs))
+            if tot_capped:
+                setattr(self, "_git_pathspecs_capped", True)
         except Exception:
             pass
         return uniq

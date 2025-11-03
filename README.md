@@ -236,6 +236,14 @@ Examples
     "exclude_mode": "gitignore_only"
   }
 }
+
+### Root semantics for config patterns
+
+- Config `include` and `exclude` patterns are always evaluated relative to the ChunkHound root (the directory you pass to `chunkhound index`).
+- Git’s own `.gitignore` patterns remain repo‑aware (anchored to their respective repository roots), but your config overlay applies uniformly from the CH root across all subtrees (including Git repos).
+- Examples:
+  - CH root is `/workspaces`; Git repo lives under `/workspaces/monorepo`. To exclude a file inside that repo using config, prefer a CH‑root‑relative path (e.g., `"**/monorepo/path/inside/repo/file.txt"`).
+  - When using anchored includes like `"src/**/*.ts"`, ensure the anchor is correct from the CH root perspective (e.g., `"monorepo/src/**/*.ts"` when the repo is nested).
 ```
 
 CLI toggle for the workspace overlay

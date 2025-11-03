@@ -139,6 +139,7 @@ async def run_command(args: argparse.Namespace, config: Config) -> None:
                 gro = getattr(indexing_coordinator, "_git_rows_others", None)
                 grtot = getattr(indexing_coordinator, "_git_rows_total", None)
                 gps = getattr(indexing_coordinator, "_git_pathspecs", None)
+                gpc = getattr(indexing_coordinator, "_git_pathspecs_capped", None)
                 if grtot is not None or grt is not None or gro is not None:
                     if grt is not None:
                         prof["git_rows_tracked"] = int(grt)
@@ -148,6 +149,8 @@ async def run_command(args: argparse.Namespace, config: Config) -> None:
                         prof["git_rows_total"] = int(grtot)
                     if gps is not None:
                         prof["git_pathspecs"] = int(gps)
+                    if gpc is not None:
+                        prof["git_pathspecs_capped"] = bool(gpc)
                 if prof:
                     print(_json.dumps({"startup_profile": prof}, indent=2), file=sys.stderr)
             except Exception:
@@ -431,6 +434,7 @@ async def _simulate_index(args: argparse.Namespace, config: Config) -> None:
             gro = getattr(indexing_coordinator, "_git_rows_others", None)
             grtot = getattr(indexing_coordinator, "_git_rows_total", None)
             gps = getattr(indexing_coordinator, "_git_pathspecs", None)
+            gpc = getattr(indexing_coordinator, "_git_pathspecs_capped", None)
             if grtot is not None or grt is not None or gro is not None:
                 if grt is not None:
                     prof["git_rows_tracked"] = int(grt)
@@ -440,6 +444,8 @@ async def _simulate_index(args: argparse.Namespace, config: Config) -> None:
                     prof["git_rows_total"] = int(grtot)
                 if gps is not None:
                     prof["git_pathspecs"] = int(gps)
+                if gpc is not None:
+                    prof["git_pathspecs_capped"] = bool(gpc)
             print(_json.dumps(prof), file=sys.stderr)
         except Exception:
             pass
