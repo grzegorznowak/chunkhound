@@ -202,6 +202,7 @@ class OpenAIEmbeddingProvider:
         retry_attempts: int = 3,
         retry_delay: float = 1.0,
         max_tokens: int | None = None,
+        rerank_batch_size: int | None = None,
     ):
         """Initialize OpenAI embedding provider.
 
@@ -217,6 +218,7 @@ class OpenAIEmbeddingProvider:
             retry_attempts: Number of retry attempts for failed requests
             retry_delay: Delay between retry attempts
             max_tokens: Maximum tokens per request (if applicable)
+            rerank_batch_size: Max documents per rerank batch (overrides model defaults, bounded by model caps)
         """
         if not OPENAI_AVAILABLE:
             raise ImportError(
@@ -237,6 +239,7 @@ class OpenAIEmbeddingProvider:
         self._retry_attempts = retry_attempts
         self._retry_delay = retry_delay
         self._max_tokens = max_tokens
+        self._rerank_batch_size = rerank_batch_size
 
         # Validate rerank configuration at initialization (fail-fast)
         # Match config validation logic: check if reranking is enabled
@@ -960,21 +963,37 @@ class OpenAIEmbeddingProvider:
         """Get maximum documents per batch for reranking operations.
 
         Returns model-specific batch limit for reranking to prevent OOM errors.
-        For Qwen3 rerankers: 64-128 based on model size (research-based).
-        For other models: uses embedding batch size as fallback.
+        Implements bounded override pattern: user can set batch size, but it's
+        clamped to model caps for safety.
+
+        Priority order:
+        0. User override (rerank_batch_size) - bounded by model cap below
+        1. Rerank model-specific config (Qwen rerankers: 64-128)
+        2. Embedding model config (if rerank model matches embedding model)
+        3. Conservative default (min of batch_size, 128)
 
         Returns:
             Maximum number of documents to rerank in a single batch
         """
-        # Use rerank-specific config if available (Qwen models)
+        # Determine model cap (Priority 1-3: existing logic)
+        model_cap = None
         if self._qwen_rerank_config and "max_rerank_batch" in self._qwen_rerank_config:
-            return self._qwen_rerank_config["max_rerank_batch"]
-        # Fall back to embedding config if rerank model is same as embedding model
-        if self._qwen_model_config and "max_rerank_batch" in self._qwen_model_config:
-            return self._qwen_model_config["max_rerank_batch"]
-        # Conservative default: limit to batch_size to prevent unbounded requests
-        # Research shows 32-128 is optimal for GPU reranking
-        return min(self._batch_size, 128)
+            # Priority 1: Rerank model-specific config (Qwen models)
+            model_cap = self._qwen_rerank_config["max_rerank_batch"]
+        elif self._qwen_model_config and "max_rerank_batch" in self._qwen_model_config:
+            # Priority 2: Embedding model config (fallback)
+            model_cap = self._qwen_model_config["max_rerank_batch"]
+        else:
+            # Priority 3: Conservative default
+            # Research shows 32-128 is optimal for GPU reranking
+            model_cap = min(self._batch_size, 128)
+
+        # Priority 0: User override (bounded by model cap)
+        if self._rerank_batch_size is not None:
+            return min(self._rerank_batch_size, model_cap)
+
+        # Return model cap as default
+        return model_cap
 
     def get_recommended_concurrency(self) -> int:
         """Get recommended number of concurrent batches for OpenAI.
@@ -1282,6 +1301,13 @@ class OpenAIEmbeddingProvider:
                 )
                 response.raise_for_status()
                 response_data = response.json()
+
+            # Check for error response (TEI returns HTTP 200 with error JSON)
+            # This happens when the server validates the request after accepting it
+            if "error" in response_data:
+                error_msg = response_data.get("error", "Unknown error")
+                error_type = response_data.get("error_type", "Unknown")
+                raise ValueError(f"Rerank service error ({error_type}): {error_msg}")
 
             # Parse response with format auto-detection
             rerank_results = await self._parse_rerank_response(
