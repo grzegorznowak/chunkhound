@@ -1407,9 +1407,61 @@ class LanceDBProvider(SerialDatabaseProvider):
     def execute_query(
         self, query: str, params: list[Any] | None = None
     ) -> list[dict[str, Any]]:
-        """Execute a SQL query and return results."""
-        # LanceDB doesn't support arbitrary SQL, only its query API
-        return []
+        """Execute a limited subset of read queries for coordinator helpers.
+
+        LanceDB has no SQL interface; this adapter recognizes a small set of
+        patterns used by higher layers (e.g., change detection in the indexing
+        coordinator) and serves equivalent results via the native API.
+
+        Supported forms:
+        - SELECT path, size, modified_time, content_hash FROM files
+        - SELECT path, size, modified_time FROM files
+        """
+        try:
+            if not self._files_table:
+                return []
+
+            q = (query or "").strip().lower().replace("\n", " ")
+            if q.startswith("select") and " from files" in q:
+                # Determine requested columns
+                cols: list[str] = []
+                try:
+                    select_part = q.split("from", 1)[0]
+                    select_part = select_part.replace("select", "").strip()
+                    cols = [c.strip() for c in select_part.split(",") if c.strip()]
+                except Exception:
+                    cols = ["path", "size", "modified_time", "content_hash"]
+
+                # Fetch all rows via native API
+                try:
+                    total = int(self._files_table.count_rows())
+                except Exception:
+                    total = 0
+                rows: list[dict[str, Any]] = []
+                try:
+                    if total > 0:
+                        df = self._files_table.head(total).to_pandas()
+                    else:
+                        # Fallback for engines that don't support count_rows
+                        df = self._files_table.to_pandas()
+                    # Normalize frame into list of dicts with requested columns
+                    for _, rec in df.iterrows():
+                        out: dict[str, Any] = {}
+                        for c in cols:
+                            if c in rec:
+                                out[c] = rec[c]
+                            else:
+                                # Provide None for missing optional columns
+                                out[c] = None
+                        rows.append(out)
+                    return rows
+                except Exception:
+                    return []
+
+            # Unsupported pattern → no-op (coordinator will fall back)
+            return []
+        except Exception:
+            return []
 
     # File Processing Integration (inherited from base class)
     async def process_file_incremental(self, file_path: Path) -> dict[str, Any]:

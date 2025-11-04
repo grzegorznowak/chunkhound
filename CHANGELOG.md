@@ -533,3 +533,16 @@ For more information, visit: https://github.com/chunkhound/chunkhound
 - Safety: Cap concurrent timeout children per worker.
   - Worker processes use a semaphore to limit timeout child processes.
   - The cap auto‑scales to `min(num_workers*2, 32)`; in restricted CI sandboxes without SemLock, the limiter falls back gracefully.
+## [Unreleased]
+
+### Added
+- Git pathspec pushdown CAP with fallback; telemetry now records `git_pathspecs` and a `git_pathspecs_capped` flag (simulate and full runs).
+- Single-root filtering for Git/hybrid discovery: config `include`/`exclude` patterns are evaluated relative to the ChunkHound root for consistent behavior across backends.
+- Default overlay semantics for `indexing.exclude` lists: combined sources `["gitignore","config"]` to avoid losing `.gitignore` rules when adding entries via the timeout prompt.
+
+### Changed
+- `indexing.exclude_mode` can force legacy `"config_only"` or `"gitignore_only"`; default for lists is `"combined"`.
+
+### Migration Notes
+- If your configuration relied on list-based `exclude` to disable `.gitignore`, set `"exclude_mode": "config_only"` explicitly.
+- Config patterns are now interpreted relative to the CH root in Git/hybrid discovery; adjust anchored include/exclude paths accordingly (e.g., prefix with the repo folder name when the repo lives under the workspace root).

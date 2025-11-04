@@ -258,6 +258,13 @@ async def get_stats_impl(
     Returns:
         Dict with database statistics and scan progress
     """
+    # Ensure DB connection for stats in lazy-connect scenarios
+    try:
+        if services and not services.provider.is_connected:
+            services.provider.connect()
+    except Exception:
+        # Best-effort: if connect fails, get_stats may still work for providers that lazy-init internally
+        pass
     stats: dict[str, Any] = services.provider.get_stats()
 
     # Map provider field names to MCP API field names
