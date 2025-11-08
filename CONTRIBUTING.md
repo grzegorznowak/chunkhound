@@ -22,12 +22,6 @@ Follow the [Tutorial](https://chunkhound.github.io/tutorial/) to:
 
 Set up the [Code Expert Sub-Agent](https://chunkhound.github.io/code-expert-agent/) to analyze the codebase architecture before making any changes. This sub-agent helps your main coding agent understand existing patterns and identify the minimal changes needed.
 
-### 3. Set Up Research Tools
-
-You'll likely need additional MCP tools for accessing up-to-date documentation and web searches like Context7, Tavily, or others.
-
-For a custom research agent designed specifically for coding workflows, ping `@ofri` in our [Discord](https://discord.gg/BAepHEXXnX).
-
 ## Development Workflow
 
 ### Before Writing Any Code
