@@ -18,18 +18,18 @@ Follow the [Tutorial](https://chunkhound.github.io/tutorial/) to:
 - Index ChunkHound's own codebase
 - Set up MCP integration with your AI agent
 
-### 2. Configure the Code Expert Agent
+### 2. Use Code Research
 
-Set up the [Code Expert Sub-Agent](https://chunkhound.github.io/code-expert-agent/) to analyze the codebase architecture before making any changes. This sub-agent helps your main coding agent understand existing patterns and identify the minimal changes needed.
+Use ChunkHound's built-in [Code Research](https://chunkhound.github.io/code-research) tool to analyze the codebase architecture before making any changes. This tool helps your agent understand existing patterns and identify the minimal changes needed.
 
 ## Development Workflow
 
 ### Before Writing Any Code
 
-**Always use the Code Expert Agent first:**
+**Always use Code Research first:**
 
 ```
-Use the code expert. Consider the surrounding code style, architecture, and module responsibilities.
+Research the codebase. Consider the surrounding code style, architecture, and module responsibilities.
 Think of the minimal required changes that reuse as much as possible.
 ```
 
@@ -140,4 +140,4 @@ By contributing to this project, you agree that your contributions will be licen
 
 ---
 
-Ready to contribute? Start by indexing ChunkHound with itself, set up the Code Expert Agent, and join our [Discord](https://discord.gg/BAepHEXXnX) to connect with the community.
+Ready to contribute? Start by indexing ChunkHound with itself, configure Code Research, and join our [Discord](https://discord.gg/BAepHEXXnX) to connect with the community.
