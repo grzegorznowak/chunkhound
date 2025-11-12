@@ -309,16 +309,22 @@ print(f"Success! Got {len(results)} results")
 - Concurrency tests: Thread safety verification
 
 ## VERSION_MANAGEMENT
-Single source of truth: chunkhound/version.py
-Auto-synchronized to all components via imports
-NEVER manually edit version strings - use update_version.py
+**Dynamic versioning via hatch-vcs** - version automatically derived from git tags
+- Source of truth: Git tags (format: v4.0.1)
+- Generated file: chunkhound/_version.py (auto-created during build, gitignored)
+- Import location: chunkhound/version.py (imports from _version.py or metadata)
+- Create new version: `uv run scripts/update_version.py 4.1.0` or `--bump major|minor|patch`
+- NEVER manually edit version strings - create git tags instead
 
 ## PUBLISHING_PROCESS
 ### Pre-release Checklist
-1. Update version: `uv run scripts/update_version.py X.Y.Z`
+1. Create version tag: `uv run scripts/update_version.py X.Y.Z` or `--bump major|minor|patch`
+   - Creates git tag (e.g., v4.1.0)
+   - Version automatically derived from tag during build via hatch-vcs
 2. Run smoke tests: `uv run pytest tests/test_smoke.py -v` (MANDATORY)
 3. Prepare release: `./scripts/prepare_release.sh`
 4. Test local install: `pip install dist/chunkhound-X.Y.Z-py3-none-any.whl`
+5. Push tag: `git push origin vX.Y.Z`
 
 ### Dependency Locking Strategy
 - `pyproject.toml`: Flexible constraints (>=) for library compatibility
