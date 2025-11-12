@@ -107,7 +107,10 @@ Two reranking API formats are supported with automatic format detection:
 
 **2. TEI Format** (Hugging Face Text Embeddings Inference)
 - Request: `{"query": "...", "texts": [...]}`
-- Response: `{"results": [{"index": 0, "score": 0.95}, ...]}`
+- Response (two variants):
+  - **Real TEI servers**: `[{"index": 0, "score": 0.95}, ...]` (bare array)
+  - **Some proxies/mocks**: `{"results": [{"index": 0, "score": 0.95}, ...]}` (wrapped)
+  - **Note**: ChunkHound automatically normalizes both variants to wrapped format internally
 - Model: Set at deployment time with `--model-id` flag (optional in request)
 - Authorization: Supports `Authorization: Bearer <token>` header when TEI uses `--api-key`
 - Use case: TEI servers (BAAI/bge-reranker-base, Alibaba-NLP/gte-reranker, etc.)
@@ -188,6 +191,7 @@ export CHUNKHOUND_EMBEDDING__BASE_URL=http://localhost:11434/v1
 export CHUNKHOUND_EMBEDDING__MODEL=nomic-embed-text
 export CHUNKHOUND_EMBEDDING__RERANK_URL=http://localhost:8080/rerank
 export CHUNKHOUND_EMBEDDING__RERANK_FORMAT=tei
+export CHUNKHOUND_EMBEDDING__RERANK_BATCH_SIZE=32  # Match TEI server --max-batch-size limit
 ```
 
 **TEI Deployment Example:**
@@ -212,8 +216,9 @@ curl -X POST http://localhost:8080/rerank \
   -H "Authorization: Bearer your-api-key" \
   -d '{"query": "python programming", "texts": ["def main():", "function test() {}"]}'
 
-# Expected response:
-# {"results": [{"index": 0, "score": 0.95}, {"index": 1, "score": 0.12}]}
+# Expected response (real TEI servers return bare array):
+# [{"index": 0, "score": 0.95}, {"index": 1, "score": 0.12}]
+# Note: Some proxies may wrap as {"results": [...]} - ChunkHound handles both
 ```
 
 **Test Cohere Format (vLLM/Cohere):**
@@ -243,7 +248,9 @@ print(f"Success! Got {len(results)} results")
 ```
 
 ### Implementation Details
-- No batching for reranking (context-dependent, small document sets)
+- Automatic batch splitting for reranking (user-configurable via `rerank_batch_size`)
+- Model-specific batch limits: Qwen3-8B (64), Qwen3-4B (96), Qwen3-0.6B (128), others (128 default)
+- Bounded override pattern: User can set `rerank_batch_size`, but clamped to model caps for safety
 - Multi-hop search: 1 initial rerank + N expansion reranks (typically 0-3)
 - Time limits: 5 second cap to prevent excessive API calls
 - Graceful degradation: Falls back to similarity scores if reranking fails
@@ -282,6 +289,13 @@ print(f"Success! Got {len(results)} results")
 - **Cause**: Rerank server slow or unresponsive
 - **Recovery**: Increase timeout via `CHUNKHOUND_EMBEDDING__TIMEOUT`
 - **Default**: 30 seconds for rerank requests
+
+**Batch Size Mismatch**
+- **Error**: `Client error '413 Payload Too Large'` or `batch size X > maximum allowed batch size Y`
+- **Cause**: ChunkHound model-default batch size exceeds server limit (e.g., Qwen3-8B sends 64, TEI limit is 32)
+- **Recovery**: Set `CHUNKHOUND_EMBEDDING__RERANK_BATCH_SIZE` to match server limit
+- **Example**: `export CHUNKHOUND_EMBEDDING__RERANK_BATCH_SIZE=32` for TEI servers
+- **Note**: User override is bounded by model caps for safety (prevents OOM)
 
 ## TESTING_APPROACH
 - Smoke tests: MANDATORY before any commit (tests/test_smoke.py)
