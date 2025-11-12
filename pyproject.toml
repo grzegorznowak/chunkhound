@@ -103,11 +103,6 @@ Issues = "https://github.com/chunkhound/chunkhound/issues"
 Documentation = "https://github.com/chunkhound/chunkhound#readme"
 Changelog = "https://github.com/chunkhound/chunkhound/releases"
 
-[tool.hatch.build]
-include = [
-    "tests/fixtures/yaml/**/*",
-]
-
 [tool.hatch.build.targets.wheel]
 packages = ["chunkhound"]
 
