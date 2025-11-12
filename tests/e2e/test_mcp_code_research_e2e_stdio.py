@@ -117,7 +117,7 @@ async def test_mcp_code_research_uses_codex_cli_via_stdio():
             # Call code_research
             call = await client.send_request(
                 "tools/call",
-                {"name": "code_research", "arguments": {"query": "alpha", "depth": "shallow"}},
+                {"name": "code_research", "arguments": {"query": "alpha"}},
                 timeout=30.0,
             )
             # Response content is a list of text items; check for stub marker
