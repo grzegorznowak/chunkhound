@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.0.1] - 2025-11-12
+
+### Fixed
+- Package build configuration now excludes test fixtures from distribution, reducing package size and removing unnecessary test data from published releases
+
 ## [4.0.0] - 2025-11-12
 
 ### Added
@@ -584,7 +589,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 For more information, visit: https://github.com/chunkhound/chunkhound
 
-[Unreleased]: https://github.com/chunkhound/chunkhound/compare/v4.0.0...HEAD
+[Unreleased]: https://github.com/chunkhound/chunkhound/compare/v4.0.1...HEAD
+[4.0.1]: https://github.com/chunkhound/chunkhound/compare/v4.0.0...v4.0.1
 [4.0.0]: https://github.com/chunkhound/chunkhound/compare/v3.3.1...v4.0.0
 [3.3.1]: https://github.com/chunkhound/chunkhound/compare/v3.3.0...v3.3.1
 [3.3.0]: https://github.com/chunkhound/chunkhound/compare/v3.2.0...v3.3.0
