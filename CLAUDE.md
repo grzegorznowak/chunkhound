@@ -107,7 +107,10 @@ Two reranking API formats are supported with automatic format detection:
 
 **2. TEI Format** (Hugging Face Text Embeddings Inference)
 - Request: `{"query": "...", "texts": [...]}`
-- Response: `{"results": [{"index": 0, "score": 0.95}, ...]}`
+- Response (two variants):
+  - **Real TEI servers**: `[{"index": 0, "score": 0.95}, ...]` (bare array)
+  - **Some proxies/mocks**: `{"results": [{"index": 0, "score": 0.95}, ...]}` (wrapped)
+  - **Note**: ChunkHound automatically normalizes both variants to wrapped format internally
 - Model: Set at deployment time with `--model-id` flag (optional in request)
 - Authorization: Supports `Authorization: Bearer <token>` header when TEI uses `--api-key`
 - Use case: TEI servers (BAAI/bge-reranker-base, Alibaba-NLP/gte-reranker, etc.)
@@ -213,8 +216,9 @@ curl -X POST http://localhost:8080/rerank \
   -H "Authorization: Bearer your-api-key" \
   -d '{"query": "python programming", "texts": ["def main():", "function test() {}"]}'
 
-# Expected response:
-# {"results": [{"index": 0, "score": 0.95}, {"index": 1, "score": 0.12}]}
+# Expected response (real TEI servers return bare array):
+# [{"index": 0, "score": 0.95}, {"index": 1, "score": 0.12}]
+# Note: Some proxies may wrap as {"results": [...]} - ChunkHound handles both
 ```
 
 **Test Cohere Format (vLLM/Cohere):**
