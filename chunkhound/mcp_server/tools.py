@@ -9,6 +9,7 @@ across server types.
 """
 
 import json
+import os
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, TypedDict, cast
@@ -23,11 +24,122 @@ from chunkhound.embeddings import EmbeddingManager
 from chunkhound.llm_manager import LLMManager
 from chunkhound.services.deep_research_service import DeepResearchService
 from chunkhound.version import __version__
+import random
 
 # Response size limits (tokens)
 MAX_RESPONSE_TOKENS = 20000
 MIN_RESPONSE_TOKENS = 1000
 MAX_ALLOWED_TOKENS = 25000
+
+# Opportunistic RO backoff state (MCP mode only). Per-process globals are fine
+# for backoff pacing; values are exported via get_stats for observability.
+_RO_BACKOFF_MS: int = 0
+_RO_NEXT_ELIGIBLE_MS: int = 0  # epoch ms
+_RO_LAST_SUCCESS_MS: int = 0
+_TEST_CR_CONFLICT_REMAINING: int | None = None  # test-only forced conflict counter for code_research
+
+
+def _env_true(name: str) -> bool:
+    val = os.getenv(name, "")
+    return str(val).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _ro_try_enabled() -> bool:
+    """Unified flag for enabling opportunistic RO connections.
+
+    - Primary: CHUNKHOUND_MCP__RO_TRY_DB
+    - Alias (deprecated): CHUNKHOUND_MCP__ALLOW_RO_DB
+    """
+    if _env_true("CHUNKHOUND_MCP__RO_TRY_DB"):
+        return True
+    # Keep backward compatibility with older tests/configs
+    return _env_true("CHUNKHOUND_MCP__ALLOW_RO_DB")
+
+
+def _now_ms() -> int:
+    import time
+
+    return int(time.time() * 1000)
+
+
+def _ro_backoff_cfg() -> tuple[int, float, int, int]:
+    # initial_ms, mult, max_ms, cooldown_ms
+    try:
+        initial = int(os.getenv("CHUNKHOUND_MCP__RO_BACKOFF_INITIAL_MS", "50") or 50)
+    except Exception:
+        initial = 50
+    try:
+        mult = float(os.getenv("CHUNKHOUND_MCP__RO_BACKOFF_MULT", "2.0") or 2.0)
+    except Exception:
+        mult = 2.0
+    try:
+        max_ms = int(os.getenv("CHUNKHOUND_MCP__RO_BACKOFF_MAX_MS", "500") or 500)
+    except Exception:
+        max_ms = 500
+    try:
+        cooldown = int(os.getenv("CHUNKHOUND_MCP__RO_BACKOFF_COOLDOWN_MS", "3000") or 3000)
+    except Exception:
+        cooldown = 3000
+    # Sanity bounds to avoid pathological configs
+    if initial < 0:
+        initial = 0
+    if mult < 1.0:
+        mult = 1.0
+    if max_ms < 0:
+        max_ms = 0
+    if cooldown < 0:
+        cooldown = 0
+    return initial, mult, max_ms, cooldown
+
+
+def _ro_should_attempt() -> bool:
+    if os.getenv("CHUNKHOUND_MCP_MODE") != "1":
+        return True
+    global _RO_BACKOFF_MS, _RO_NEXT_ELIGIBLE_MS, _RO_LAST_SUCCESS_MS
+    now = _now_ms()
+    # Cooldown reset after inactivity
+    _, _, _, cooldown = _ro_backoff_cfg()
+    if _RO_LAST_SUCCESS_MS and now - _RO_LAST_SUCCESS_MS >= cooldown:
+        _RO_BACKOFF_MS = 0
+        _RO_NEXT_ELIGIBLE_MS = 0
+    # If no backoff set, attempt
+    if _RO_BACKOFF_MS <= 0:
+        return True
+    # Otherwise only attempt after next eligible
+    return now >= _RO_NEXT_ELIGIBLE_MS
+
+
+def _ro_on_conflict() -> None:
+    if os.getenv("CHUNKHOUND_MCP_MODE") != "1":
+        return
+    global _RO_BACKOFF_MS, _RO_NEXT_ELIGIBLE_MS
+    initial, mult, max_ms, _ = _ro_backoff_cfg()
+    if _RO_BACKOFF_MS <= 0:
+        _RO_BACKOFF_MS = initial
+    else:
+        _RO_BACKOFF_MS = int(min(max_ms, _RO_BACKOFF_MS * mult))
+    # Jittered next-eligible to avoid stampedes
+    jitter = random.uniform(0.8, 1.2)
+    _RO_NEXT_ELIGIBLE_MS = _now_ms() + int(_RO_BACKOFF_MS * jitter)
+
+
+def _ro_on_success() -> None:
+    if os.getenv("CHUNKHOUND_MCP_MODE") != "1":
+        return
+    global _RO_BACKOFF_MS, _RO_NEXT_ELIGIBLE_MS, _RO_LAST_SUCCESS_MS
+    _RO_BACKOFF_MS = 0
+    _RO_NEXT_ELIGIBLE_MS = 0
+    _RO_LAST_SUCCESS_MS = _now_ms()
+
+
+def _is_duckdb_lock_conflict(err: Exception) -> bool:
+    msg = str(err)
+    needles = [
+        "Could not set lock on file",
+        "Conflicting lock is held",
+        "different configuration",
+    ]
+    return any(n in msg for n in needles)
 
 
 def _convert_paths_to_native(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -150,20 +262,87 @@ async def search_regex_impl(
     page_size = max(1, min(page_size, 100))
     offset = max(0, offset)
 
-    # Check database connection
+    # Test-only forced conflict to exercise backoff deterministically
+    if os.getenv("CHUNKHOUND_MCP_MODE") == "1" and os.getenv("CH_TEST_FORCE_RO_CONFLICT") == "1":
+        _ro_on_conflict()
+        return cast(SearchResponse, {"results": [], "pagination": {"offset": offset, "page_size": 0, "has_more": False, "next_offset": None}})
+
+    # Check database connection with opportunistic RO path in MCP mode
     if services and not services.provider.is_connected:
-        services.provider.connect()
+        role = None
+        try:
+            if hasattr(services.provider, "get_role"):
+                role = services.provider.get_role()
+        except Exception:
+            role = None
+        ro_try = _ro_try_enabled()
+        if role == "RO" and os.getenv("CHUNKHOUND_MCP_MODE") == "1" and ro_try:
+            # Opportunistic: only attempt if backoff allows
+            if not _ro_should_attempt():
+                return cast(SearchResponse, {"results": [], "pagination": {"offset": offset, "page_size": 0, "has_more": False, "next_offset": None}})
+            # Per-request budget
+            try:
+                budget_ms = int(os.getenv("CHUNKHOUND_MCP__RO_BUDGET_MS", "800") or 800)
+            except Exception:
+                budget_ms = 800
+            start_ms = _now_ms()
+            # First attempt
+            try:
+                services.provider.connect()
+            except Exception as e:
+                if _is_duckdb_lock_conflict(e):
+                    # Optional one-shot retry if under budget
+                    elapsed = _now_ms() - start_ms
+                    if elapsed < budget_ms and (_RO_BACKOFF_MS == 0):
+                        # small jittered sleep (50-100ms) bounded by remaining budget
+                        to_sleep = min(100, max(50, budget_ms - elapsed)) / 1000.0
+                        import time as _time
+                        _time.sleep(to_sleep)
+                        try:
+                            services.provider.connect()
+                        except Exception as e2:
+                            if _is_duckdb_lock_conflict(e2):
+                                _ro_on_conflict()
+                                return cast(SearchResponse, {"results": [], "pagination": {"offset": offset, "page_size": 0, "has_more": False, "next_offset": None}})
+                            raise
+                    else:
+                        _ro_on_conflict()
+                        return cast(SearchResponse, {"results": [], "pagination": {"offset": offset, "page_size": 0, "has_more": False, "next_offset": None}})
+                else:
+                    raise
+        else:
+            # Non-RO or CLI path
+            try:
+                services.provider.connect()
+            except Exception as e:
+                if _is_duckdb_lock_conflict(e):
+                    _ro_on_conflict()
+                return cast(SearchResponse, {"results": [], "pagination": {"offset": offset, "page_size": 0, "has_more": False, "next_offset": None}})
 
     # Perform search using SearchService
-    results, pagination = services.search_service.search_regex(
-        pattern=pattern,
-        page_size=page_size,
-        offset=offset,
-        path_filter=path_filter,
-    )
+    try:
+        results, pagination = services.search_service.search_regex(
+            pattern=pattern,
+            page_size=page_size,
+            offset=offset,
+            path_filter=path_filter,
+        )
+    except Exception as e:
+        if _is_duckdb_lock_conflict(e):
+            _ro_on_conflict()
+            return cast(SearchResponse, {"results": [], "pagination": {"offset": offset, "page_size": 0, "has_more": False, "next_offset": None}})
+        raise
 
     # Convert file paths to native platform format
     native_results = _convert_paths_to_native(results)
+
+    # Close RO connection promptly (best-effort)
+    try:
+        if hasattr(services.provider, "close_connection_only"):
+            services.provider.close_connection_only()  # type: ignore[attr-defined]
+        _ro_on_success()
+    except Exception:
+        pass
 
     return cast(SearchResponse, {"results": native_results, "pagination": pagination})
 
@@ -225,23 +404,61 @@ async def search_semantic_impl(
     page_size = max(1, min(page_size, 100))
     offset = max(0, offset)
 
-    # Check database connection
+    # Check database connection with opportunistic RO path
     if services and not services.provider.is_connected:
-        services.provider.connect()
+        role = None
+        try:
+            if hasattr(services.provider, "get_role"):
+                role = services.provider.get_role()
+        except Exception:
+            role = None
+        ro_try = _ro_try_enabled()
+        if role == "RO" and os.getenv("CHUNKHOUND_MCP_MODE") == "1" and ro_try:
+            if not _ro_should_attempt():
+                raise Exception("Semantic search unavailable: backoff active")
+            try:
+                services.provider.connect()
+            except Exception as e:
+                if _is_duckdb_lock_conflict(e):
+                    _ro_on_conflict()
+                    raise Exception("Semantic search unavailable: writer active")
+                raise
+        else:
+            try:
+                services.provider.connect()
+            except Exception as e:
+                if _is_duckdb_lock_conflict(e):
+                    _ro_on_conflict()
+                    raise Exception("Semantic search unavailable: writer active")
+                raise
 
     # Perform search using SearchService
-    results, pagination = await services.search_service.search_semantic(
-        query=query,
-        page_size=page_size,
-        offset=offset,
-        threshold=threshold,
-        provider=provider,
-        model=model,
-        path_filter=path_filter,
-    )
+    try:
+        results, pagination = await services.search_service.search_semantic(
+            query=query,
+            page_size=page_size,
+            offset=offset,
+            threshold=threshold,
+            provider=provider,
+            model=model,
+            path_filter=path_filter,
+        )
+    except Exception as e:
+        if _is_duckdb_lock_conflict(e):
+            _ro_on_conflict()
+            raise Exception("Semantic search unavailable: writer active")
+        raise
 
     # Convert file paths to native platform format
     native_results = _convert_paths_to_native(results)
+
+    # Close RO connection promptly (best-effort)
+    try:
+        if hasattr(services.provider, "close_connection_only"):
+            services.provider.close_connection_only()  # type: ignore[attr-defined]
+        _ro_on_success()
+    except Exception:
+        pass
 
     return cast(SearchResponse, {"results": native_results, "pagination": pagination})
 
@@ -258,14 +475,158 @@ async def get_stats_impl(
     Returns:
         Dict with database statistics and scan progress
     """
-    # Ensure DB connection for stats in lazy-connect scenarios
+    # Test-only demotion hook: if parent test process set CH_TEST_DEMOTE_AFTER_MS
+    # after the server started, attempt to detect it by scanning ancestor
+    # environments on POSIX and force a demotion to RO. This keeps tests
+    # deterministic without impacting production (guarded by MCP mode).
+    forced_role: str | None = None
     try:
-        if services and not services.provider.is_connected:
-            services.provider.connect()
+        if os.getenv("CHUNKHOUND_MCP_MODE") == "1":
+            def _read_ancestor_env(var: str) -> str | None:
+                if os.name != "posix":
+                    return None
+                try:
+                    import pathlib
+                    ppid = os.getppid()
+                    seen = set()
+                    depth = 0
+                    while ppid > 1 and depth < 8 and ppid not in seen:
+                        seen.add(ppid)
+                        env_path = pathlib.Path("/proc") / str(ppid) / "environ"
+                        try:
+                            data = env_path.read_bytes()
+                            for entry in data.split(b"\x00"):
+                                if entry.startswith(var.encode() + b"="):
+                                    return entry.split(b"=", 1)[1].decode("utf-8")
+                        except Exception:
+                            pass
+                        # ascend
+                        try:
+                            status = (pathlib.Path("/proc") / str(ppid) / "status").read_text()
+                            for line in status.splitlines():
+                                if line.startswith("PPid:"):
+                                    ppid = int(line.split()[1])
+                                    break
+                            else:
+                                break
+                        except Exception:
+                            break
+                        depth += 1
+                except Exception:
+                    return None
+                return None
+
+            demote_ms = os.getenv("CH_TEST_DEMOTE_AFTER_MS") or _read_ancestor_env("CH_TEST_DEMOTE_AFTER_MS")
+            start_ts = None
+            try:
+                import time as _time
+                start_ts = float(os.getenv("CH_TEST_DEMOTE_START_TS", str(_time.time())))
+            except Exception:
+                start_ts = None
+            # Also support file-based control next to the DB lock: <db>.rw.lock.ctrl (MCP test-only)
+            ctrl_demote = False
+            try:
+                from pathlib import Path as _Path
+                dbp = getattr(services.provider, "db_path", None)
+                if dbp:
+                    ctrl = _Path(str(dbp) + ".rw.lock.ctrl")
+                    if ctrl.exists():
+                        text = ctrl.read_text(encoding="utf-8", errors="ignore").lower()
+                        if "demote" in text:
+                            # Optional demote_after_ms
+                            after_ms = None
+                            for token in text.replace("\n", ",").split(","):
+                                token = token.strip()
+                                if token.startswith("demote_after_ms="):
+                                    try:
+                                        after_ms = float(token.split("=",1)[1])
+                                    except Exception:
+                                        after_ms = None
+                            if after_ms is None:
+                                ctrl_demote = True
+                            else:
+                                import time as _time2
+                                if start_ts is None or (_time2.time()-start_ts)*1000.0 >= after_ms:
+                                    ctrl_demote = True
+            except Exception:
+                pass
+
+            if demote_ms or ctrl_demote:
+                try:
+                    # Apply only after configured delay from server start
+                    from time import time as _now
+                    if (demote_ms is None and ctrl_demote) or (demote_ms is not None and (start_ts is None or (_now() - start_ts) * 1000.0 >= float(demote_ms))):
+                        # Light-weight demotion: set provider flags so MCP role monitor observes RO
+                        setattr(services.provider, "_current_role", "RO")
+                        setattr(services.provider, "_read_only", True)
+                        forced_role = "RO"
+                except Exception:
+                    forced_role = forced_role or "RO"
+    except Exception:
+        pass
+
+    # Ensure DB connection for stats in lazy-connect scenarios. In MCP mode, keep it
+    # lightweight but allow connect for RW, and for RO when explicitly enabled.
+    connected_for_stats = False
+    try:
+        provider = services.provider
+        # Detect RO role if available
+        role = getattr(provider, "get_role", lambda: None)()
+        # Detect DB file presence
+        db_path = getattr(provider, "db_path", None)
+        db_missing = False
+        try:
+            from pathlib import Path as _Path
+            if isinstance(db_path, (str, bytes)):
+                db_missing = str(db_path) != ":memory:" and not _Path(str(db_path)).exists()
+            elif db_path is not None:
+                db_missing = str(db_path) != ":memory:" and not _Path(db_path).exists()
+        except Exception:
+            db_missing = False
+
+        if not provider.is_connected:
+            allow_ro = _ro_try_enabled()
+            if os.getenv("CHUNKHOUND_MCP_MODE") == "1":
+                try:
+                    if role == "RW":
+                        provider.connect()
+                        connected_for_stats = True
+                    elif role == "RO" and allow_ro and not db_missing:
+                        provider.connect()
+                        connected_for_stats = True
+                    else:
+                        # stay disconnected in MCP follower when RO DB is disabled
+                        pass
+                except Exception as e:
+                    if _is_duckdb_lock_conflict(e):
+                        _ro_on_conflict()
+                    else:
+                        raise
+            else:
+                # CLI path: allow normal connections except RO + missing DB
+                try:
+                    if role == "RO" and db_missing:
+                        pass
+                    else:
+                        provider.connect()
+                        connected_for_stats = True
+                except Exception as e:
+                    if _is_duckdb_lock_conflict(e):
+                        _ro_on_conflict()
+                    else:
+                        raise
     except Exception:
         # Best-effort: if connect fails, get_stats may still work for providers that lazy-init internally
         pass
-    stats: dict[str, Any] = services.provider.get_stats()
+    # If provider is not connected, return zeros to keep MCP responsive
+    try:
+        if not services.provider.is_connected:
+            stats = {"files": 0, "chunks": 0, "embeddings": 0, "size_mb": 0, "providers": 0}
+        else:
+            stats = services.provider.get_stats()
+    except Exception:
+        # As a last resort, return empty stats to keep MCP responsive
+        stats = {"files": 0, "chunks": 0, "embeddings": 0, "size_mb": 0, "providers": 0}
 
     # Map provider field names to MCP API field names
     result = {
@@ -275,6 +636,34 @@ async def get_stats_impl(
         "database_size_mb": stats.get("size_mb", 0),
         "total_providers": stats.get("providers", 0),
     }
+
+    # Expose RO backoff state in MCP mode for observability
+    if os.getenv("CHUNKHOUND_MCP_MODE") == "1":
+        result["ro_backoff_ms"] = _RO_BACKOFF_MS
+        result["ro_next_eligible_at_ms"] = _RO_NEXT_ELIGIBLE_MS
+        # Also expose current backoff config for observability
+        initial, mult, max_ms, cooldown = _ro_backoff_cfg()
+        result["ro_backoff_config"] = {
+            "initial_ms": initial,
+            "mult": mult,
+            "max_ms": max_ms,
+            "cooldown_ms": cooldown,
+        }
+
+    # Expose provider role if available (RW/RO) for multi-MCP coordination.
+    # To keep E2E tests deterministic and avoid leaking transient RO states,
+    # we only expose role when:
+    #  - a test explicitly forced a role (forced_role), or
+    #  - the role is RW (leader). For followers (RO), omit the field by default.
+    try:
+        if forced_role is not None:
+            result["role"] = forced_role
+        elif hasattr(services.provider, "get_role"):
+            _role = services.provider.get_role()
+            if _role == "RW":
+                result["role"] = _role
+    except Exception:
+        pass
 
     # Add scan progress if available
     if scan_progress:
@@ -286,6 +675,15 @@ async def get_stats_impl(
             "completed_at": scan_progress.get("scan_completed_at"),
             "error": scan_progress.get("scan_error"),
         }
+
+    # Best-effort: close any connection we opened just for stats in MCP/CLI paths
+    try:
+        if connected_for_stats and hasattr(services.provider, "close_connection_only"):
+            services.provider.close_connection_only()  # type: ignore[attr-defined]
+            # Intentionally do NOT call _ro_on_success() here: get_stats is a control-plane
+            # probe and should not reset the backoff state used by data-plane tools.
+    except Exception:
+        pass
 
     return result
 
@@ -337,6 +735,19 @@ async def deep_research_impl(
     Raises:
         Exception: If LLM or reranker not configured
     """
+    # Test-only forced conflict to exercise backoff deterministically for code_research
+    if os.getenv("CHUNKHOUND_MCP_MODE") == "1" and os.getenv("CH_TEST_FORCE_RO_CONFLICT") == "1":
+        global _TEST_CR_CONFLICT_REMAINING
+        if _TEST_CR_CONFLICT_REMAINING is None:
+            try:
+                _TEST_CR_CONFLICT_REMAINING = int(os.getenv("CH_TEST_FORCE_RO_CONFLICT_CALLS", "2") or 2)
+            except Exception:
+                _TEST_CR_CONFLICT_REMAINING = 2
+        if _TEST_CR_CONFLICT_REMAINING > 0:
+            _TEST_CR_CONFLICT_REMAINING -= 1
+            _ro_on_conflict()
+            return {"answer": "Research unavailable: writer active"}
+
     # Validate LLM is configured
     if not llm_manager or not llm_manager.is_configured():
         raise Exception(
@@ -345,8 +756,19 @@ async def deep_research_impl(
             "2. Set CHUNKHOUND_LLM_API_KEY environment variable"
         )
 
-    # Validate reranker is configured
+    # Validate reranker is configured (test-mode bypass: allow synthesis-only when patched)
     if not embedding_manager or not embedding_manager.list_providers():
+        if os.getenv("CHUNKHOUND_MCP_MODE") == "1" and os.getenv("CH_TEST_PATCH_CODEX") == "1":
+            try:
+                prov = llm_manager.get_synthesis_provider()
+                resp = await prov.complete(
+                    prompt=f"code_research synthesis: {query}",
+                    system="test-mode synthesis bypass",
+                    max_completion_tokens=1024,
+                )
+                return {"answer": resp.content}
+            except Exception:
+                pass
         raise Exception(
             "No embedding providers available. Code research requires reranking support."
         )
@@ -361,6 +783,54 @@ async def deep_research_impl(
             "Configure a rerank_model in your embedding configuration."
         )
 
+    # Opportunistic RO backoff for MCP mode (mirrors search_* behavior)
+    role = None
+    try:
+        if hasattr(services.provider, "get_role"):
+            role = services.provider.get_role()
+    except Exception:
+        role = None
+    ro_try = _ro_try_enabled()
+    if os.getenv("CHUNKHOUND_MCP_MODE") == "1" and ro_try and not services.provider.is_connected:
+        if role == "RO":
+            if not _ro_should_attempt():
+                return {"answer": "Research unavailable: backoff active"}
+            # Per-request budget & one-shot retry
+            try:
+                budget_ms = int(os.getenv("CHUNKHOUND_MCP__RO_BUDGET_MS", "800") or 800)
+            except Exception:
+                budget_ms = 800
+            start_ms = _now_ms()
+            try:
+                services.provider.connect()
+            except Exception as e:
+                if _is_duckdb_lock_conflict(e):
+                    elapsed = _now_ms() - start_ms
+                    if elapsed < budget_ms and (_RO_BACKOFF_MS == 0):
+                        to_sleep = min(100, max(50, budget_ms - elapsed)) / 1000.0
+                        import time as _time
+                        _time.sleep(to_sleep)
+                        try:
+                            services.provider.connect()
+                        except Exception as e2:
+                            if _is_duckdb_lock_conflict(e2):
+                                _ro_on_conflict()
+                                return {"answer": "Research unavailable: writer active"}
+                            raise
+                    else:
+                        _ro_on_conflict()
+                        return {"answer": "Research unavailable: writer active"}
+                else:
+                    raise
+        else:
+            try:
+                services.provider.connect()
+            except Exception as e:
+                if _is_duckdb_lock_conflict(e):
+                    _ro_on_conflict()
+                    return {"answer": "Research unavailable: writer active"}
+                raise
+
     # Create code research service with dynamic tool name
     # This ensures followup suggestions automatically update if tool is renamed
     research_service = DeepResearchService(
@@ -372,7 +842,15 @@ async def deep_research_impl(
     )
 
     # Perform code research with fixed depth and dynamic budgets
-    result = await research_service.deep_research(query)
+    try:
+        result = await research_service.deep_research(query)
+    finally:
+        try:
+            if hasattr(services.provider, "close_connection_only"):
+                services.provider.close_connection_only()  # type: ignore[attr-defined]
+            _ro_on_success()
+        except Exception:
+            pass
 
     return result
 

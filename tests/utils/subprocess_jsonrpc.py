@@ -195,7 +195,30 @@ class SubprocessJsonRpcClient:
                     f"Response missing 'result' field: {response}"
                 )
 
-            return cast(dict[str, Any], response["result"])
+            result_obj = response["result"]
+            # Compatibility: unwrap MCP ToolResult shape into a plain dict when possible
+            # Expected shape from official MCP SDK: { content: [ { type: 'text', text: '{json}' } ], isError: false }
+            if (
+                method == "tools/call"
+                and isinstance(result_obj, dict)
+                and isinstance(result_obj.get("content"), list)
+                and result_obj["content"]
+                and isinstance(result_obj["content"][0], dict)
+                and "text" in result_obj["content"][0]
+            ):
+                try:
+                    text = result_obj["content"][0]["text"]
+                    parsed = json.loads(text)
+                    if isinstance(parsed, dict):
+                        # Compatibility: return parsed fields while preserving original content
+                        merged: dict[str, Any] = {**parsed}
+                        merged.setdefault("content", result_obj["content"])  # expose ToolResult for tests expecting it
+                        return merged
+                except Exception:
+                    # Fall through to returning raw result
+                    pass
+
+            return cast(dict[str, Any], result_obj)
 
         except Exception:
             # Clean up pending request on any error
@@ -250,12 +273,25 @@ class SubprocessJsonRpcClient:
 
         self._closed = True
 
-        # Cancel background reader task
+        # Proactively terminate subprocess first to unblock reader fast
+        if self._process.returncode is None:
+            self._process.terminate()
+            try:
+                await asyncio.wait_for(self._process.wait(), timeout=1.5)
+            except asyncio.TimeoutError:
+                logger.warning("Subprocess didn't terminate, killing it")
+                self._process.kill()
+                try:
+                    await asyncio.wait_for(self._process.wait(), timeout=1.5)
+                except asyncio.TimeoutError:
+                    logger.warning("Subprocess didn't die after SIGKILL; continuing shutdown")
+
+        # Cancel background reader task with timeout tolerance
         if self._reader_task is not None:
             self._reader_task.cancel()
             try:
-                await self._reader_task
-            except asyncio.CancelledError:
+                await asyncio.wait_for(self._reader_task, timeout=0.5)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
                 pass
 
         # Cancel all pending requests
@@ -263,16 +299,6 @@ class SubprocessJsonRpcClient:
             if not future.done():
                 future.cancel()
         self._pending_requests.clear()
-
-        # Terminate subprocess
-        if self._process.returncode is None:
-            self._process.terminate()
-            try:
-                await asyncio.wait_for(self._process.wait(), timeout=2.0)
-            except asyncio.TimeoutError:
-                logger.warning("Subprocess didn't terminate, killing it")
-                self._process.kill()
-                await self._process.wait()
 
     async def _read_responses(self) -> None:
         """Background task that continuously reads responses from stdout.

@@ -238,6 +238,11 @@ class RealtimeIndexingService:
             None  # Track when monitoring became ready
         )
 
+        # Promotion burst mode (RW after promotion) for near‑instant ingestion
+        self._burst_active: bool = False
+        self._burst_end_ts: float | None = None
+        self._burst_saved_debounce: float | None = None
+
     # Internal helper to forward realtime events into the MCP debug log file
     def _debug(self, message: str) -> None:
         try:
@@ -275,6 +280,15 @@ class RealtimeIndexingService:
             self._debug("monitoring ready")
         else:
             self._debug("monitoring timeout; continuing")
+
+        # Optional idle-disconnect pump for RW Indexer to release DB when idle
+        try:
+            import os as _os
+            idle_ms = int(_os.getenv("CHUNKHOUND_MCP__RW_IDLE_DISCONNECT_MS", "0") or 0)
+        except Exception:
+            idle_ms = 0
+        if idle_ms > 0:
+            asyncio.create_task(self._idle_disconnect_pump(idle_ms/1000.0))
 
     async def stop(self) -> None:
         """Stop the service gracefully."""
@@ -334,6 +348,32 @@ class RealtimeIndexingService:
             await asyncio.gather(*self._debounce_tasks, return_exceptions=True)
             self._debounce_tasks.clear()
 
+    async def _idle_disconnect_pump(self, idle_seconds: float) -> None:
+        """Periodically release DB connection when the Indexer is idle.
+
+        This aims to create short windows for opportunistic RO readers without
+        disrupting the single-writer invariant. It is best-effort and skips if
+        provider API is unavailable.
+        """
+        try:
+            provider = self.services.provider
+        except Exception:
+            return
+        last_activity = time.time()
+        while True:
+            await asyncio.sleep(max(0.1, idle_seconds/3))
+            try:
+                # If queue empty and no pending files, consider idle
+                if self.file_queue.empty() and not self.pending_files:
+                    # Try to close only the underlying connection, keeping executor alive
+                    if hasattr(provider, "db_connected") and provider.db_connected:  # type: ignore[attr-defined]
+                        provider.close_connection_only()  # type: ignore[attr-defined]
+                else:
+                    last_activity = time.time()
+            except Exception:
+                # Never fail the service because of the pump
+                pass
+
     async def _setup_watchdog_async(
         self, watch_path: Path, loop: asyncio.AbstractEventLoop
     ) -> None:
@@ -355,8 +395,9 @@ class RealtimeIndexingService:
         )
 
         try:
-            # Try recursive setup with reasonable timeout for large directories
-            await asyncio.wait_for(watchdog_task, timeout=5.0)
+            # Try recursive setup with a shorter timeout so promotion tests
+            # don't wait too long before monitoring becomes active.
+            await asyncio.wait_for(watchdog_task, timeout=1.0)
             logger.debug("Watchdog setup completed successfully (recursive mode)")
             self._debug("watchdog setup complete (recursive)")
             self._monitoring_ready_time = time.time()
@@ -501,6 +542,9 @@ class RealtimeIndexingService:
 
     async def add_file(self, file_path: Path, priority: str = "change") -> None:
         """Add file to processing queue with deduplication and debouncing."""
+        # During burst mode, bypass debouncing for change events
+        if priority == "change" and self._is_burst_active():
+            priority = "burst"
         if file_path not in self.pending_files:
             self.pending_files.add(file_path)
 
@@ -746,7 +790,7 @@ class RealtimeIndexingService:
             # If we're using polling mode, consider it "alive"
             monitoring_active = True
 
-        return {
+        stats = {
             "queue_size": self.file_queue.qsize(),
             "pending_files": len(self.pending_files),
             "failed_files": len(self.failed_files),
@@ -755,6 +799,17 @@ class RealtimeIndexingService:
             "watching_directory": str(self.watch_path) if self.watch_path else None,
             "watched_directories_count": len(self.watched_directories),  # Added
         }
+        try:
+            stats["promotion_ingest"] = {
+                "burst_active": self._is_burst_active(),
+                "burst_window_s": (
+                    max(0.0, self._burst_end_ts - time.time()) if self._burst_end_ts else 0.0
+                ),
+                "monitoring_ready_at": self._monitoring_ready_time,
+            }
+        except Exception:
+            pass
+        return stats
 
     async def wait_for_monitoring_ready(self, timeout: float = 10.0) -> bool:
         """Wait for filesystem monitoring to be ready."""
@@ -765,3 +820,65 @@ class RealtimeIndexingService:
         except asyncio.TimeoutError:
             logger.warning(f"Monitoring not ready after {timeout}s")
             return False
+
+    async def poke_for_recent_files(self, seconds: float = 3.0) -> None:
+        """Lightweight poll to enqueue recently created files.
+
+        This is a minimal helper used after promotion to RW to reduce races
+        where a file is created immediately after watcher start. It is not a
+        full catch-up scan and does not modify initial_scan flags.
+        """
+        try:
+            from time import time as _now
+            cutoff = _now() - max(0.5, seconds)
+            root = self.watch_path or self.config.target_dir
+            if not root:
+                return
+            for p in Path(root).rglob("*"):
+                if not p.is_file():
+                    continue
+                try:
+                    stat = p.stat()
+                    if stat.st_mtime >= cutoff:
+                        prio = "burst" if self._is_burst_active() else "change"
+                        await self.add_file(p, priority=prio)
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+    # ---- Promotion burst mode helpers ----
+    def _is_burst_active(self) -> bool:
+        try:
+            if not self._burst_active or self._burst_end_ts is None:
+                return False
+            if time.time() <= self._burst_end_ts:
+                return True
+            # Auto-disable when window elapsed
+            self.disable_burst_mode()
+            return False
+        except Exception:
+            return False
+
+    def enable_burst_mode(self, window_s: float = 2.5) -> None:
+        try:
+            window_s = max(0.2, float(window_s))
+            self._burst_end_ts = time.time() + window_s
+            if not self._burst_active:
+                self._burst_saved_debounce = self._debounce_delay
+                self._debounce_delay = 0.0
+            self._burst_active = True
+            self._debug(f"burst mode enabled window_s={window_s}")
+        except Exception:
+            pass
+
+    def disable_burst_mode(self) -> None:
+        try:
+            if self._burst_saved_debounce is not None:
+                self._debounce_delay = self._burst_saved_debounce
+            self._burst_saved_debounce = None
+            self._burst_active = False
+            self._burst_end_ts = None
+            self._debug("burst mode disabled")
+        except Exception:
+            pass

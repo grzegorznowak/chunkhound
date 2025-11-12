@@ -37,6 +37,14 @@ def add_mcp_subparser(subparsers: Any) -> argparse.ArgumentParser:
     # Add config-specific arguments - include LLM so MCP can override providers
     add_config_arguments(mcp_parser, ["database", "embedding", "indexing", "llm", "mcp"])
 
+    # Read-only / skip-indexing flag for top-level CLI
+    mcp_parser.add_argument(
+        "--skip-indexing",
+        "--read-only-index",
+        action="store_true",
+        help="Start MCP without realtime watcher or initial scan (read-only startup)",
+    )
+
     return cast(argparse.ArgumentParser, mcp_parser)
 
 

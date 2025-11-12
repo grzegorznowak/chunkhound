@@ -161,8 +161,33 @@ async def handle_tool_call(
         # Lazy import at runtime to construct MCP content objects without
         # forcing hard dependency during module import/collection.
         import mcp.types as types  # noqa: WPS433
-        # Wait for initialization (reduced timeout since server is immediately available)
-        await asyncio.wait_for(initialization_complete.wait(), timeout=5.0)
+        # Wait for initialization. Use a slightly larger timeout to accommodate
+        # cold starts on constrained runners.
+        try:
+            await asyncio.wait_for(initialization_complete.wait(), timeout=10.0)
+        except asyncio.TimeoutError:
+            # For get_stats specifically, return minimal stats instead of error to keep
+            # clients responsive during cold starts. Other tools will surface an error.
+            if tool_name == "get_stats":
+                import mcp.types as types  # noqa: WPS433
+                minimal = {
+                    "total_files": 0,
+                    "total_chunks": 0,
+                    "total_embeddings": 0,
+                    "database_size_mb": 0,
+                    "total_providers": 0,
+                }
+                if isinstance(scan_progress, dict):
+                    minimal["initial_scan"] = {
+                        "is_scanning": scan_progress.get("is_scanning", False),
+                        "files_processed": scan_progress.get("files_processed", 0),
+                        "chunks_created": scan_progress.get("chunks_created", 0),
+                        "started_at": scan_progress.get("scan_started_at"),
+                        "completed_at": scan_progress.get("scan_completed_at"),
+                        "error": scan_progress.get("scan_error"),
+                    }
+                return [types.TextContent(type="text", text=format_json_response(minimal))]
+            raise
 
         # Validate tool exists
         if tool_name not in TOOL_REGISTRY:
@@ -305,3 +330,11 @@ def add_common_mcp_arguments(parser: Any) -> None:
 
     # Debug flag
     parser.add_argument("--debug", action="store_true", help="Enable debug mode")
+
+    # Read-only / skip-indexing flag
+    parser.add_argument(
+        "--skip-indexing",
+        "--read-only-index",
+        action="store_true",
+        help="Start MCP without realtime watcher or initial scan (read-only startup)",
+    )

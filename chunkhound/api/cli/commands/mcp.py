@@ -279,8 +279,9 @@ def _show_mcp_setup_instructions(
     _safe_print("• Global configs (~/.claude/) require absolute path")
 
     if is_http:
+        _safe_print("\n• HTTP mode: Server accessible at")
         _safe_print(
-            f"\n• HTTP mode: Server accessible at http://localhost:{getattr(args, 'port', 3000)}"
+            f"  http://localhost:{getattr(args, 'port', 3000)}"
         )
         _safe_print("• HTTP mode can print setup instructions safely")
 

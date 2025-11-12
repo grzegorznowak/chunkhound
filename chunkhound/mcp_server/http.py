@@ -27,7 +27,7 @@ class HttpMCPServer(MCPServerBase):
     request/response model.
     """
 
-    def __init__(self, config: Config, port: int = 5173, host: str = "0.0.0.0"):
+    def __init__(self, config: Config, port: int = 5173, host: str = "0.0.0.0", args: Any = None):
         """Initialize HTTP MCP server.
 
         Args:
@@ -35,7 +35,7 @@ class HttpMCPServer(MCPServerBase):
             port: Port to listen on (default: 5173)
             host: Host to bind to (default: "0.0.0.0")
         """
-        super().__init__(config)
+        super().__init__(config, args=args)
         self.port = port
         self.host = host
 
@@ -164,7 +164,7 @@ async def main() -> None:
         sys.exit(1)
 
     # Create and run the HTTP server
-    server = HttpMCPServer(config, port=args.port, host=args.host)
+    server = HttpMCPServer(config, port=args.port, host=args.host, args=args)
     await server.run()
 
 
