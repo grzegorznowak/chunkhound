@@ -43,6 +43,13 @@ class SimpleEventHandler(FileSystemEventHandler):
         self.event_queue = event_queue
         self.config = config
         self.loop = loop
+        self._engine = None
+        self._include_patterns: list[str] | None = None
+        self._pattern_cache: dict[str, Any] = {}
+        try:
+            self._root = (config.target_dir if config and config.target_dir else Path.cwd()).resolve()
+        except Exception:
+            self._root = Path.cwd().resolve()
 
     def on_any_event(self, event: Any) -> None:
         """Handle filesystem events - simple queue operation."""
@@ -107,27 +114,42 @@ class SimpleEventHandler(FileSystemEventHandler):
 
             return False
 
-        # Use config-based pattern matching
-        from fnmatch import fnmatch
+        # Repo-aware ignore engine (lazy init)
+        try:
+            if self._engine is None:
+                from chunkhound.utils.ignore_engine import build_repo_aware_ignore_engine
+                sources = self.config.indexing.resolve_ignore_sources()
+                cfg_ex = self.config.indexing.get_effective_config_excludes()
+                chf = self.config.indexing.chignore_file
+                overlay = bool(getattr(self.config.indexing, "workspace_gitignore_nonrepo", False))
+                self._engine = build_repo_aware_ignore_engine(self._root, sources, chf, cfg_ex, workspace_root_only_gitignore=overlay)
+        except Exception:
+            self._engine = None
 
-        file_str = str(file_path)
-        file_name = file_path.name
-
-        # Check exclude patterns first (more specific)
-        for exclude_pattern in self.config.indexing.exclude:
-            if fnmatch(file_str, exclude_pattern) or fnmatch(
-                file_name, exclude_pattern
-            ):
+        # Exclude via engine
+        try:
+            if self._engine is not None and self._engine.matches(file_path, is_dir=False):
                 return False
+        except Exception:
+            pass
 
-        # Check include patterns
-        for include_pattern in self.config.indexing.include:
-            if fnmatch(file_str, include_pattern) or fnmatch(
-                file_name, include_pattern
-            ):
+        # Include via normalized patterns (fallback to Language defaults)
+        try:
+            if self._include_patterns is None:
+                from chunkhound.utils.file_patterns import normalize_include_patterns
+                inc = list(self.config.indexing.include)
+                self._include_patterns = normalize_include_patterns(inc)
+
+            from chunkhound.utils.file_patterns import should_include_file
+            return should_include_file(file_path, self._root, self._include_patterns, self._pattern_cache)
+        except Exception:
+            # Fallback to Language-based detection if include matching fails
+            from chunkhound.core.types.common import Language
+            if file_path.suffix.lower() in Language.get_all_extensions():
                 return True
-
-        return False
+            if file_path.name.lower() in Language.get_all_filename_patterns():
+                return True
+            return False
 
     def _handle_move_event(self, src_path: str, dest_path: str) -> None:
         """Handle atomic file moves (temp -> final file)."""
@@ -662,8 +684,18 @@ class RealtimeIndexingService:
                 # Process the file
                 logger.debug(f"Processing {file_path} (priority: {priority})")
 
-                # For initial scan, skip embeddings for speed
-                skip_embeddings = priority == "initial"
+                # Fast path for embedding pass: generate missing embeddings for all chunks
+                # without re-parsing the file. Keeps the loop snappy and avoids diffing.
+                if priority == "embed":
+                    try:
+                        await self.services.indexing_coordinator.generate_missing_embeddings()
+                    except Exception as e:
+                        logger.warning(f"Embedding generation failed in realtime (embed pass): {e}")
+                    continue
+
+                # Skip embeddings for initial and change events to keep loop responsive.
+                # An explicit 'embed' follow-up event will generate embeddings.
+                skip_embeddings = True
 
                 # Use existing indexing coordinator
                 result = await self.services.indexing_coordinator.process_file(

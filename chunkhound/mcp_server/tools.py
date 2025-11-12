@@ -258,6 +258,13 @@ async def get_stats_impl(
     Returns:
         Dict with database statistics and scan progress
     """
+    # Ensure DB connection for stats in lazy-connect scenarios
+    try:
+        if services and not services.provider.is_connected:
+            services.provider.connect()
+    except Exception:
+        # Best-effort: if connect fails, get_stats may still work for providers that lazy-init internally
+        pass
     stats: dict[str, Any] = services.provider.get_stats()
 
     # Map provider field names to MCP API field names
@@ -312,7 +319,6 @@ async def deep_research_impl(
     embedding_manager: EmbeddingManager,
     llm_manager: LLMManager,
     query: str,
-    depth: str | None = None,
     progress: Any = None,
 ) -> dict[str, Any]:
     """Core deep research implementation.
@@ -496,11 +502,6 @@ TOOL_DEFINITIONS = [
                     "description": "Research query to investigate",
                     "type": "string",
                 },
-                # Optional traversal depth hint for tests and future UI controls
-                "depth": {
-                    "description": "Traversal depth hint (e.g., 'shallow' or 'deep'). Optional.",
-                    "type": "string",
-                },
             },
             "required": ["query"],
             "type": "object",
@@ -583,23 +584,12 @@ async def execute_tool(
 
     elif tool_name == "code_research":
         # Code research - return raw markdown directly (not wrapped in JSON)
-        # Forward optional depth hint if provided
-        depth = arguments.get("depth")
-        if depth is not None:
-            result = await tool.implementation(
-                services=services,
-                embedding_manager=embedding_manager,
-                llm_manager=llm_manager,
-                query=arguments["query"],
-                depth=depth,
-            )
-        else:
-            result = await tool.implementation(
-                services=services,
-                embedding_manager=embedding_manager,
-                llm_manager=llm_manager,
-                query=arguments["query"],
-            )
+        result = await tool.implementation(
+            services=services,
+            embedding_manager=embedding_manager,
+            llm_manager=llm_manager,
+            query=arguments["query"],
+        )
         # Return raw markdown string
         return result.get("answer", f"Research incomplete: Unable to analyze '{arguments['query']}'. Try a more specific query or check that relevant code exists.")
 

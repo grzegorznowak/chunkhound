@@ -85,7 +85,8 @@ chunkhound/
 - Python 3.10+ (async/await patterns)
 - uv (package manager - ALWAYS use this)
 - DuckDB (primary) / LanceDB (alternative)
-- Tree-sitter (24 language parsers: Python, JavaScript, TypeScript, JSX, TSX, Java, Kotlin, Groovy, C, C++, C#, Go, Rust, Bash, MATLAB, Makefile, Objective-C, PHP, Vue, Zig, JSON, YAML, TOML, Markdown)
+- Tree-sitter (27 language parsers: Python, JavaScript, TypeScript, JSX, TSX, Java, Kotlin, Groovy, C, C++, C#, Go, Rust, Haskell, Swift, Bash, MATLAB, Makefile, Objective-C, PHP, Vue, Zig, JSON, YAML, TOML, HCL, Markdown)
+- Custom parsers (2 formats: TEXT, PDF)
 - OpenAI/Ollama embeddings
 - MCP protocol (stdio and HTTP)
 - Pydantic (configuration validation)
