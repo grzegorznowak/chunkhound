@@ -153,15 +153,12 @@ class MCPServerBase(ABC):
                 # Unexpected error - log but continue
                 self.debug_log(f"Unexpected error setting up LLM provider: {e}")
 
-            # Create services using unified factory
+            # Create services using unified factory (lazy connect for fast init)
             self.services = create_services(
                 db_path=db_path,
                 config=self.config,
                 embedding_manager=self.embedding_manager,
             )
-
-            # Connect to database
-            self.services.provider.connect()
 
             # Determine target path for scanning and watching
             if self.args and hasattr(self.args, "path"):
@@ -172,25 +169,37 @@ class MCPServerBase(ABC):
                 target_path = self.config.target_dir or db_path.parent.parent
                 self.debug_log(f"Using fallback path resolution: {target_path}")
 
-            # Start real-time indexing service
-            self.debug_log("Starting real-time indexing service")
-            self.realtime_indexing = RealtimeIndexingService(
-                self.services, self.config, debug_sink=self.debug_log
-            )
-
-            # Start monitoring and wait for it to be ready
-            monitoring_task = asyncio.create_task(
-                self.realtime_indexing.start(target_path)
-            )
-
             # Mark as initialized immediately (tools available)
             self._initialized = True
             self.debug_log("Service initialization complete")
 
+            # Defer DB connect + realtime start to background so initialize is fast
+            asyncio.create_task(self._deferred_connect_and_start(target_path))
+
+    async def _deferred_connect_and_start(self, target_path: Path) -> None:
+        """Connect DB and start realtime monitoring in background."""
+        try:
+            # Ensure services exist
+            if not self.services:
+                return
+            # Connect to database lazily
+            if not self.services.provider.is_connected:
+                self.services.provider.connect()
+
+            # Start real-time indexing service
+            self.debug_log("Starting real-time indexing service (deferred)")
+            self.realtime_indexing = RealtimeIndexingService(
+                self.services, self.config, debug_sink=self.debug_log
+            )
+            monitoring_task = asyncio.create_task(
+                self.realtime_indexing.start(target_path)
+            )
             # Schedule background scan AFTER monitoring is confirmed ready
             asyncio.create_task(
                 self._coordinated_initial_scan(target_path, monitoring_task)
             )
+        except Exception as e:
+            self.debug_log(f"Deferred connect/start failed: {e}")
 
     async def _coordinated_initial_scan(
         self, target_path: Path, monitoring_task: asyncio.Task

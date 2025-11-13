@@ -62,7 +62,7 @@ async def test_code_research_uses_codex_cli_for_synthesis(monkeypatch, tmp_path:
     # 4) Monkeypatch tool implementation to force synthesis call regardless of DB/search
     from chunkhound.mcp_server import tools as tools_mod
 
-    async def _stub_deep_research_impl(*, services, embedding_manager, llm_manager, query, depth, progress=None):
+    async def _stub_deep_research_impl(*, services, embedding_manager, llm_manager, query, progress=None):
         prov = llm_manager.get_synthesis_provider()
         resp = await prov.complete(prompt=f"probe: {query}")
         return {"answer": resp.content}
@@ -76,7 +76,7 @@ async def test_code_research_uses_codex_cli_for_synthesis(monkeypatch, tmp_path:
         tool_name="code_research",
         services=services,
         embedding_manager=em,
-        arguments={"query": "dummy question", "depth": "shallow"},
+        arguments={"query": "dummy question"},
         scan_progress=None,
         llm_manager=llm,
     )

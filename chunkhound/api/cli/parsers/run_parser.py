@@ -140,6 +140,75 @@ def add_run_subparser(subparsers: Any) -> argparse.ArgumentParser:
     # Add config-specific arguments
     add_config_arguments(run_parser, ["database", "embedding", "indexing", "mcp"])
 
+    # Simulate mode as a flag to preserve backward-compatible positional path usage
+    run_parser.add_argument(
+        "--simulate",
+        action="store_true",
+        help="Dry-run discovery; prints sorted relative file list",
+    )
+    run_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="With --simulate or --check-ignores: output JSON",
+    )
+    run_parser.add_argument(
+        "--all-discovered",
+        action="store_true",
+        help="With --simulate: show discovered files before change-detection pruning",
+    )
+    run_parser.add_argument(
+        "--show-sizes",
+        action="store_true",
+        help="With --simulate: include file sizes in text output",
+    )
+    run_parser.add_argument(
+        "--sort",
+        choices=["path", "size", "size_desc"],
+        default="path",
+        help="With --simulate: sort output by path or size (desc for largest first)",
+    )
+
+    # Debug ignores: print ignore context for troubleshooting without breaking JSON output
+    run_parser.add_argument(
+        "--debug-ignores",
+        action="store_true",
+        help=(
+            "With --simulate: print CH root, active ignore sources, and first 10 "
+            "default excludes to stderr for troubleshooting"
+        ),
+    )
+
+    # Ignore decision diffing against external sentinels (initially: Git)
+    run_parser.add_argument(
+        "--check-ignores",
+        action="store_true",
+        help="Compare ChunkHound ignore decisions vs a sentinel (use --vs git)",
+    )
+    run_parser.add_argument(
+        "--vs",
+        choices=["git"],
+        default="git",
+        help="Sentinel to compare against for --check-ignores (default: git)",
+    )
+
+    # Startup profiling (timings for discovery, cleanup, change-scan)
+    run_parser.add_argument(
+        "--profile-startup",
+        action="store_true",
+        help=(
+            "Emit startup phase timings (discovery/cleanup/change-scan) as JSON to stderr; "
+            "minimal overhead when enabled"
+        ),
+    )
+
+    # Discovery backend (A/B experiments): default remains python
+    run_parser.add_argument(
+        "--discovery-backend",
+        choices=["auto", "python", "git", "git_only"],
+        default=None,
+        help="Override discovery backend for this run: auto|python|git|git_only",
+    )
+
     return cast(argparse.ArgumentParser, run_parser)
 
 

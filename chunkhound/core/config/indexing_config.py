@@ -8,7 +8,7 @@ import argparse
 import os
 from typing import Any
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 def _get_default_include_patterns() -> list[str]:
@@ -96,14 +96,23 @@ class IndexingConfig(BaseModel):
         description="Glob patterns for files to include (all supported languages)",
     )
 
-    exclude: list[str] = Field(
-        default_factory=lambda: [
+    # NOTE: For backwards-compatibility, users may set indexing.exclude to
+    # the sentinel string ".gitignore" in .chunkhound.json.
+    # We store the sentinel separately and keep `exclude` as a list to preserve
+    # existing type semantics across the codebase.
+    @staticmethod
+    def _default_excludes() -> list[str]:
+        return [
             # Virtual environments and package managers
             "**/node_modules/**",
             "**/.git/**",
             "**/__pycache__/**",
             "**/venv/**",
             "**/.venv/**",
+            # ChunkHound config and working directory
+            "**/.chunkhound/**",
+            "**/.chunkhound.json",
+            ".chunkhound.json",
             "**/.mypy_cache/**",
             # Build artifacts and distributions
             "**/dist/**",
@@ -181,8 +190,59 @@ class IndexingConfig(BaseModel):
             "**/assets.json",
             "**/*.map.json",
             "**/*.min.json",
-        ],
+        ]
+
+    exclude: list[str] = Field(
+        default_factory=_default_excludes,
         description="Glob patterns for files to exclude",
+    )
+
+    # Private: sentinel value when user provides exclude as a string
+    exclude_sentinel: str | None = Field(default=None, repr=False)
+    # Private: whether user explicitly supplied an exclude list in input
+    exclude_user_supplied: bool = Field(default=False, repr=False)
+    # Optional: control how exclude list combines with gitignore
+    # - None (default): if user supplies a list, combine with gitignore (overlay)
+    # - "combined": same as default behavior
+    # - "config_only": use only config excludes (legacy behavior)
+    # - "gitignore_only": use only gitignore (rare; sentinel also forces this)
+    exclude_mode: str | None = Field(default=None, description="Exclude source mode: combined|config_only|gitignore_only")
+
+    # Root-level file name for ChunkHound-specific ignores (gitwildmatch syntax)
+    chignore_file: str = Field(default=".chignore")
+
+    # Backend for .gitignore evaluation when repo-aware engine is used
+    # - "python": use pathspec-based evaluator (default)
+    # - "libgit2": use libgit2/pygit2 for native ignore decisions (optional)
+    gitignore_backend: str = Field(
+        default="python", description="Backend for gitignore evaluation: python|libgit2"
+    )
+
+    # Discovery backend controls how files are enumerated before parsing.
+    # - "python" (default): use ChunkHound's optimized os.walk-based traversal
+    #   with repo-aware ignore engine.
+    # - "git": for directories inside Git repositories, enumerate files using
+    #   `git ls-files` (tracked + untracked non-ignored) and then apply ChunkHound
+    #   include patterns and config excludes. Non-repo directories still fall back
+    #   to the Python traversal.
+    discovery_backend: str = Field(
+        default="auto",
+        description="Discovery backend for file enumeration: auto|python|git|git_only",
+    )
+
+    # When true, also load the CH root's .gitignore as a global overlay in addition
+    # to per-repo .gitignore files. This does not affect Git itself; it is a CH-only
+    # convenience to apply workspace-wide rules across external repos.
+    workspace_gitignore_overlay: bool = Field(
+        default=False,
+        description="Apply CH root .gitignore as global overlay across repos",
+    )
+
+    # Apply the CH root's .gitignore to NON-REPO paths only. Repo subtrees
+    # continue to follow their native Git rules. Off by default.
+    workspace_gitignore_nonrepo: bool = Field(
+        default=True,
+        description="Use CH root .gitignore only for non-repo paths",
     )
 
     @field_validator("include", "exclude")
@@ -288,6 +348,14 @@ class IndexingConfig(BaseModel):
                 "Set to 0 to disable. Default: 20"
             ),
         )
+        parser.add_argument(
+            "--nonrepo-gitignore",
+            action="store_true",
+            help=(
+                "Apply the CH root's .gitignore to NON-REPO paths only; repo subtrees "
+                "continue to follow their native Git rules"
+            ),
+        )
 
     @classmethod
     def load_from_env(cls) -> dict[str, Any]:
@@ -342,7 +410,92 @@ class IndexingConfig(BaseModel):
             except ValueError:
                 pass
 
+        # Gitignore backend selection
+        if backend := os.getenv("CHUNKHOUND_INDEXING__GITIGNORE_BACKEND"):
+            config["gitignore_backend"] = backend
+
+        # Discovery backend selection
+        if dback := os.getenv("CHUNKHOUND_INDEXING__DISCOVERY_BACKEND"):
+            config["discovery_backend"] = dback
+
+        # Exclude mode (combined | config_only | gitignore_only)
+        if em := os.getenv("CHUNKHOUND_INDEXING__EXCLUDE_MODE"):
+            val = em.strip().lower()
+            if val in ("combined", "config_only", "gitignore_only"):
+                config["exclude_mode"] = val
+
+        # Non‑repo workspace .gitignore toggle
+        if wr := os.getenv("CHUNKHOUND_INDEXING__WORKSPACE_GITIGNORE_NONREPO"):
+            config["workspace_gitignore_nonrepo"] = wr.strip().lower() not in ("0", "false", "no")
+
         return config
+
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce_exclude_sentinel(cls, data: Any) -> Any:
+        """Allow exclude to be a sentinel string ('.gitignore').
+
+        We convert it into `exclude_sentinel` and normalize `exclude` to a list
+        to keep runtime type expectations stable.
+        """
+        try:
+            if isinstance(data, dict) and "exclude" in (data.get("indexing") or data):
+                # Support both nested under indexing and direct construction
+                if "indexing" in data:
+                    idx = data["indexing"] or {}
+                    exc = idx.get("exclude")
+                    if isinstance(exc, str) and exc in {".gitignore"}:
+                        idx["exclude_sentinel"] = exc
+                        idx["exclude"] = []
+                        data["indexing"] = idx
+                    elif isinstance(exc, str) and exc == ".chignore":
+                        # No longer supported: drop the key so defaults apply
+                        idx.pop("exclude", None)
+                        data["indexing"] = idx
+                else:
+                    exc = data.get("exclude")
+                    if isinstance(exc, str) and exc in {".gitignore"}:
+                        data["exclude_sentinel"] = exc
+                        data["exclude"] = []
+                    elif isinstance(exc, str) and exc == ".chignore":
+                        # No longer supported: drop the key so defaults apply
+                        data.pop("exclude", None)
+        except Exception:
+            # Be permissive; validation will catch true errors later
+            pass
+        return data
+
+    # Convenience helper for callers to interpret ignore source selection
+    def resolve_ignore_sources(self) -> list[str]:
+        # 1) Sentinel or explicit mode -> gitignore only
+        if self.exclude_sentinel == ".gitignore" or (self.exclude_mode and self.exclude_mode.lower() == "gitignore_only"):
+            return ["gitignore"]
+        # 2) User provided exclude list (detect either explicit flag or any deviation from defaults)
+        if getattr(self, "exclude_user_supplied", False):
+            mode = (self.exclude_mode or "combined").lower()
+            if mode == "config_only":
+                return ["config"]
+            # default and "combined": overlay gitignore + config
+            return ["gitignore", "config"]
+        # 3) Not provided at all -> default to gitignore only
+        return ["gitignore"]
+
+    def get_effective_config_excludes(self) -> list[str]:
+        """Return the config-driven exclude globs to apply.
+
+        If a sentinel is set (e.g., ".gitignore"), we still apply the default
+        exclude set to preserve expected behavior (e.g., node_modules).
+        """
+        # Always include safe defaults; overlay user list unless gitignore-only sentinel
+        defaults = list(self._default_excludes())
+        if self.exclude_sentinel in {".gitignore"}:
+            return defaults
+        # Merge user-provided excludes on top of defaults (preserve order, dedupe)
+        out = list(defaults)
+        for pat in list(self.exclude or []):
+            if pat not in out:
+                out.append(pat)
+        return out
 
     @classmethod
     def extract_cli_overrides(cls, args: Any) -> dict[str, Any]:
@@ -397,6 +550,14 @@ class IndexingConfig(BaseModel):
                 overrides["max_concurrent"] = int(args.max_concurrent)
             except (TypeError, ValueError):
                 pass
+
+        # Non‑repo workspace .gitignore toggle
+        if hasattr(args, "nonrepo_gitignore") and args.nonrepo_gitignore is not None:
+            overrides["workspace_gitignore_nonrepo"] = bool(args.nonrepo_gitignore)
+
+        # Discovery backend override via CLI (if present)
+        if hasattr(args, "discovery_backend") and args.discovery_backend is not None:
+            overrides["discovery_backend"] = str(args.discovery_backend)
 
         return overrides
 
