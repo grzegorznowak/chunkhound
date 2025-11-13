@@ -275,5 +275,6 @@ logs/
 
 # for those who like to keep agents' configs close to their projects
 .codex-persistent
-# muting for now
+
+tickets/
 .devcontainer

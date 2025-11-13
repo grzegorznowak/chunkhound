@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 
 from chunkhound.core.types.common import Language
 from chunkhound.parsers.mappings.javascript import JavaScriptMapping
+from chunkhound.parsers.universal_engine import UniversalConcept
 
 if TYPE_CHECKING:
     from tree_sitter import Node as TSNode
@@ -70,7 +71,7 @@ class JSXMapping(JavaScriptMapping):
         ) @component.definition
 
         (variable_declarator
-            name: (identifier) @component.name  
+            name: (identifier) @component.name
             value: (arrow_function
                 body: (statement_block
                     (return_statement
@@ -111,7 +112,7 @@ class JSXMapping(JavaScriptMapping):
         """
         return """
         (jsx_element
-            open_tag: (jsx_opening_element 
+            open_tag: (jsx_opening_element
                 name: (_) @jsx.element_name
             )
         ) @jsx.element
@@ -172,6 +173,112 @@ class JSXMapping(JavaScriptMapping):
         """
 
         return base_query + jsx_comment_query
+
+    # Universal Concept integration: override to TSX-friendly patterns
+    def get_query_for_concept(self, concept: "UniversalConcept") -> str | None:  # type: ignore[override]
+        if concept == UniversalConcept.DEFINITION:
+            return """
+            ; Functions and classes (TSX class name uses type_identifier)
+            (function_declaration
+                name: (identifier) @name
+            ) @definition
+
+            (class_declaration
+                name: (type_identifier) @name
+            ) @definition
+
+            ; Exports
+            (export_statement) @definition
+
+            ; Top-level const/let
+            (program
+                (lexical_declaration
+                    (variable_declarator
+                        name: (identifier) @name
+                        value: [(object) (array)] @init
+                    ) @definition
+                )
+            )
+
+            ; Top-level var
+            (program
+                (variable_declaration
+                    (variable_declarator
+                        name: (identifier) @name
+                        value: [(object) (array)] @init
+                    ) @definition
+                )
+            )
+
+            ; Top-level const/let function/arrow
+            (program
+                (lexical_declaration
+                    (variable_declarator
+                        name: (identifier) @name
+                        value: (function_expression)
+                    ) @definition
+                )
+            )
+
+            (program
+                (lexical_declaration
+                    (variable_declarator
+                        name: (identifier) @name
+                        value: (arrow_function)
+                    ) @definition
+                )
+            )
+
+            ; CommonJS assignments (module.exports = ...)
+            (program
+                (expression_statement
+                (assignment_expression
+                    left: (member_expression
+                        object: (identifier) @lhs_module
+                        property: (property_identifier) @lhs_exports
+                    )
+                    right: [(object) (array)] @init
+                ) @definition
+                (#eq? @lhs_module "module")
+                (#eq? @lhs_exports "exports")
+                )
+            )
+
+            ; CommonJS nested assignments (module.exports.foo = ...)
+            (program
+                (expression_statement
+                (assignment_expression
+                    left: (member_expression
+                        object: (member_expression
+                            object: (identifier) @lhs_module_n
+                            property: (property_identifier) @lhs_exports_n
+                        )
+                    )
+                    right: [(object) (array)] @init
+                ) @definition
+                (#eq? @lhs_module_n "module")
+                (#eq? @lhs_exports_n "exports")
+                )
+            )
+
+            ; CommonJS assignments (exports.foo = ...)
+            (program
+                (expression_statement
+                (assignment_expression
+                    left: (member_expression
+                        object: (identifier) @lhs_exports
+                    )
+                    right: [(object) (array)] @init
+                ) @definition
+                (#eq? @lhs_exports "exports")
+                )
+            )
+            """
+        elif concept == UniversalConcept.COMMENT:
+            return """
+            (comment) @definition
+            """
+        return None
 
     def extract_component_name(self, node: "TSNode | None", source: str) -> str:
         """Extract React component name from a function definition.
