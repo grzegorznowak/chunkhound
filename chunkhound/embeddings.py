@@ -161,6 +161,7 @@ def create_openai_provider(
     rerank_model: str | None = None,
     rerank_url: str = "/rerank",
     rerank_format: str = "auto",
+    rerank_batch_size: int | None = None,
 ) -> "OpenAIEmbeddingProvider":
     """Create an OpenAI embedding provider with default settings.
 
@@ -171,6 +172,7 @@ def create_openai_provider(
         rerank_model: Model name to use for reranking (enables multi-hop search)
         rerank_url: Rerank endpoint URL (defaults to /rerank)
         rerank_format: Reranking API format - 'cohere', 'tei', or 'auto' (default: 'auto')
+        rerank_batch_size: Max documents per rerank batch (overrides model defaults, bounded by model caps)
 
     Returns:
         Configured OpenAI embedding provider
@@ -185,4 +187,5 @@ def create_openai_provider(
         rerank_model=rerank_model,
         rerank_url=rerank_url,
         rerank_format=rerank_format,
+        rerank_batch_size=rerank_batch_size,
     )

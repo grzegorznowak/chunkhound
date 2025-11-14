@@ -306,6 +306,38 @@ def test_comprehensive_file(php_parser, comprehensive_php):
     assert "namespace" in all_code or "class" in all_code, "No PHP structures found in parsed code"
 
 
+def test_top_level_return_config_literals(php_parser):
+    """Ensure top-level return statements (common in config files) are indexed.
+
+    This covers arrays like:
+    <?php
+    return [ 'url' => env('SERVICE_URL', null) ];
+    """
+    code = """<?php
+
+return [
+    'url' => env('SERVICE_URL', null),
+    'api_key' => env('SERVICE_API_KEY', null),
+    'client' => env('SERVICE_CLIENT', null),
+    'meterid' => env('SERVICE_METERID', null),
+    'ssl_verify' => false,
+    'timeout' => 0,
+    'connection_timeout' => 0,
+    'read_timeout' => ini_get('default_socket_timeout') ?? 10,
+    'fake_data_ingestion' => env('SERVICE_FAKE_DATA_INGESTION', false),
+];
+"""
+
+    chunks = php_parser.parse_content(code, Path("config.php"), file_id=1)
+
+    assert len(chunks) > 0, "No chunks returned for top-level return config"
+    # Should include the literal token inside at least one chunk's code
+    assert any("SERVICE_URL" in c.code for c in chunks), "Literal from config not captured"
+    # Prefer tagging as ARRAY when possible
+    from chunkhound.core.types.common import ChunkType
+    assert any(c.chunk_type == ChunkType.ARRAY for c in chunks), "Config array not tagged as ARRAY"
+
+
 @pytest.mark.parametrize("test_name,php_code,expected_checks", [
     (
         "Function with typed parameters and return type",

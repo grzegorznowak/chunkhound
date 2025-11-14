@@ -19,6 +19,7 @@ from chunkhound.core.exceptions import (
 )
 from chunkhound.core.models import Chunk, Embedding, EmbeddingResult, File
 from chunkhound.core.types import ChunkType, Language, ModelName, ProviderName
+from chunkhound.version import __version__
 
 __all__ = [
     # Domain Models
@@ -38,5 +39,3 @@ __all__ = [
     "EmbeddingError",
     "ParsingError",
 ]
-
-__version__ = "1.1.0"

@@ -303,3 +303,167 @@ class TestQwenBatchSplitting:
 
         results = await provider.rerank("test query", [], top_k=10)
         assert results == []
+
+
+class TestRerankBatchSizeOverride:
+    """Test rerank_batch_size bounded override behavior."""
+
+    def test_user_override_below_model_cap(self):
+        """Test user override is used when below model cap."""
+        provider = OpenAIEmbeddingProvider(
+            api_key="test-key",
+            base_url="http://localhost:11434/v1",
+            model="text-embedding-3-small",
+            rerank_model="qwen3-reranker-8b",
+            rerank_batch_size=32,  # Lower than model cap of 64
+        )
+
+        max_batch = provider.get_max_rerank_batch_size()
+        assert max_batch == 32  # User override respected
+
+    def test_user_override_above_model_cap_clamped(self):
+        """Test user override is clamped to model cap when above."""
+        provider = OpenAIEmbeddingProvider(
+            api_key="test-key",
+            base_url="http://localhost:11434/v1",
+            model="text-embedding-3-small",
+            rerank_model="qwen3-reranker-8b",
+            rerank_batch_size=200,  # Higher than model cap of 64
+        )
+
+        max_batch = provider.get_max_rerank_batch_size()
+        assert max_batch == 64  # Clamped to model cap
+
+    def test_user_override_with_non_qwen_model(self):
+        """Test user override works with non-Qwen models."""
+        provider = OpenAIEmbeddingProvider(
+            api_key="test-key",
+            model="text-embedding-3-small",
+            rerank_batch_size=32,
+        )
+
+        max_batch = provider.get_max_rerank_batch_size()
+        assert max_batch == 32  # User override below default 128
+
+    def test_user_override_above_default_clamped(self):
+        """Test user override clamped to default for non-Qwen."""
+        provider = OpenAIEmbeddingProvider(
+            api_key="test-key",
+            model="text-embedding-3-small",
+            batch_size=200,
+            rerank_batch_size=200,
+        )
+
+        max_batch = provider.get_max_rerank_batch_size()
+        assert max_batch == 128  # Clamped to default limit
+
+    def test_none_uses_model_default(self):
+        """Test that None rerank_batch_size uses model defaults."""
+        provider = OpenAIEmbeddingProvider(
+            api_key="test-key",
+            base_url="http://localhost:11434/v1",
+            model="text-embedding-3-small",
+            rerank_model="qwen3-reranker-4b",
+            rerank_batch_size=None,  # Explicit None
+        )
+
+        max_batch = provider.get_max_rerank_batch_size()
+        assert max_batch == 96  # Qwen 4B reranker default
+
+    def test_fallback_to_embedding_model_with_override(self):
+        """Test override works with embedding model fallback."""
+        provider = OpenAIEmbeddingProvider(
+            api_key="test-key",
+            model="dengcao/Qwen3-Embedding-8B:Q5_K_M",
+            batch_size=100,
+            rerank_batch_size=50,  # Below embedding model cap of 64
+        )
+
+        max_batch = provider.get_max_rerank_batch_size()
+        assert max_batch == 50  # User override respected
+
+
+@pytest.mark.asyncio
+class TestRerankErrorHandling:
+    """Test rerank error JSON response handling."""
+
+    async def test_error_json_response_http_200(self):
+        """Test that error JSON with HTTP 200 is caught and raised as ValueError."""
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        provider = OpenAIEmbeddingProvider(
+            api_key="test-key",
+            base_url="http://localhost:8080",
+            model="text-embedding-3-small",
+            rerank_model="test-reranker",
+        )
+
+        # Initialize the OpenAI client BEFORE patching to avoid breaking isinstance checks
+        await provider._ensure_client()
+
+        # Mock httpx.AsyncClient's post method to return HTTP 200 with error JSON
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {
+            "error": "batch size 64 > maximum allowed batch size 32",
+            "error_type": "Validation",
+        }
+        mock_response.raise_for_status = MagicMock()  # Don't raise on 200
+
+        # Create a mock client that returns the mock response
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(return_value=mock_response)
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=None)
+
+        # Patch httpx.AsyncClient in the provider module (after client is initialized)
+        with patch("chunkhound.providers.embeddings.openai_provider.httpx.AsyncClient", return_value=mock_client):
+            with pytest.raises(ValueError) as exc_info:
+                await provider.rerank("test query", ["doc1", "doc2"])
+
+            # Verify error message contains server error details
+            assert "Validation" in str(exc_info.value)
+            assert "batch size 64 > maximum allowed batch size 32" in str(exc_info.value)
+
+    async def test_error_json_response_http_413(self):
+        """Test that HTTP 413 errors are properly raised."""
+        from unittest.mock import AsyncMock, MagicMock, patch
+        import httpx
+
+        provider = OpenAIEmbeddingProvider(
+            api_key="test-key",
+            base_url="http://localhost:8080",
+            model="text-embedding-3-small",
+            rerank_model="test-reranker",
+        )
+
+        # Initialize the OpenAI client BEFORE patching to avoid breaking isinstance checks
+        await provider._ensure_client()
+
+        # Mock the response to return HTTP 413
+        mock_response = MagicMock()
+        mock_response.status_code = 413
+        mock_response.text = '{"error":"batch size 64 > maximum allowed batch size 32"}'
+
+        def raise_status_error():
+            raise httpx.HTTPStatusError(
+                "Client error '413 Payload Too Large'",
+                request=MagicMock(),
+                response=mock_response,
+            )
+
+        mock_response.raise_for_status = raise_status_error
+
+        # Create a mock client that returns the mock response
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(return_value=mock_response)
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=None)
+
+        # Patch httpx.AsyncClient in the provider module (after client is initialized)
+        with patch("chunkhound.providers.embeddings.openai_provider.httpx.AsyncClient", return_value=mock_client):
+            with pytest.raises(httpx.HTTPStatusError) as exc_info:
+                await provider.rerank("test query", ["doc1", "doc2"])
+
+            # Verify it's a 413 error
+            assert exc_info.value.response.status_code == 413

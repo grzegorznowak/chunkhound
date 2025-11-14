@@ -128,7 +128,7 @@ class StdioMCPServer(MCPServerBase):
                     try:
                         from chunkhound.mcp_server import tools as tools_mod  # noqa: WPS433
 
-                        async def _stub_deep_research_impl(*, services, embedding_manager, llm_manager, query, depth=None, progress=None):
+                        async def _stub_deep_research_impl(*, services, embedding_manager, llm_manager, query, progress=None):
                             if llm_manager is None:
                                 try:
                                     from chunkhound.llm_manager import LLMManager  # noqa: WPS433

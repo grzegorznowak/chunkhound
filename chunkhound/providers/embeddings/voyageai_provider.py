@@ -119,6 +119,7 @@ class VoyageAIEmbeddingProvider:
         retry_attempts: int = 3,
         retry_delay: float = 1.0,
         max_tokens: int | None = None,
+        rerank_batch_size: int | None = None,
     ):
         """Initialize VoyageAI embedding provider.
 
@@ -131,6 +132,7 @@ class VoyageAIEmbeddingProvider:
             retry_attempts: Number of retry attempts for failed requests
             retry_delay: Delay between retry attempts
             max_tokens: Maximum tokens per request (if applicable)
+            rerank_batch_size: Max documents per rerank batch (overrides default of 1000)
         """
         if not VOYAGEAI_AVAILABLE:
             raise ImportError(
@@ -159,6 +161,7 @@ class VoyageAIEmbeddingProvider:
         self._max_tokens = max_tokens or model_config["context_length"]
         self._api_key = api_key
         self._model_config = model_config
+        self._rerank_batch_size = rerank_batch_size
 
         # Initialize client
         self._client = voyageai.Client(api_key=api_key)
@@ -429,12 +432,22 @@ class VoyageAIEmbeddingProvider:
         VoyageAI's SDK handles batching internally, so we return a large limit.
         The actual batch splitting is managed by the VoyageAI client library.
 
+        Implements bounded override pattern: user can set batch size, but it's
+        clamped to a conservative default of 1000 for safety.
+
         Returns:
-            Conservative limit to prevent OOM on client side: 1000 documents
+            Maximum documents per rerank batch (user override or 1000 default)
         """
+        # Conservative default: 1000 documents (prevent OOM on large result sets)
+        default_limit = 1000
+
+        # User override (bounded by default limit for safety)
+        if self._rerank_batch_size is not None:
+            return min(self._rerank_batch_size, default_limit)
+
         # VoyageAI SDK handles batching, but we set a conservative client-side limit
         # to prevent memory issues when processing very large result sets
-        return 1000
+        return default_limit
 
     # Reranking Operations
     def supports_reranking(self) -> bool:

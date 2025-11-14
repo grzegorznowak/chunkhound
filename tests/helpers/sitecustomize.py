@@ -51,7 +51,7 @@ def _force_code_research_synthesis() -> None:
     except Exception:
         return
 
-    async def _stub_deep_research_impl(*, services, embedding_manager, llm_manager, query, depth, progress=None):
+    async def _stub_deep_research_impl(*, services, embedding_manager, llm_manager, query, progress=None):
         # Ensure we have an LLM manager even if server didn't configure one
         if llm_manager is None:
             try:

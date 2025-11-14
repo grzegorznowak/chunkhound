@@ -6,7 +6,7 @@ using the user's existing Claude subscription instead of API credits.
 Note: This provider is configured for vanilla LLM behavior:
 - All tools disabled (Write, Edit, Bash, WebFetch, etc.)
 - MCP servers disabled via --strict-mcp-config
-- Workspace isolation (runs from /tmp to prevent context gathering)
+- Workspace isolation (runs from temp directory to prevent context gathering)
 - Clean API access without workspace overhead
 """
 
@@ -14,6 +14,7 @@ import asyncio
 import json
 import os
 import subprocess
+import tempfile
 from typing import Any
 
 from loguru import logger
@@ -141,11 +142,11 @@ class ClaudeCodeCLIProvider(LLMProvider):
                 # Create subprocess with neutral CWD to prevent workspace scanning
                 process = await asyncio.create_subprocess_exec(
                     *cmd,
-                    stdin=subprocess.DEVNULL,  # Prevent stdin inheritance (fixes MCP server freeze)
+                    stdin=subprocess.DEVNULL,  # Prevent stdin inheritance
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     env=env,
-                    cwd="/tmp",  # Run from neutral directory to avoid Claude CLI workspace context gathering
+                    cwd=tempfile.gettempdir(),  # Cross-platform temp directory
                 )
 
                 # Wrap communicate() with timeout (this is the long-running part)

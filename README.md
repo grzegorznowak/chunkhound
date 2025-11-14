@@ -27,9 +27,9 @@ Transform your codebase into a searchable knowledge base for AI assistants using
 - **Semantic search** - Natural language queries like "find authentication code"
 - **Regex search** - Pattern matching without API keys
 - **Local-first** - Your code stays on your machine
-- **24 languages** with structured parsing
-  - **Programming** (via [Tree-sitter](https://tree-sitter.github.io/tree-sitter/)): Python, JavaScript, TypeScript, JSX, TSX, Java, Kotlin, Groovy, C, C++, C#, Go, Rust, Bash, MATLAB, Makefile, PHP, Vue
-  - **Configuration** (via Tree-sitter): JSON, YAML, TOML, Markdown
+- **29 languages** with structured parsing
+  - **Programming** (via [Tree-sitter](https://tree-sitter.github.io/tree-sitter/)): Python, JavaScript, TypeScript, JSX, TSX, Java, Kotlin, Groovy, C, C++, C#, Go, Rust, Haskell, Swift, Bash, MATLAB, Makefile, Objective-C, PHP, Vue, Zig
+  - **Configuration** (via Tree-sitter): JSON, YAML, TOML, HCL, Markdown
   - **Text-based** (custom parsers): Text files, PDF
 - **[MCP integration](https://spec.modelcontextprotocol.io/)** - Works with Claude, VS Code, Cursor, Windsurf, Zed, etc
 
@@ -113,7 +113,7 @@ uv run python scripts/bench_yaml.py \
 - No per-token charges for large codebases
 
 **Universal Language Support**:
-- Structured parsing for 24 languages (Tree-sitter + custom parsers)
+- Structured parsing for 29 languages (Tree-sitter + custom parsers)
 - Same semantic concepts across all programming languages
 
 **Intelligent Code Discovery**:

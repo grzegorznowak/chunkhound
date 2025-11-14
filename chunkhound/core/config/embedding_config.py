@@ -131,6 +131,10 @@ class EmbeddingConfig(BaseSettings):
 
     # Internal settings - not exposed to users
     batch_size: int = Field(default=100, description="Internal batch size")
+    rerank_batch_size: int | None = Field(
+        default=None,
+        description="Max documents per rerank batch (overrides model defaults, bounded by model caps)",
+    )
     timeout: int = Field(default=30, description="Internal timeout")
     max_retries: int = Field(default=3, description="Internal max retries")
     max_concurrent_batches: int | None = Field(
@@ -141,6 +145,13 @@ class EmbeddingConfig(BaseSettings):
         default=1000,
         description="Internal optimization frequency (runs every N batches during indexing)",
     )
+
+    @field_validator("rerank_batch_size")
+    def validate_rerank_batch_size(cls, v: int | None) -> int | None:  # noqa: N805
+        """Validate rerank batch size is positive."""
+        if v is not None and v <= 0:
+            raise ValueError("rerank_batch_size must be positive")
+        return v
 
     @field_validator("model")
     def validate_model(cls, v: str | None) -> str | None:  # noqa: N805
@@ -212,6 +223,8 @@ class EmbeddingConfig(BaseSettings):
             base_config["rerank_model"] = self.rerank_model
         base_config["rerank_url"] = self.rerank_url
         base_config["rerank_format"] = self.rerank_format
+        if self.rerank_batch_size is not None:
+            base_config["rerank_batch_size"] = self.rerank_batch_size
 
         return base_config
 

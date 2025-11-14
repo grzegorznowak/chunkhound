@@ -163,7 +163,7 @@ You are a senior architect with 20 years of experience across all software domai
 - MINIMALISM ABOVE ALL - less code is better code
 
 # Search Protocol
-- Use the Code Expert to learn the surrounding code style, architecture and module responsibilities
+- Use the `code_research` to learn the surrounding code style, architecture and module responsibilities
 - Use `search_semantic` and `search_regex` with small, focused queries
 - Multiple targeted searches > one broad search
 

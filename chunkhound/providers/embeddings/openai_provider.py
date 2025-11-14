@@ -202,6 +202,7 @@ class OpenAIEmbeddingProvider:
         retry_attempts: int = 3,
         retry_delay: float = 1.0,
         max_tokens: int | None = None,
+        rerank_batch_size: int | None = None,
     ):
         """Initialize OpenAI embedding provider.
 
@@ -217,6 +218,7 @@ class OpenAIEmbeddingProvider:
             retry_attempts: Number of retry attempts for failed requests
             retry_delay: Delay between retry attempts
             max_tokens: Maximum tokens per request (if applicable)
+            rerank_batch_size: Max documents per rerank batch (overrides model defaults, bounded by model caps)
         """
         if not OPENAI_AVAILABLE:
             raise ImportError(
@@ -230,13 +232,16 @@ class OpenAIEmbeddingProvider:
         self._rerank_model = rerank_model
         self._rerank_url = rerank_url
         self._rerank_format = rerank_format
-        self._detected_rerank_format: str | None = None  # Cache for auto-detected format
+        self._detected_rerank_format: str | None = (
+            None  # Cache for auto-detected format
+        )
         self._format_detection_lock = asyncio.Lock()  # Protect format detection cache
         self._batch_size = batch_size
         self._timeout = timeout
         self._retry_attempts = retry_attempts
         self._retry_delay = retry_delay
         self._max_tokens = max_tokens
+        self._rerank_batch_size = rerank_batch_size
 
         # Validate rerank configuration at initialization (fail-fast)
         # Match config validation logic: check if reranking is enabled
@@ -960,21 +965,37 @@ class OpenAIEmbeddingProvider:
         """Get maximum documents per batch for reranking operations.
 
         Returns model-specific batch limit for reranking to prevent OOM errors.
-        For Qwen3 rerankers: 64-128 based on model size (research-based).
-        For other models: uses embedding batch size as fallback.
+        Implements bounded override pattern: user can set batch size, but it's
+        clamped to model caps for safety.
+
+        Priority order:
+        0. User override (rerank_batch_size) - bounded by model cap below
+        1. Rerank model-specific config (Qwen rerankers: 64-128)
+        2. Embedding model config (if rerank model matches embedding model)
+        3. Conservative default (min of batch_size, 128)
 
         Returns:
             Maximum number of documents to rerank in a single batch
         """
-        # Use rerank-specific config if available (Qwen models)
+        # Determine model cap (Priority 1-3: existing logic)
+        model_cap = None
         if self._qwen_rerank_config and "max_rerank_batch" in self._qwen_rerank_config:
-            return self._qwen_rerank_config["max_rerank_batch"]
-        # Fall back to embedding config if rerank model is same as embedding model
-        if self._qwen_model_config and "max_rerank_batch" in self._qwen_model_config:
-            return self._qwen_model_config["max_rerank_batch"]
-        # Conservative default: limit to batch_size to prevent unbounded requests
-        # Research shows 32-128 is optimal for GPU reranking
-        return min(self._batch_size, 128)
+            # Priority 1: Rerank model-specific config (Qwen models)
+            model_cap = self._qwen_rerank_config["max_rerank_batch"]
+        elif self._qwen_model_config and "max_rerank_batch" in self._qwen_model_config:
+            # Priority 2: Embedding model config (fallback)
+            model_cap = self._qwen_model_config["max_rerank_batch"]
+        else:
+            # Priority 3: Conservative default
+            # Research shows 32-128 is optimal for GPU reranking
+            model_cap = min(self._batch_size, 128)
+
+        # Priority 0: User override (bounded by model cap)
+        if self._rerank_batch_size is not None:
+            return min(self._rerank_batch_size, model_cap)
+
+        # Return model cap as default
+        return model_cap
 
     def get_recommended_concurrency(self) -> int:
         """Get recommended number of concurrent batches for OpenAI.
@@ -1017,15 +1038,17 @@ class OpenAIEmbeddingProvider:
         """
         if format_to_use == "tei":
             # TEI format: no model in request, uses "texts" field
-            logger.debug(
-                f"Using TEI format for reranking {len(documents)} documents"
-            )
+            logger.debug(f"Using TEI format for reranking {len(documents)} documents")
             return {"query": query, "texts": documents}
 
         elif format_to_use == "cohere":
             # Cohere format: requires model, uses "documents" field
             # Validation already done in __init__, so we know model is present
-            payload = {"model": self._rerank_model, "query": query, "documents": documents}
+            payload = {
+                "model": self._rerank_model,
+                "query": query,
+                "documents": documents,
+            }
             if top_k is not None:
                 payload["top_n"] = top_k
             logger.debug(
@@ -1036,7 +1059,11 @@ class OpenAIEmbeddingProvider:
         else:  # auto mode
             # Try Cohere first if model is set, otherwise TEI
             if self._rerank_model:
-                payload = {"model": self._rerank_model, "query": query, "documents": documents}
+                payload = {
+                    "model": self._rerank_model,
+                    "query": query,
+                    "documents": documents,
+                }
                 if top_k is not None:
                     payload["top_n"] = top_k
                 logger.debug(
@@ -1107,7 +1134,9 @@ class OpenAIEmbeddingProvider:
             if top_k is not None and len(results) > top_k:
                 # Results from _rerank_single_batch are already sorted descending by score
                 results = results[:top_k]
-                logger.debug(f"Applied client-side top_k filter: {len(results)} results")
+                logger.debug(
+                    f"Applied client-side top_k filter: {len(results)} results"
+                )
 
             return results
 
@@ -1143,16 +1172,18 @@ class OpenAIEmbeddingProvider:
                 except Exception as e:
                     # Classify error as retryable or not
                     error_str = str(e).lower()
-                    is_retryable = any([
-                        "timeout" in error_str,
-                        "connection" in error_str,
-                        "503" in error_str,  # Service unavailable
-                        "429" in error_str,  # Rate limit
-                    ])
+                    is_retryable = any(
+                        [
+                            "timeout" in error_str,
+                            "connection" in error_str,
+                            "503" in error_str,  # Service unavailable
+                            "429" in error_str,  # Rate limit
+                        ]
+                    )
 
                     if is_retryable and attempt < self._retry_attempts - 1:
                         # Exponential backoff
-                        delay = self._retry_delay * (2 ** attempt)
+                        delay = self._retry_delay * (2**attempt)
                         logger.warning(
                             f"Batch {batch_idx + 1} failed (attempt {attempt + 1}), "
                             f"retrying in {delay}s: {e}"
@@ -1184,8 +1215,7 @@ class OpenAIEmbeddingProvider:
 
                     # Create new RerankResult with adjusted index
                     adjusted_result = RerankResult(
-                        index=result.index + start_idx,
-                        score=result.score
+                        index=result.index + start_idx, score=result.score
                     )
                     all_results.append(adjusted_result)
 
@@ -1236,7 +1266,10 @@ class OpenAIEmbeddingProvider:
         await self._ensure_client()
 
         # Validate base_url exists for relative URLs (redundant check for safety)
-        if not self._rerank_url.startswith(("http://", "https://")) and not self._base_url:
+        if (
+            not self._rerank_url.startswith(("http://", "https://"))
+            and not self._base_url
+        ):
             raise ValueError(RERANK_BASE_URL_REQUIRED)
 
         # Build full rerank endpoint URL
@@ -1282,6 +1315,20 @@ class OpenAIEmbeddingProvider:
                 )
                 response.raise_for_status()
                 response_data = response.json()
+
+            # Normalize response format: TEI servers may return bare array or wrapped dict
+            # Real TEI servers: [{"index": 0, "score": 0.95}, ...]
+            # Cohere/proxies: {"results": [{"index": 0, "relevance_score": 0.95}, ...]}
+            if isinstance(response_data, list):
+                response_data = {"results": response_data}
+
+            # Check for error response (TEI returns HTTP 200 with error JSON)
+            # This happens when the server validates the request after accepting it
+            # Note: Only dict responses can have error field (arrays cannot)
+            if isinstance(response_data, dict) and "error" in response_data:
+                error_msg = response_data.get("error", "Unknown error")
+                error_type = response_data.get("error_type", "Unknown")
+                raise ValueError(f"Rerank service error ({error_type}): {error_msg}")
 
             # Parse response with format auto-detection
             rerank_results = await self._parse_rerank_response(
@@ -1330,15 +1377,18 @@ class OpenAIEmbeddingProvider:
             raise
 
     async def _parse_rerank_response(
-        self, response_data: dict, format_hint: str, num_documents: int
+        self, response_data: dict | list, format_hint: str, num_documents: int
     ) -> list[RerankResult]:
         """Parse rerank response with format auto-detection.
 
         Thread-safe format detection using async lock to prevent race conditions.
         Validates that returned indices are within bounds of the original document list.
 
+        Supports both wrapped dict format (Cohere/proxies) and bare array format (real TEI servers).
+        Bare arrays are normalized to wrapped format before processing.
+
         Args:
-            response_data: JSON response from rerank API
+            response_data: JSON response from rerank API (dict or list)
             format_hint: Format hint ('cohere', 'tei', or 'auto')
             num_documents: Number of documents that were sent for reranking
 
@@ -1356,8 +1406,12 @@ class OpenAIEmbeddingProvider:
             return []
 
         # Validate response has results
+        # Note: Bare array responses are normalized to {"results": [...]} before this point
         if "results" not in response_data:
-            raise ValueError("Invalid rerank response: missing 'results' field")
+            raise ValueError(
+                "Invalid rerank response: missing 'results' field. "
+                "Expected dict with 'results' key or bare array (auto-normalized)."
+            )
 
         results = response_data["results"]
         if not isinstance(results, list):
@@ -1370,7 +1424,9 @@ class OpenAIEmbeddingProvider:
         # Try to detect format from first result
         first_result = results[0]
         if not isinstance(first_result, dict):
-            raise ValueError("Invalid rerank response: results must contain dict objects")
+            raise ValueError(
+                "Invalid rerank response: results must contain dict objects"
+            )
 
         # Detect format based on field names
         has_relevance_score = "relevance_score" in first_result
@@ -1422,9 +1478,7 @@ class OpenAIEmbeddingProvider:
 
                 # Validate index is within bounds
                 if index < 0:
-                    logger.warning(
-                        f"Skipping result {i}: negative index {index}"
-                    )
+                    logger.warning(f"Skipping result {i}: negative index {index}")
                     continue
 
                 if index >= num_documents:
