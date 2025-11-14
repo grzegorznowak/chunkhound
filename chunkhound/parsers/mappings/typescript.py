@@ -12,6 +12,15 @@ from loguru import logger
 
 from chunkhound.core.types.common import ChunkType, Language
 from chunkhound.parsers.mappings.base import BaseMapping
+from chunkhound.parsers.mappings._shared.js_family_extraction import (
+    JSFamilyExtraction,
+)
+from chunkhound.parsers.mappings._shared.js_query_patterns import (
+    TOP_LEVEL_LEXICAL_CONFIG,
+    COMMONJS_MODULE_EXPORTS,
+    COMMONJS_NESTED_EXPORTS,
+    COMMONJS_EXPORTS_SHORTHAND,
+)
 from chunkhound.parsers.universal_engine import UniversalConcept
 
 if TYPE_CHECKING:
@@ -26,7 +35,7 @@ except ImportError:
     # TSNode is already defined in TYPE_CHECKING block
 
 
-class TypeScriptMapping(BaseMapping):
+class TypeScriptMapping(BaseMapping, JSFamilyExtraction):
     """TypeScript language mapping for tree-sitter parsing.
 
     This mapping handles TypeScript-specific AST patterns including:
@@ -104,164 +113,52 @@ class TypeScriptMapping(BaseMapping):
           modules that export object literals are chunked.
         """
         if concept == UniversalConcept.DEFINITION:
-            return """
-            ; Standard definitions
-            (function_declaration
-                name: (identifier) @name
-            ) @definition
-
-            (class_declaration
-                name: (type_identifier) @name
-            ) @definition
-
-            ; Top-level export (default or named)
-            (export_statement) @definition
-
-            ; Top-level const/let with object/array initializer
-            (program
-                (lexical_declaration
-                    (variable_declarator
-                        name: (identifier) @name
-                        value: [(object) (array)] @init
-                    ) @definition
-                )
-            )
-
-            ; Top-level const/let function expression
-            (program
-                (lexical_declaration
-                    (variable_declarator
-                        name: (identifier) @name
-                        value: (function_expression)
-                    ) @definition
-                )
-            )
-
-            ; Top-level const/let arrow function
-            (program
-                (lexical_declaration
-                    (variable_declarator
-                        name: (identifier) @name
-                        value: (arrow_function)
-                    ) @definition
-                )
-            )
-
-            ; Assignment (CommonJS): module.exports = ... or exports.* = ...
-            (program
-                (expression_statement
-                (assignment_expression
-                    left: (member_expression
-                        object: (identifier) @lhs_module
-                        property: (property_identifier) @lhs_exports
-                    )
-                    right: [(object) (array)] @init
+            return ("\n".join([
+                """
+                ; Standard definitions
+                (function_declaration
+                    name: (identifier) @name
                 ) @definition
-                (#eq? @lhs_module "module")
-                (#eq? @lhs_exports "exports")
-                )
-            )
 
-            (program
-                (expression_statement
-                (assignment_expression
-                    left: (member_expression
-                        object: (member_expression
-                            object: (identifier) @lhs_module_n
-                            property: (property_identifier) @lhs_exports_n
-                        )
-                    )
-                    right: [(object) (array)] @init
+                (class_declaration
+                    name: (type_identifier) @name
                 ) @definition
-                (#eq? @lhs_module_n "module")
-                (#eq? @lhs_exports_n "exports")
-                )
-            )
 
-            (program
-                (expression_statement
-                (assignment_expression
-                    left: (member_expression
-                        object: (identifier) @lhs_exports
+                ; Top-level export (default or named)
+                (export_statement) @definition
+                """,
+                TOP_LEVEL_LEXICAL_CONFIG,
+                # Top-level function/arrow declarators
+                """
+                (program
+                    (lexical_declaration
+                        (variable_declarator
+                            name: (identifier) @name
+                            value: (function_expression)
+                        ) @definition
                     )
-                    right: [(object) (array)] @init
-                ) @definition
-                (#eq? @lhs_exports "exports")
                 )
-            )
-            """
+                (program
+                    (lexical_declaration
+                        (variable_declarator
+                            name: (identifier) @name
+                            value: (arrow_function)
+                        ) @definition
+                    )
+                )
+                """,
+                COMMONJS_MODULE_EXPORTS,
+                COMMONJS_NESTED_EXPORTS,
+                COMMONJS_EXPORTS_SHORTHAND,
+            ]))
         elif concept == UniversalConcept.COMMENT:
             return """
             (comment) @definition
             """
         return None
 
-    def extract_name(
-        self,
-        concept: "UniversalConcept",
-        captures: dict[str, "TSNode"],
-        content: bytes,
-    ) -> str:  # type: ignore[override]
-        source = content.decode("utf-8", errors="replace")
-        if concept == UniversalConcept.DEFINITION:
-            if "name" in captures:
-                name_text = self.get_node_text(captures["name"], source).strip()
-                return name_text or "definition"
-            if "definition" in captures:
-                node = captures["definition"]
-                text = self.get_node_text(node, source)
-                if text.strip().startswith("export default"):
-                    return "export_default"
-                if "module.exports" in text:
-                    return "module_exports"
-                line = node.start_point[0] + 1
-                return f"definition_line_{line}"
-        if concept == UniversalConcept.COMMENT and "definition" in captures:
-            node = captures["definition"]
-            return f"comment_line_{node.start_point[0] + 1}"
-        return f"unnamed_{concept.value}"
-
-    def extract_metadata(
-        self,
-        concept: "UniversalConcept",
-        captures: dict[str, "TSNode"],
-        content: bytes,
-    ) -> dict[str, Any]:  # type: ignore[override]
-        meta: dict[str, Any] = {"concept": concept.value}
-        if concept == UniversalConcept.DEFINITION and "definition" in captures:
-            node = captures["definition"]
-            init = captures.get("init")
-            target = init or node
-            try:
-                node_type = getattr(target, "type", "")
-                if node_type == "object":
-                    meta["chunk_type_hint"] = "object"
-                elif node_type == "array":
-                    meta["chunk_type_hint"] = "array"
-                else:
-                    for i in range(getattr(target, "child_count", 0)):
-                        child = target.child(i)
-                        if not child:
-                            continue
-                        if child.type == "object":
-                            meta["chunk_type_hint"] = "object"
-                            break
-                        if child.type == "array":
-                            meta["chunk_type_hint"] = "array"
-                            break
-            except Exception:
-                pass
-        return meta
-
-    def extract_content(
-        self,
-        concept: "UniversalConcept",
-        captures: dict[str, "TSNode"],
-        content: bytes,
-    ) -> str:  # type: ignore[override]
-        source = content.decode("utf-8", errors="replace")
-        node = captures.get("definition") or next(iter(captures.values()), None)
-        return self.get_node_text(node, source) if node is not None else ""
+    # extract_name / extract_metadata / extract_content are inherited
+    # from JSFamilyExtraction (de-duplicated across JS/TS/JSX)
 
     def get_interface_query(self) -> str:
         """Get tree-sitter query pattern for TypeScript interface definitions.
