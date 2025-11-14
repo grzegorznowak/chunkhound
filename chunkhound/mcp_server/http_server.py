@@ -115,8 +115,8 @@ class HttpMCPServer(MCPServerBase):
             offset: int = 0,
             max_response_tokens: int = 20000,
             path: str | None = None,
-            provider: str = "openai",
-            model: str = "text-embedding-3-small",
+            provider: str | None = None,
+            model: str | None = None,
             threshold: float | None = None,
         ) -> dict[str, Any]:
             await self.initialize()
@@ -127,11 +127,13 @@ class HttpMCPServer(MCPServerBase):
                 "page_size": page_size,
                 "offset": offset,
                 "max_response_tokens": max_response_tokens,
-                "provider": provider,
-                "model": model,
             }
             if path is not None:
                 args["path"] = path
+            if provider is not None:
+                args["provider"] = provider
+            if model is not None:
+                args["model"] = model
             if threshold is not None:
                 args["threshold"] = threshold
 

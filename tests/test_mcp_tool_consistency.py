@@ -153,8 +153,12 @@ def test_default_values_in_schema():
     assert semantic_props["page_size"].get("default") == 10
     assert semantic_props["offset"].get("default") == 0
     assert semantic_props["max_response_tokens"].get("default") == 20000
-    assert semantic_props["provider"].get("default") == "openai"
-    assert semantic_props["model"].get("default") == "text-embedding-3-small"
+    # provider and model should NOT have defaults - they should be None
+    # to allow auto-detection from configured embedding provider
+    assert "default" not in semantic_props["provider"], \
+        "provider should not have default value (allows auto-detection)"
+    assert "default" not in semantic_props["model"], \
+        "model should not have default value (allows auto-detection)"
 
 
 def test_no_duplicate_tool_dataclass():

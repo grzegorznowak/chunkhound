@@ -405,8 +405,8 @@ async def search_semantic_impl(
     offset: int = 0,
     max_response_tokens: int = 20000,
     path: str | None = None,
-    provider: str = "openai",
-    model: str = "text-embedding-3-small",
+    provider: str | None = None,
+    model: str | None = None,
     threshold: float | None = None,
 ) -> SearchResponse:
     """Core semantic search implementation.
@@ -419,8 +419,8 @@ async def search_semantic_impl(
         offset: Starting offset for pagination
         max_response_tokens: Maximum response size in tokens (1000-25000)
         path: Optional path to limit search scope
-        provider: Embedding provider name
-        model: Embedding model name
+        provider: Embedding provider name (optional, uses configured provider if not specified)
+        model: Embedding model name (optional, uses configured model if not specified)
         threshold: Distance threshold for filtering (optional)
 
     Returns:
