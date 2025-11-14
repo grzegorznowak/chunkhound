@@ -92,7 +92,7 @@ async def search_command(args: argparse.Namespace, config: Config) -> None:
                 pattern=args.query,
                 page_size=args.page_size,
                 offset=args.offset,
-                path_filter=args.path_filter,
+                path=args.path_filter,
             )
             result_dict = cast(dict[str, Any], result)
         else:
@@ -142,7 +142,7 @@ async def search_command(args: argparse.Namespace, config: Config) -> None:
                     query=args.query,
                     page_size=args.page_size,
                     offset=args.offset,
-                    path_filter=args.path_filter,
+                    path=args.path_filter,
                 )
                 result_dict = cast(dict[str, Any], result)
 
