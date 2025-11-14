@@ -172,6 +172,11 @@ class PHPMapping(BaseMapping):
             (trait_declaration
                 name: (name) @name
             ) @definition
+
+            ;; Fallback for config-style files: top-level return statement
+            (program
+                (return_statement) @definition
+            )
             """
 
         elif concept == UniversalConcept.BLOCK:
@@ -244,6 +249,10 @@ class PHPMapping(BaseMapping):
             # Fallback based on node type
             if "definition" in captures:
                 def_node = captures["definition"]
+                # Name top-level return statements by line for discoverability
+                if def_node.type == "return_statement":
+                    line = def_node.start_point[0] + 1
+                    return f"return_line_{line}"
                 if def_node.type == "method_declaration":
                     return self.get_fallback_name(def_node, "method")
                 elif def_node.type == "class_declaration":
@@ -387,6 +396,15 @@ class PHPMapping(BaseMapping):
                         metadata["kind"] = "interface"
                     elif def_node.type == "trait_declaration":
                         metadata["kind"] = "trait"
+
+                # Config returns (e.g., return [ 'key' => env('FOO') ])
+                elif def_node.type == "return_statement":
+                    metadata["kind"] = "return"
+                    # Hint chunk type so downstream mapping doesn't default to FUNCTION
+                    if self._contains_array_expression(def_node, source):
+                        metadata["chunk_type_hint"] = "array"
+                    else:
+                        metadata["chunk_type_hint"] = "block"
 
         elif concept == UniversalConcept.COMMENT:
             if "definition" in captures:
@@ -581,4 +599,31 @@ class PHPMapping(BaseMapping):
             if child and child.type == "final_modifier":
                 return True
 
+        return False
+
+    def _contains_array_expression(self, node: "TSNode", source: str) -> bool:
+        """Return True if the node subtree contains an array creation expression.
+
+        Handles both short array syntax `[ ... ]` and classic `array(...)` forms.
+        """
+        if not TREE_SITTER_AVAILABLE or node is None:
+            return False
+
+        try:
+            for n in self.walk_tree(node):
+                if n and n.type in (
+                    "array_creation_expression",
+                    "array_element_initializer",
+                ):
+                    return True
+            # Defensive text check in case of grammar differences
+            text = self.get_node_text(node, source)
+            if text is None:
+                return False
+            if "[" in text and "]" in text:
+                return True
+            if "array(" in text:
+                return True
+        except Exception:
+            return False
         return False
