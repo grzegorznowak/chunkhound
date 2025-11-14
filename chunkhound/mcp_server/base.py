@@ -209,6 +209,10 @@ class MCPServerBase(ABC):
                 self._scan_progress["is_scanning"] = False
                 self._scan_progress.setdefault("scan_error", None)
                 self.debug_log("MCP read-only: startup indexing skipped by configuration")
+
+                # In skip-indexing mode, do not hold DB connections open. Tools will
+                # manage short-lived connections as needed (RO backoff will apply).
+
             else:
                 # Defer DB connect + realtime start to background so initialize is fast
                 asyncio.create_task(self._deferred_connect_and_start(target_path))
@@ -324,6 +328,13 @@ class MCPServerBase(ABC):
                 while not self._role_monitor_stop.is_set():
                     await asyncio.sleep(0.2)
                     try:
+                        # Nudge provider to refresh/acquire role without opening DB connections
+                        try:
+                            tr = getattr(self.services.provider, "try_acquire_role_only", None)
+                            if callable(tr):
+                                tr()
+                        except Exception:
+                            pass
                         role = (
                             getattr(self.services.provider, "get_role", lambda: None)()
                             if self.services
@@ -432,11 +443,15 @@ class MCPServerBase(ABC):
             # after promotion even before full readiness is reported.
             async def _staggered_pokes() -> None:
                 try:
-                    for delay in (0.0, 0.25, 0.5, 1.0, 2.0, 3.0, 4.0, 5.0):
+                    # Add dense early pokes plus a slightly longer tail to
+                    # cover files created just-after promotion without a catch-up.
+                    for delay in (0.0, 0.25, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 5.0):
                         await asyncio.sleep(delay)
                         if self.realtime_indexing is not None:
                             try:
-                                await self.realtime_indexing.poke_for_recent_files(seconds=8.0)
+                                # Widen cutoff window to improve chances of grabbing
+                                # very recent files in races around promotion.
+                                await self.realtime_indexing.poke_for_recent_files(seconds=10.0)
                             except Exception:
                                 pass
                 except Exception:
@@ -456,14 +471,24 @@ class MCPServerBase(ABC):
             try:
                 # Allow a slightly longer window for watcher readiness after promotion
                 await asyncio.wait_for(
-                    self.realtime_indexing.wait_for_monitoring_ready(timeout=5.0),
-                    timeout=5.0,
+                    self.realtime_indexing.wait_for_monitoring_ready(timeout=6.0),
+                    timeout=6.0,
                 )
                 # After ready, poke for recent files to minimize race conditions
                 await asyncio.wait_for(
-                    self.realtime_indexing.poke_for_recent_files(seconds=6.0),
-                    timeout=3.0,
+                    self.realtime_indexing.poke_for_recent_files(seconds=10.0),
+                    timeout=4.0,
                 )
+                # Schedule one extra post-ready poke shortly after to catch files
+                # created right after readiness flips.
+                async def _post_ready_extra():
+                    try:
+                        await asyncio.sleep(1.5)
+                        if self.realtime_indexing is not None:
+                            await self.realtime_indexing.poke_for_recent_files(seconds=10.0)
+                    except Exception:
+                        pass
+                asyncio.create_task(_post_ready_extra())
             except Exception:
                 # Best-effort: continue even if not ready; polling fallback may catch up
                 pass

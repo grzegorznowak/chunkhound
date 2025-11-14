@@ -13,7 +13,6 @@ Architecture:
 
 import asyncio
 import time
-from collections.abc import Iterator
 from pathlib import Path
 from typing import Any, Callable
 
@@ -214,8 +213,7 @@ class RealtimeIndexingService:
         self._debounce_delay = 0.5  # 500ms delay from research
         self._debounce_tasks: set[asyncio.Task] = set()  # Track active debounce tasks
 
-        # Background scan state
-        self.scan_iterator: Iterator | None = None
+        # Background scan state (initial full scan handled elsewhere)
         self.scan_complete = False
 
         # Filesystem monitoring
@@ -374,16 +372,7 @@ class RealtimeIndexingService:
                 # Never fail the service because of the pump
                 pass
 
-    async def _setup_watchdog_async(
-        self, watch_path: Path, loop: asyncio.AbstractEventLoop
-    ) -> None:
-        """Setup watchdog in background thread without blocking initialization."""
-        try:
-            await loop.run_in_executor(None, self._start_fs_monitor, watch_path, loop)
-            logger.debug("Watchdog setup completed successfully")
-        except Exception as e:
-            logger.error(f"Failed to setup watchdog monitoring: {e}")
-            # Server continues to work even if watchdog setup fails
+    # Removed unused _setup_watchdog_async helper (replaced by timeout variant)
 
     async def _setup_watchdog_with_timeout(
         self, watch_path: Path, loop: asyncio.AbstractEventLoop
@@ -469,11 +458,7 @@ class RealtimeIndexingService:
         else:
             raise RuntimeError("Observer failed to start within timeout")
 
-    async def _add_subdirectories_progressively(self, root_path: Path) -> None:
-        """No longer needed - using recursive monitoring."""
-        logger.debug(
-            "Progressive directory addition skipped (using recursive monitoring)"
-        )
+    # Removed progressive directory addition (recursive monitoring is used)
 
     async def _polling_monitor(self, watch_path: Path) -> None:
         """Simple polling monitor for large directories."""
@@ -824,9 +809,9 @@ class RealtimeIndexingService:
     async def poke_for_recent_files(self, seconds: float = 3.0) -> None:
         """Lightweight poll to enqueue recently created files.
 
-        This is a minimal helper used after promotion to RW to reduce races
-        where a file is created immediately after watcher start. It is not a
-        full catch-up scan and does not modify initial_scan flags.
+        Filters using the same include/ignore logic as realtime events to avoid
+        flooding the queue with non-source files (e.g., .db, .wal). This is a
+        small, bounded sweep around promotion — not a catch‑up scan.
         """
         try:
             from time import time as _now
@@ -834,10 +819,18 @@ class RealtimeIndexingService:
             root = self.watch_path or self.config.target_dir
             if not root:
                 return
+            # Use a lightweight handler for shouldIndex filtering
+            try:
+                simple_handler = SimpleEventHandler(None, self.config, None)
+            except Exception:
+                simple_handler = None
             for p in Path(root).rglob("*"):
-                if not p.is_file():
-                    continue
                 try:
+                    if not p.is_file():
+                        continue
+                    # Apply include/ignore filtering when available
+                    if simple_handler is not None and not simple_handler._should_index(p):
+                        continue
                     stat = p.stat()
                     if stat.st_mtime >= cutoff:
                         prio = "burst" if self._is_burst_active() else "change"

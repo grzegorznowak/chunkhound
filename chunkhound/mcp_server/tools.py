@@ -44,6 +44,23 @@ def _env_true(name: str) -> bool:
     return str(val).strip().lower() in ("1", "true", "yes", "on")
 
 
+def _debug(msg: str) -> None:
+    """Write debug messages to file when CHUNKHOUND_DEBUG is enabled.
+
+    Avoids stdout to preserve MCP protocol. Best-effort only.
+    """
+    try:
+        if not _env_true("CHUNKHOUND_DEBUG") and os.getenv("CHUNKHOUND_DEBUG") not in ("1", "true", "yes", "on"):
+            return
+        path = os.getenv("CHUNKHOUND_DEBUG_FILE", "/tmp/chunkhound_mcp_debug.log")
+        with open(path, "a", encoding="utf-8") as f:
+            from datetime import datetime as _dt
+
+            f.write(f"[{_dt.now().isoformat()}] [TOOLS] {msg}\n")
+    except Exception:
+        return
+
+
 def _ro_try_enabled() -> bool:
     """Unified flag for enabling opportunistic RO connections.
 
@@ -130,6 +147,122 @@ def _ro_on_success() -> None:
     _RO_BACKOFF_MS = 0
     _RO_NEXT_ELIGIBLE_MS = 0
     _RO_LAST_SUCCESS_MS = _now_ms()
+
+
+# ---- Centralized opportunistic connection helpers ----
+
+def _opportunistic_connect_for_regex(
+    services: DatabaseServices,
+    *,
+    pattern: str,
+    page_size: int,
+    offset: int,
+    path_filter: str | None,
+) -> dict[str, Any] | None:
+    """Try to establish a RO connection opportunistically; otherwise fall back.
+
+    Returns a SearchResponse when an immediate fallback should be used, or
+    None when the caller should proceed with a normal DB-backed search.
+    """
+    if not services:
+        return None
+    provider = services.provider
+    # If already connected, proceed
+    try:
+        if provider.is_connected and bool(getattr(provider, "db_connected", False)):
+            return None
+    except Exception:
+        pass
+
+    # Determine role
+    role = None
+    try:
+        if hasattr(provider, "get_role"):
+            role = provider.get_role()
+    except Exception:
+        role = None
+
+    # RO path in MCP: attempt within budget; otherwise use non-DB fallback
+    if role == "RO" and os.getenv("CHUNKHOUND_MCP_MODE") == "1" and _ro_try_enabled():
+        if not _ro_should_attempt():
+            _debug("regex backoff active -> fast fallback [central]")
+            return cast(dict[str, Any], {"results": [], "pagination": {"offset": offset, "page_size": 0, "has_more": False, "next_offset": None}})
+        try:
+            budget_ms = int(os.getenv("CHUNKHOUND_MCP__RO_BUDGET_MS", "800") or 800)
+        except Exception:
+            budget_ms = 800
+        start_ms = _now_ms()
+        try:
+            _debug("regex attempting provider.connect() [RO central]")
+            provider.connect()
+            _debug("regex connect success [RO central]")
+        except Exception as e:
+            if _is_duckdb_lock_conflict(e):
+                elapsed = _now_ms() - start_ms
+                if elapsed < budget_ms and (_RO_BACKOFF_MS == 0):
+                    import time as _time
+                    to_sleep = min(100, max(50, budget_ms - elapsed)) / 1000.0
+                    _time.sleep(to_sleep)
+                    try:
+                        _debug("regex retry provider.connect() [RO central]")
+                        provider.connect()
+                        _debug("regex retry success [RO central]")
+                    except Exception as e2:
+                        if _is_duckdb_lock_conflict(e2):
+                            _debug("regex conflict after retry -> non-DB fallback + backoff [central]")
+                            _ro_on_conflict()
+                            return _fallback_regex_non_db(services, pattern, page_size, offset, path_filter)
+                        raise
+                else:
+                    _debug("regex conflict -> non-DB fallback immediate + backoff [central]")
+                    _ro_on_conflict()
+                    return _fallback_regex_non_db(services, pattern, page_size, offset, path_filter)
+            else:
+                raise
+        return None
+
+    # Non-RO path: fast-path, skip explicit connect; executor will create connection lazily
+    _debug("regex skipping explicit connect() [non-RO fast-path central]")
+    return None
+
+
+def _opportunistic_connect_for_semantic(services: DatabaseServices) -> None:
+    """Opportunistic connection handling for semantic search.
+
+    Raises a controlled error on RO conflicts, otherwise returns and lets the
+    caller proceed. For non-RO, uses the same fast-path (no explicit connect).
+    """
+    if not services:
+        return
+    provider = services.provider
+    try:
+        if provider.is_connected and bool(getattr(provider, "db_connected", False)):
+            return
+    except Exception:
+        pass
+
+    role = None
+    try:
+        if hasattr(provider, "get_role"):
+            role = provider.get_role()
+    except Exception:
+        role = None
+
+    if role == "RO" and os.getenv("CHUNKHOUND_MCP_MODE") == "1" and _ro_try_enabled():
+        if not _ro_should_attempt():
+            raise Exception("Semantic search unavailable: backoff active")
+        try:
+            _debug("semantic attempting provider.connect() [RO central]")
+            provider.connect()
+            _debug("semantic connect success [RO central]")
+        except Exception as e:
+            if _is_duckdb_lock_conflict(e):
+                _ro_on_conflict()
+                raise Exception("Semantic search unavailable: writer active")
+            raise
+        return
+    # Non-RO fast-path: skip explicit connect, let executor lazily create
+    _debug("semantic skipping explicit connect() [non-RO fast-path central]")
 
 
 def _is_duckdb_lock_conflict(err: Exception) -> bool:
@@ -258,6 +391,7 @@ async def search_regex_impl(
     Returns:
         Dict with 'results' and 'pagination' keys
     """
+    _debug(f"search_regex_impl start pattern={pattern!r} page_size={page_size} offset={offset}")
     # Validate and constrain parameters
     page_size = max(1, min(page_size, 100))
     offset = max(0, offset)
@@ -267,71 +401,45 @@ async def search_regex_impl(
         _ro_on_conflict()
         return cast(SearchResponse, {"results": [], "pagination": {"offset": offset, "page_size": 0, "has_more": False, "next_offset": None}})
 
-    # Check database connection with opportunistic RO path in MCP mode
-    if services and not services.provider.is_connected:
-        role = None
-        try:
-            if hasattr(services.provider, "get_role"):
-                role = services.provider.get_role()
-        except Exception:
-            role = None
-        ro_try = _ro_try_enabled()
-        if role == "RO" and os.getenv("CHUNKHOUND_MCP_MODE") == "1" and ro_try:
-            # Opportunistic: only attempt if backoff allows
-            if not _ro_should_attempt():
-                return cast(SearchResponse, {"results": [], "pagination": {"offset": offset, "page_size": 0, "has_more": False, "next_offset": None}})
-            # Per-request budget
-            try:
-                budget_ms = int(os.getenv("CHUNKHOUND_MCP__RO_BUDGET_MS", "800") or 800)
-            except Exception:
-                budget_ms = 800
-            start_ms = _now_ms()
-            # First attempt
-            try:
-                services.provider.connect()
-            except Exception as e:
-                if _is_duckdb_lock_conflict(e):
-                    # Optional one-shot retry if under budget
-                    elapsed = _now_ms() - start_ms
-                    if elapsed < budget_ms and (_RO_BACKOFF_MS == 0):
-                        # small jittered sleep (50-100ms) bounded by remaining budget
-                        to_sleep = min(100, max(50, budget_ms - elapsed)) / 1000.0
-                        import time as _time
-                        _time.sleep(to_sleep)
-                        try:
-                            services.provider.connect()
-                        except Exception as e2:
-                            if _is_duckdb_lock_conflict(e2):
-                                _ro_on_conflict()
-                                return cast(SearchResponse, {"results": [], "pagination": {"offset": offset, "page_size": 0, "has_more": False, "next_offset": None}})
-                            raise
-                    else:
-                        _ro_on_conflict()
-                        return cast(SearchResponse, {"results": [], "pagination": {"offset": offset, "page_size": 0, "has_more": False, "next_offset": None}})
-                else:
-                    raise
-        else:
-            # Non-RO or CLI path
-            try:
-                services.provider.connect()
-            except Exception as e:
-                if _is_duckdb_lock_conflict(e):
-                    _ro_on_conflict()
-                return cast(SearchResponse, {"results": [], "pagination": {"offset": offset, "page_size": 0, "has_more": False, "next_offset": None}})
+    # Centralized opportunistic connection handling for regex
+    fb = _opportunistic_connect_for_regex(
+        services,
+        pattern=pattern,
+        page_size=page_size,
+        offset=offset,
+        path_filter=path_filter,
+    )
+    if fb is not None:
+        return fb
 
     # Perform search using SearchService
     try:
+        import time as _t
+        t0 = _t.time()
         results, pagination = services.search_service.search_regex(
             pattern=pattern,
             page_size=page_size,
             offset=offset,
             path_filter=path_filter,
         )
+        t1 = _t.time()
+        _debug(f"regex search call ok dt={(t1-t0):.3f}s results={len(results)}")
     except Exception as e:
         if _is_duckdb_lock_conflict(e):
             _ro_on_conflict()
             return cast(SearchResponse, {"results": [], "pagination": {"offset": offset, "page_size": 0, "has_more": False, "next_offset": None}})
         raise
+
+    # Promotion helper: if index-on-promotion is enabled and DB returned empty,
+    # do a quick non-DB fallback to catch very recent files before the watcher
+    # flushes to DB. This preserves responsiveness without a catch-up scan.
+    try:
+        if not results and os.getenv("CHUNKHOUND_MCP__INDEX_ON_PROMOTION", "").lower() in ("1","true","yes","on"):
+            fb = _fallback_regex_non_db(services, pattern, page_size, offset, path_filter)
+            if fb and fb.get("results"):
+                return fb
+    except Exception:
+        pass
 
     # Convert file paths to native platform format
     native_results = _convert_paths_to_native(results)
@@ -345,6 +453,78 @@ async def search_regex_impl(
         pass
 
     return cast(SearchResponse, {"results": native_results, "pagination": pagination})
+
+
+def _fallback_regex_non_db(
+    services: DatabaseServices,
+    pattern: str,
+    page_size: int,
+    offset: int,
+    path_filter: str | None,
+) -> SearchResponse:
+    import re
+    from pathlib import Path
+
+    # Only allow in MCP mode during skip-indexing, as a Non-Indexer fallback
+    if os.getenv("CHUNKHOUND_MCP_MODE") != "1" or os.getenv("CHUNKHOUND_MCP__SKIP_INDEXING", "").lower() not in ("1", "true", "yes", "on"):
+        return cast(SearchResponse, {"results": [], "pagination": {"offset": offset, "page_size": 0, "has_more": False, "next_offset": None}})
+
+    base_dir = None
+    try:
+        base_dir = getattr(services.provider, "get_base_directory", lambda: None)()
+    except Exception:
+        base_dir = None
+    if not base_dir:
+        return cast(SearchResponse, {"results": [], "pagination": {"offset": offset, "page_size": 0, "has_more": False, "next_offset": None}})
+
+    try:
+        rx = re.compile(pattern)
+    except Exception:
+        return cast(SearchResponse, {"results": [], "pagination": {"offset": offset, "page_size": 0, "has_more": False, "next_offset": None}})
+
+    # Determine include patterns from config if available
+    includes: list[str] | None = None
+    try:
+        idx = getattr(services, "indexing_coordinator", None)
+        cfg = getattr(idx, "config", None)
+        if cfg and getattr(cfg, "indexing", None) and getattr(cfg.indexing, "include", None):
+            includes = list(cfg.indexing.include)
+    except Exception:
+        includes = None
+    if not includes:
+        includes = ["**/*.py", "**/*.js", "**/*.ts", "**/*.jsx", "**/*.tsx", "**/*.go", "**/*.rs", "**/*.java", "**/*.c", "**/*.cpp", "**/*.rb", "**/*.php", "**/*.md"]
+
+    root = Path(str(base_dir))
+    files: list[Path] = []
+    for pat in includes:
+        try:
+            for p in root.glob(pat):
+                if not p.is_file():
+                    continue
+                rel = p.relative_to(root).as_posix()
+                if rel.startswith(".chunkhound/") or rel.startswith(".git/"):
+                    continue
+                if path_filter and not rel.startswith(path_filter):
+                    continue
+                files.append(p)
+        except Exception:
+            continue
+
+    results: list[dict[str, Any]] = []
+    for fp in files:
+        try:
+            text = fp.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            continue
+        if rx.search(text):
+            results.append({"file_path": str(fp), "content": ""})
+            if len(results) >= (offset + page_size):
+                break
+
+    page = results[offset: offset + page_size]
+    has_more = (offset + page_size) < len(results)
+    _debug(f"non-db fallback results={len(page)} total={len(results)}")
+    return cast(SearchResponse, {"results": page, "pagination": {"offset": offset, "page_size": len(page), "has_more": has_more, "next_offset": (offset + len(page)) if has_more else None, "total": len(results)}})
 
 
 async def search_semantic_impl(
@@ -404,33 +584,8 @@ async def search_semantic_impl(
     page_size = max(1, min(page_size, 100))
     offset = max(0, offset)
 
-    # Check database connection with opportunistic RO path
-    if services and not services.provider.is_connected:
-        role = None
-        try:
-            if hasattr(services.provider, "get_role"):
-                role = services.provider.get_role()
-        except Exception:
-            role = None
-        ro_try = _ro_try_enabled()
-        if role == "RO" and os.getenv("CHUNKHOUND_MCP_MODE") == "1" and ro_try:
-            if not _ro_should_attempt():
-                raise Exception("Semantic search unavailable: backoff active")
-            try:
-                services.provider.connect()
-            except Exception as e:
-                if _is_duckdb_lock_conflict(e):
-                    _ro_on_conflict()
-                    raise Exception("Semantic search unavailable: writer active")
-                raise
-        else:
-            try:
-                services.provider.connect()
-            except Exception as e:
-                if _is_duckdb_lock_conflict(e):
-                    _ro_on_conflict()
-                    raise Exception("Semantic search unavailable: writer active")
-                raise
+    # Centralized opportunistic connection handling for semantic
+    _opportunistic_connect_for_semantic(services)
 
     # Perform search using SearchService
     try:
@@ -565,8 +720,9 @@ async def get_stats_impl(
     except Exception:
         pass
 
-    # Ensure DB connection for stats in lazy-connect scenarios. In MCP mode, keep it
-    # lightweight but allow connect for RW, and for RO when explicitly enabled.
+    # Ensure DB connection for stats in lazy-connect scenarios.
+    # MCP mode: NEVER connect just to answer stats. Control-plane must be cheap
+    # and non-intrusive; return zeros unless a connection is already open.
     connected_for_stats = False
     try:
         provider = services.provider
@@ -585,23 +741,9 @@ async def get_stats_impl(
             db_missing = False
 
         if not provider.is_connected:
-            allow_ro = _ro_try_enabled()
             if os.getenv("CHUNKHOUND_MCP_MODE") == "1":
-                try:
-                    if role == "RW":
-                        provider.connect()
-                        connected_for_stats = True
-                    elif role == "RO" and allow_ro and not db_missing:
-                        provider.connect()
-                        connected_for_stats = True
-                    else:
-                        # stay disconnected in MCP follower when RO DB is disabled
-                        pass
-                except Exception as e:
-                    if _is_duckdb_lock_conflict(e):
-                        _ro_on_conflict()
-                    else:
-                        raise
+                # Do not open DB connections in MCP for stats; keep control-plane fast.
+                pass
             else:
                 # CLI path: allow normal connections except RO + missing DB
                 try:
@@ -717,6 +859,7 @@ async def deep_research_impl(
     embedding_manager: EmbeddingManager,
     llm_manager: LLMManager,
     query: str,
+    depth: str | None = None,
     progress: Any = None,
 ) -> dict[str, Any]:
     """Core deep research implementation.
@@ -726,6 +869,7 @@ async def deep_research_impl(
         embedding_manager: Embedding manager instance
         llm_manager: LLM manager instance
         query: Research query
+        depth: Optional research depth hint (ignored; service uses fixed depth)
         progress: Optional Rich Progress instance for terminal UI (None for MCP)
 
     Returns:

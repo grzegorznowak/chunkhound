@@ -85,7 +85,11 @@ class DuckDBConnectionManager:
             logger.info("DuckDB connection established")
 
             # Load required extensions
-            self._load_extensions()
+            # Optimization: skip extension load for read-only connections to
+            # minimize latency for regex-only RO readers (extensions will be
+            # loaded lazily in provider executor when needed for semantic ops).
+            if not self._read_only:
+                self._load_extensions()
 
             # Note: Schema and index creation is now handled by DuckDBProvider's executor
 

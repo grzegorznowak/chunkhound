@@ -319,9 +319,29 @@ class StdioMCPServer(MCPServerBase):
                         pass
 
                 loop = asyncio.get_event_loop()
+                reader = None
+                try:
+                    # Prefer asyncio-native pipe reader for stdin to avoid
+                    # thread scheduling delays with run_in_executor.
+                    reader = asyncio.StreamReader()
+                    protocol = asyncio.StreamReaderProtocol(reader)  # type: ignore[arg-type]
+                    await loop.connect_read_pipe(lambda: protocol, sys.stdin)  # type: ignore[arg-type]
+                except Exception:
+                    reader = None
 
                 async def _readline() -> str:
-                    return await loop.run_in_executor(None, sys.stdin.readline)
+                    try:
+                        if reader is not None:
+                            line = await reader.readline()
+                            try:
+                                return line.decode("utf-8")
+                            except Exception:
+                                return line.decode("utf-8", errors="ignore")
+                        # Fallback to thread executor
+                        return await loop.run_in_executor(None, sys.stdin.readline)
+                    except Exception:
+                        # Propagate to outer handler
+                        raise
 
                 self.debug_log("STDIO fallback loop started")
                 while True:
@@ -331,6 +351,11 @@ class StdioMCPServer(MCPServerBase):
                         line = await asyncio.wait_for(_readline(), timeout=0.25)
                     except asyncio.TimeoutError:
                         # Periodically check for shutdown without blocking forever
+                        # Optional heartbeat for debugging
+                        try:
+                            self.debug_log("STDIO fallback idle tick")
+                        except Exception:
+                            pass
                         continue
                     if not line:
                         break  # EOF
@@ -371,12 +396,12 @@ class StdioMCPServer(MCPServerBase):
                         continue
 
                     # Simple notifications: ignore
-                    if method == "notifications/initialized":
+                    elif method == "notifications/initialized":
                         # no response required; background tasks were scheduled during initialize
                         continue
 
                     # Minimal tools/list support
-                    if method == "tools/list":
+                    elif method == "tools/list":
                         try:
                             tools = []
                             # Build a minimal tool descriptor list compatible with tests
@@ -397,19 +422,24 @@ class StdioMCPServer(MCPServerBase):
                                     "error": {"code": -32000, "message": f"tools/list error: {e}"},
                                 }
                             )
-                        continue
 
                     # Minimal tools/call support (ToolResult envelope)
-                    if method == "tools/call":
+                    elif method == "tools/call":
                         params = req.get("params", {}) or {}
                         name = params.get("name")
                         arguments = params.get("arguments") or {}
+                        try:
+                            self.debug_log(f"tools/call start name={name}")
+                        except Exception:
+                            pass
                         try:
                             from .common import parse_mcp_arguments
                             from .tools import execute_tool
 
                             # Fast path for get_stats before initialization completes
-                            if name == "get_stats" and (self.services is None or not getattr(self, "_initialized", False)):
+                            if name == "get_stats" and (
+                                self.services is None or not getattr(self, "_initialized", False)
+                            ):
                                 import json as _json
                                 # Minimal stats without forcing DB init
                                 minimal = {
@@ -438,9 +468,12 @@ class StdioMCPServer(MCPServerBase):
                                 continue
 
                             # Ensure services are ready (may still be initializing in background)
+                            self.debug_log("tools/call awaiting initialize()")
                             await self.initialize()
+                            self.debug_log("tools/call initialize() complete")
                             # Pass services without forcing a DB connect here; individual
                             # tools handle lazy connections to avoid RO follower conflicts.
+                            self.debug_log(f"tools/call executing {name}")
                             result = await execute_tool(
                                 tool_name=name,
                                 services=self.services,
@@ -449,6 +482,7 @@ class StdioMCPServer(MCPServerBase):
                                 scan_progress=self._scan_progress,
                                 llm_manager=self.llm_manager,
                             )
+                            self.debug_log(f"tools/call done {name}")
                             # Match official MCP SDK ToolResult shape
                             import json as _json
                             if isinstance(result, str):
@@ -463,6 +497,10 @@ class StdioMCPServer(MCPServerBase):
                             }
                             await _write({"jsonrpc": "2.0", "id": req_id, "result": tool_result})
                         except Exception as e:
+                            try:
+                                self.debug_log(f"tools/call error {name}: {e}")
+                            except Exception:
+                                pass
                             await _write(
                                 {
                                     "jsonrpc": "2.0",
@@ -470,13 +508,12 @@ class StdioMCPServer(MCPServerBase):
                                     "error": {"code": -32000, "message": f"tool error: {e}"},
                                 }
                             )
-                        continue
-
-                    # Unknown method
-                    if req_id is not None:
-                        await _write(
-                            {
-                                "jsonrpc": "2.0",
+                    else:
+                        # Unknown method
+                        if req_id is not None:
+                            await _write(
+                                {
+                                    "jsonrpc": "2.0",
                                 "id": req_id,
                                 "error": {"code": -32601, "message": f"Method not found: {method}"},
                             }
@@ -537,11 +574,39 @@ async def main(args: Any = None) -> None:
 
     # Create and run the stdio server
     try:
+        # Early debug (before server exists)
+        try:
+            path = os.getenv("CHUNKHOUND_DEBUG_FILE", "/tmp/chunkhound_mcp_debug.log")
+            if os.getenv("CHUNKHOUND_DEBUG") in ("1", "true", "yes", "on"):
+                with open(path, "a", encoding="utf-8") as f:
+                    from datetime import datetime as _dt
+                    f.write(f"[{_dt.now().isoformat()}] [STDIO] main creating server\n")
+        except Exception:
+            pass
+
         server = StdioMCPServer(config, args=args)
+
+        try:
+            if os.getenv("CHUNKHOUND_DEBUG") in ("1", "true", "yes", "on"):
+                with open(os.getenv("CHUNKHOUND_DEBUG_FILE", "/tmp/chunkhound_mcp_debug.log"), "a", encoding="utf-8") as f:
+                    from datetime import datetime as _dt
+                    f.write(f"[{_dt.now().isoformat()}] [STDIO] server created, running\n")
+        except Exception:
+            pass
+
         await server.run()
     except Exception:
         # CRITICAL: Cannot print to stderr in MCP mode - breaks JSON-RPC protocol
         # Exit silently with error code
+        try:
+            if os.getenv("CHUNKHOUND_DEBUG") in ("1", "true", "yes", "on"):
+                import traceback
+                tb = traceback.format_exc()
+                with open(os.getenv("CHUNKHOUND_DEBUG_FILE", "/tmp/chunkhound_mcp_debug.log"), "a", encoding="utf-8") as f:
+                    from datetime import datetime as _dt
+                    f.write(f"[{_dt.now().isoformat()}] [STDIO] main exception:\n{tb}\n")
+        except Exception:
+            pass
         sys.exit(1)
 
 

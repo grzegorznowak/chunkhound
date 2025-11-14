@@ -139,10 +139,11 @@ class DuckDBProvider(SerialDatabaseProvider):
             str(self._connection_manager.db_path), read_only=getattr(self, "_read_only", False)
         )
 
-        # Load required extensions
-        conn.execute("INSTALL vss")
-        conn.execute("LOAD vss")
-        conn.execute("SET hnsw_enable_experimental_persistence = true")
+        # Load required extensions (skip for read-only to minimize RO latency)
+        if not getattr(self, "_read_only", False):
+            conn.execute("INSTALL vss")
+            conn.execute("LOAD vss")
+            conn.execute("SET hnsw_enable_experimental_persistence = true")
 
         logger.debug(
             f"Created new DuckDB connection in executor thread {threading.get_ident()}"
