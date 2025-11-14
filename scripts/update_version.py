@@ -1,22 +1,15 @@
 #!/usr/bin/env uv run python3
 """
-Create a new ChunkHound version tag.
-
-With dynamic versioning via hatch-vcs, versions are automatically
-derived from git tags. This script simplifies creating properly formatted tags.
-
-Usage:
-    python scripts/update_version.py 4.1.0
-    python scripts/update_version.py --bump major|minor|patch
+Create a new ChunkHound version tag with PEP 440 support.
 """
 
+import argparse
 import re
 import subprocess
 import sys
-from pathlib import Path
 
 
-def get_current_version():
+def get_current_version() -> str:
     """Get the current version from the latest git tag."""
     try:
         result = subprocess.run(
@@ -25,46 +18,84 @@ def get_current_version():
             text=True,
             check=True,
         )
-        tag = result.stdout.strip()
-        # Remove 'v' prefix if present
-        return tag.lstrip("v")
+        return result.stdout.strip().lstrip("v")
     except subprocess.CalledProcessError:
         return "0.0.0"
 
 
-def parse_version(version_str):
-    """Parse version string into (major, minor, patch) tuple."""
-    match = re.match(r"^(\d+)\.(\d+)\.(\d+)", version_str)
-    if not match:
-        raise ValueError(f"Invalid version format: {version_str}")
-    return tuple(map(int, match.groups()))
+def validate_version(version: str) -> None:
+    """Validate version format (PEP 440 compliant).
 
-
-def bump_version(current, bump_type):
-    """Bump version based on type (major, minor, patch)."""
-    major, minor, patch = parse_version(current)
-
-    if bump_type == "major":
-        return f"{major + 1}.0.0"
-    elif bump_type == "minor":
-        return f"{major}.{minor + 1}.0"
-    elif bump_type == "patch":
-        return f"{major}.{minor}.{patch + 1}"
-    else:
-        raise ValueError(f"Invalid bump type: {bump_type}")
-
-
-def validate_version(version):
-    """Validate version format."""
-    pattern = r"^\d+\.\d+\.\d+(-[a-zA-Z0-9]+)?$"
+    Supports:
+    - Standard releases: 4.1.0
+    - Pre-releases: 4.1.0a1, 4.1.0b2, 4.1.0rc3
+    - Alternative spellings: 4.1.0alpha1, 4.1.0beta2
+    """
+    pattern = r"^\d+\.\d+\.\d+(?:(?:a|alpha|b|beta|rc|c|preview|pre)\d+)?$"
     if not re.match(pattern, version):
         raise ValueError(
-            f"Invalid version format: {version}. Expected: X.Y.Z or X.Y.Z-suffix"
+            f"Invalid version format: {version}. "
+            f"Expected: X.Y.Z or X.Y.Z{{a|b|rc}}N (e.g., 4.1.0, 4.1.0b1, 4.1.0rc3)"
         )
 
 
-def create_tag(version):
-    """Create and push git tag."""
+def parse_version(version_str: str) -> tuple[int, int, int, str | None]:
+    """Parse version string into (major, minor, patch, prerelease) tuple.
+
+    Examples:
+        "4.1.0" -> (4, 1, 0, None)
+        "4.1.0b2" -> (4, 1, 0, "b2")
+        "4.1.0rc1" -> (4, 1, 0, "rc1")
+    """
+    match = re.match(r"^(\d+)\.(\d+)\.(\d+)(.+)?$", version_str)
+    if not match:
+        raise ValueError(f"Invalid version format: {version_str}")
+    major, minor, patch, prerelease = match.groups()
+    return (int(major), int(minor), int(patch), prerelease)
+
+
+def bump_version(current: str, bump_type: str, prerelease: str | None = None) -> str:
+    """Bump version based on type (major, minor, patch).
+
+    Args:
+        current: Current version string
+        bump_type: One of 'major', 'minor', 'patch'
+        prerelease: Optional pre-release suffix (e.g., 'a1', 'b2', 'rc1')
+
+    Examples:
+        bump_version("4.0.1", "minor") -> "4.1.0"
+        bump_version("4.0.1", "minor", "b1") -> "4.1.0b1"
+        bump_version("4.1.0b1", "patch") -> "4.1.1" (removes prerelease)
+    """
+    major, minor, patch, _ = parse_version(current)
+
+    if bump_type == "major":
+        new_version = f"{major + 1}.0.0"
+    elif bump_type == "minor":
+        new_version = f"{major}.{minor + 1}.0"
+    elif bump_type == "patch":
+        new_version = f"{major}.{minor}.{patch + 1}"
+    else:
+        raise ValueError(f"Invalid bump type: {bump_type}")
+
+    if prerelease:
+        new_version += prerelease
+
+    return new_version
+
+
+def create_tag(version: str) -> str:
+    """Create annotated git tag.
+
+    Args:
+        version: Version string (e.g., "4.1.0", "4.1.0b1")
+
+    Returns:
+        Created tag name (e.g., "v4.1.0")
+
+    Raises:
+        RuntimeError: If tag already exists
+    """
     tag = f"v{version}"
 
     # Check if tag already exists
@@ -74,8 +105,7 @@ def create_tag(version):
         text=True,
     )
     if result.stdout.strip():
-        print(f"Error: Tag {tag} already exists")
-        sys.exit(1)
+        raise RuntimeError(f"Tag {tag} already exists")
 
     # Create annotated tag
     subprocess.run(
@@ -83,32 +113,54 @@ def create_tag(version):
         check=True,
     )
     print(f"Created tag {tag}")
-
     return tag
 
 
-def main():
-    """Main function."""
-    if len(sys.argv) < 2:
-        print(f"Usage: {sys.argv[0]} <version>", file=sys.stderr)
-        print(f"       {sys.argv[0]} --bump <major|minor|patch>", file=sys.stderr)
-        print(f"Examples:", file=sys.stderr)
-        print(f"  {sys.argv[0]} 4.1.0", file=sys.stderr)
-        print(f"  {sys.argv[0]} --bump minor", file=sys.stderr)
-        sys.exit(1)
+def main() -> None:
+    """Main entry point."""
+    parser = argparse.ArgumentParser(
+        description="Create PEP 440 compliant version tags for ChunkHound",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  %(prog)s 4.1.0           # Release version
+  %(prog)s 4.1.0b1         # Beta pre-release
+  %(prog)s 4.1.0rc2        # Release candidate
+  %(prog)s --bump minor    # Bump to next minor
+  %(prog)s --bump minor b1 # Bump to next minor beta
+        """,
+    )
+
+    # Mutually exclusive: either explicit version OR bump
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument(
+        "version",
+        nargs="?",
+        help="Explicit version to set (e.g., 4.1.0, 4.1.0b1)",
+    )
+    group.add_argument(
+        "--bump",
+        choices=["major", "minor", "patch"],
+        help="Bump version semantically",
+    )
+
+    parser.add_argument(
+        "prerelease",
+        nargs="?",
+        help="Optional pre-release suffix (e.g., b1, rc2) for --bump",
+    )
+
+    args = parser.parse_args()
 
     try:
-        # Handle --bump flag
-        if sys.argv[1] == "--bump":
-            if len(sys.argv) != 3 or sys.argv[2] not in ("major", "minor", "patch"):
-                print("Error: --bump requires major, minor, or patch", file=sys.stderr)
-                sys.exit(1)
-
+        if args.bump:
+            # Bump mode
             current = get_current_version()
-            version = bump_version(current, sys.argv[2])
+            version = bump_version(current, args.bump, args.prerelease)
             print(f"Bumping version from {current} to {version}")
         else:
-            version = sys.argv[1]
+            # Explicit version mode
+            version = args.version
             validate_version(version)
             print(f"Creating version {version}")
 
@@ -121,7 +173,7 @@ def main():
         print(f"\nNote: Version is now managed via git tags (hatch-vcs)")
         print(f"      No need to manually update version files!")
 
-    except Exception as e:
+    except (ValueError, RuntimeError, subprocess.CalledProcessError) as e:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
 
