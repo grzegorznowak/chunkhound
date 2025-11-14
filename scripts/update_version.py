@@ -167,11 +167,11 @@ Examples:
         tag = create_tag(version)
 
         print(f"\nSuccessfully created version {version}")
-        print(f"\nNext steps:")
+        print("\nNext steps:")
         print(f"1. Push the tag: git push origin {tag}")
-        print(f"2. Build will automatically use version from git tag")
-        print(f"\nNote: Version is now managed via git tags (hatch-vcs)")
-        print(f"      No need to manually update version files!")
+        print("2. Build will automatically use version from git tag")
+        print("\nNote: Version is now managed via git tags (hatch-vcs)")
+        print("      No need to manually update version files!")
 
     except (ValueError, RuntimeError, subprocess.CalledProcessError) as e:
         print(f"Error: {e}", file=sys.stderr)
