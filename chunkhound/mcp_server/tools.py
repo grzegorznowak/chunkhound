@@ -481,7 +481,30 @@ def _fallback_regex_non_db(
 
     skip_flag = os.getenv("CHUNKHOUND_MCP__SKIP_INDEXING", "").lower() in ("1", "true", "yes", "on")
     index_on_promotion = os.getenv("CHUNKHOUND_MCP__INDEX_ON_PROMOTION", "").lower() in ("1", "true", "yes", "on")
-    if not (skip_flag or index_on_promotion):
+
+    # Determine current provider role, if available. This lets us distinguish
+    # between RW promotion flows (where a watcher is expected to run) and
+    # RO demotion flows (where the watcher must be stopped and non-DB fallback
+    # should NOT surface new files).
+    role: str | None = None
+    try:
+        provider = getattr(services, "provider", None)
+        if provider is not None and hasattr(provider, "get_role"):
+            role = provider.get_role()  # type: ignore[assignment]
+    except Exception:
+        role = None
+
+    allow_fallback = False
+    if skip_flag:
+        # Skip-indexing Non-Indexer flows always allow non-DB regex fallback.
+        allow_fallback = True
+    elif index_on_promotion and role == "RW":
+        # Promotion watcher flows: only allow fallback while this process is
+        # RW leader. After RW→RO demotion, role will be "RO" and fallback is
+        # disabled so that watcher stop semantics are preserved.
+        allow_fallback = True
+
+    if not allow_fallback:
         return cast(SearchResponse, {"results": [], "pagination": {"offset": offset, "page_size": 0, "has_more": False, "next_offset": None}})
 
     base_dir = None
