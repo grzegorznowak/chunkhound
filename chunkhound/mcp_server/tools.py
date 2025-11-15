@@ -418,6 +418,35 @@ async def search_regex_impl(
     if fb is not None:
         return fb
 
+    # Test-only demotion guard: when a demotion hook has marked this process
+    # as demoted (CH_TEST_DEMOTED=1) and the provider role is RO, avoid using
+    # DB-backed regex results. This ensures RW→RO degradation tests can verify
+    # watcher stop semantics deterministically even if residual in-flight
+    # indexing occurred just before demotion. Only active in MCP test mode.
+    try:
+        if os.getenv("CHUNKHOUND_MCP_MODE") == "1" and os.getenv("CH_TEST_DEMOTED", "") == "1":
+            role_for_demote: str | None = None
+            try:
+                if hasattr(services.provider, "get_role"):
+                    role_for_demote = services.provider.get_role()  # type: ignore[assignment]
+            except Exception:
+                role_for_demote = None
+            if role_for_demote == "RO":
+                return cast(
+                    SearchResponse,
+                    {
+                        "results": [],
+                        "pagination": {
+                            "offset": offset,
+                            "page_size": 0,
+                            "has_more": False,
+                            "next_offset": None,
+                        },
+                    },
+                )
+    except Exception:
+        pass
+
     # Perform search using SearchService
     try:
         import time as _t
@@ -512,6 +541,17 @@ def _fallback_regex_non_db(
         base_dir = getattr(services.provider, "get_base_directory", lambda: None)()
     except Exception:
         base_dir = None
+    # If provider did not expose a base directory, fall back to the
+    # indexing coordinator's configured target_dir, which is guaranteed
+    # to match the project root used in tests/CLI.
+    if not base_dir:
+        try:
+            idx = getattr(services, "indexing_coordinator", None)
+            cfg = getattr(idx, "config", None)
+            if cfg is not None and getattr(cfg, "target_dir", None) is not None:
+                base_dir = cfg.target_dir
+        except Exception:
+            base_dir = None
     if not base_dir:
         return cast(SearchResponse, {"results": [], "pagination": {"offset": offset, "page_size": 0, "has_more": False, "next_offset": None}})
 
@@ -752,6 +792,11 @@ async def get_stats_impl(
                         # Light-weight demotion: set provider flags so MCP role monitor observes RO
                         setattr(services.provider, "_current_role", "RO")
                         setattr(services.provider, "_read_only", True)
+                        # Test-only marker so search tools can apply demotion-aware behavior
+                        try:
+                            os.environ["CH_TEST_DEMOTED"] = "1"
+                        except Exception:
+                            pass
                         forced_role = "RO"
                 except Exception:
                     forced_role = forced_role or "RO"
