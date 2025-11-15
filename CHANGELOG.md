@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.1.0b1] - 2025-11-15
+
+### Added
+- PHP configuration files with top-level return arrays are now searchable - config patterns like `return ['key' => 'value'];` are automatically indexed
+- Universal config-literal parsing across Python, JavaScript, TypeScript, and JSX/TSX - all exported configuration objects and arrays are now discoverable through semantic search
+
+### Enhanced
+- Windows compatibility improved with cross-platform temporary directory handling for Claude Code CLI provider
+- JavaScript-family parsers (JavaScript, TypeScript, JSX/TSX) internally streamlined to reduce maintenance overhead while preserving all functionality
+- Version management now supports PEP 440 pre-release formats (beta, release candidate) for clearer update channels
+- Version tagging includes safety checks to prevent accidental releases from uncommitted work
+
+### Fixed
+- Code quality improvements addressing linting warnings for cleaner, more maintainable codebase
+
 ## [4.0.1] - 2025-11-12
 
 ### Fixed
@@ -589,7 +604,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 For more information, visit: https://github.com/chunkhound/chunkhound
 
-[Unreleased]: https://github.com/chunkhound/chunkhound/compare/v4.0.1...HEAD
+[Unreleased]: https://github.com/chunkhound/chunkhound/compare/v4.1.0b1...HEAD
+[4.1.0b1]: https://github.com/chunkhound/chunkhound/compare/v4.0.1...v4.1.0b1
 [4.0.1]: https://github.com/chunkhound/chunkhound/compare/v4.0.0...v4.0.1
 [4.0.0]: https://github.com/chunkhound/chunkhound/compare/v3.3.1...v4.0.0
 [3.3.1]: https://github.com/chunkhound/chunkhound/compare/v3.3.0...v3.3.1
