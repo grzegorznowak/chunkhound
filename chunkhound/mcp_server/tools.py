@@ -462,7 +462,35 @@ async def search_regex_impl(
     except Exception as e:
         if _is_duckdb_lock_conflict(e):
             _ro_on_conflict()
-            return cast(SearchResponse, {"results": [], "pagination": {"offset": offset, "page_size": 0, "has_more": False, "next_offset": None}})
+            # In MCP promotion flows, treat lock conflicts as a signal to fall
+            # back to non-DB regex so that recent files are still discoverable
+            # even if DuckDB is briefly locked by another process (common on
+            # Windows). This preserves INDEX_ON_PROMOTION semantics.
+            try:
+                if (
+                    os.getenv("CHUNKHOUND_MCP_MODE") == "1"
+                    and os.getenv("CHUNKHOUND_MCP__INDEX_ON_PROMOTION", "").lower()
+                    in ("1", "true", "yes", "on")
+                ):
+                    fb = _fallback_regex_non_db(
+                        services, pattern, page_size, offset, path_filter
+                    )
+                    if fb and fb.get("results"):
+                        return fb
+            except Exception:
+                pass
+            return cast(
+                SearchResponse,
+                {
+                    "results": [],
+                    "pagination": {
+                        "offset": offset,
+                        "page_size": 0,
+                        "has_more": False,
+                        "next_offset": None,
+                    },
+                },
+            )
         raise
 
     # Promotion helper: if index-on-promotion is enabled and DB returned empty,
@@ -504,36 +532,24 @@ def _fallback_regex_non_db(
     # 1) Skip-indexing Non-Indexer flows (CHUNKHOUND_MCP__SKIP_INDEXING=1)
     # 2) Promotion watcher flows where INDEX_ON_PROMOTION is enabled; this
     #    provides a safety net when the DB is briefly locked by another
-    #    process on Windows while still surfacing recent files.
+    #    process while still surfacing recent files.
     if os.getenv("CHUNKHOUND_MCP_MODE") != "1":
         return cast(SearchResponse, {"results": [], "pagination": {"offset": offset, "page_size": 0, "has_more": False, "next_offset": None}})
 
-    skip_flag = os.getenv("CHUNKHOUND_MCP__SKIP_INDEXING", "").lower() in ("1", "true", "yes", "on")
-    index_on_promotion = os.getenv("CHUNKHOUND_MCP__INDEX_ON_PROMOTION", "").lower() in ("1", "true", "yes", "on")
+    skip_flag = os.getenv("CHUNKHOUND_MCP__SKIP_INDEXING", "").lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+    index_on_promotion = os.getenv("CHUNKHOUND_MCP__INDEX_ON_PROMOTION", "").lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
 
-    # Determine current provider role, if available. This lets us distinguish
-    # between RW promotion flows (where a watcher is expected to run) and
-    # RO demotion flows (where the watcher must be stopped and non-DB fallback
-    # should NOT surface new files).
-    role: str | None = None
-    try:
-        provider = getattr(services, "provider", None)
-        if provider is not None and hasattr(provider, "get_role"):
-            role = provider.get_role()  # type: ignore[assignment]
-    except Exception:
-        role = None
-
-    allow_fallback = False
-    if skip_flag:
-        # Skip-indexing Non-Indexer flows always allow non-DB regex fallback.
-        allow_fallback = True
-    elif index_on_promotion and role == "RW":
-        # Promotion watcher flows: only allow fallback while this process is
-        # RW leader. After RW→RO demotion, role will be "RO" and fallback is
-        # disabled so that watcher stop semantics are preserved.
-        allow_fallback = True
-
-    if not allow_fallback:
+    if not (skip_flag or index_on_promotion):
         return cast(SearchResponse, {"results": [], "pagination": {"offset": offset, "page_size": 0, "has_more": False, "next_offset": None}})
 
     base_dir = None
