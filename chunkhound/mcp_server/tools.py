@@ -271,6 +271,12 @@ def _is_duckdb_lock_conflict(err: Exception) -> bool:
         "Could not set lock on file",
         "Conflicting lock is held",
         "different configuration",
+        # Windows-specific file lock errors when the DB file is held
+        # by another process. Example:
+        # "IO Error: Cannot open file ... The process cannot access the file
+        #  because it is being used by another process."
+        "The process cannot access the file because it is being used by another process",
+        "IO Error: Cannot open file",
     ]
     return any(n in msg for n in needles)
 
@@ -465,8 +471,17 @@ def _fallback_regex_non_db(
     import re
     from pathlib import Path
 
-    # Only allow in MCP mode during skip-indexing, as a Non-Indexer fallback
-    if os.getenv("CHUNKHOUND_MCP_MODE") != "1" or os.getenv("CHUNKHOUND_MCP__SKIP_INDEXING", "").lower() not in ("1", "true", "yes", "on"):
+    # Only allow in MCP mode. Within MCP, enable this fallback in two cases:
+    # 1) Skip-indexing Non-Indexer flows (CHUNKHOUND_MCP__SKIP_INDEXING=1)
+    # 2) Promotion watcher flows where INDEX_ON_PROMOTION is enabled; this
+    #    provides a safety net when the DB is briefly locked by another
+    #    process on Windows while still surfacing recent files.
+    if os.getenv("CHUNKHOUND_MCP_MODE") != "1":
+        return cast(SearchResponse, {"results": [], "pagination": {"offset": offset, "page_size": 0, "has_more": False, "next_offset": None}})
+
+    skip_flag = os.getenv("CHUNKHOUND_MCP__SKIP_INDEXING", "").lower() in ("1", "true", "yes", "on")
+    index_on_promotion = os.getenv("CHUNKHOUND_MCP__INDEX_ON_PROMOTION", "").lower() in ("1", "true", "yes", "on")
+    if not (skip_flag or index_on_promotion):
         return cast(SearchResponse, {"results": [], "pagination": {"offset": offset, "page_size": 0, "has_more": False, "next_offset": None}})
 
     base_dir = None
