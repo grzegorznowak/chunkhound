@@ -155,11 +155,12 @@ class StdioMCPServer(MCPServerBase):
         # Create MCP server instance (prefer official SDK when available).
         # Allow forcing fallback with CHUNKHOUND_MCP__USE_SDK in {0,false,off}.
         use_sdk_env = os.getenv("CHUNKHOUND_MCP__USE_SDK", "").lower()
-        # Prefer fallback loop when skip-indexing is explicitly requested to
-        # minimize initialization latency in constrained environments.
         skip_env = os.getenv("CHUNKHOUND_MCP__SKIP_INDEXING", "").lower()
         skip_on = skip_env in ("1", "true", "yes", "on")
-        use_sdk = _MCP_AVAILABLE and use_sdk_env not in ("0", "false", "off") and not skip_on
+        # Default to official SDK whenever available, regardless of skip-indexing.
+        # Fallback loop is reserved for environments without MCP SDK or when
+        # explicitly forced via CHUNKHOUND_MCP__USE_SDK=0.
+        use_sdk = _MCP_AVAILABLE and use_sdk_env not in ("0", "false", "off")
         self.debug_log(f"STDIO: _MCP_AVAILABLE={_MCP_AVAILABLE}, use_sdk={use_sdk} (env={use_sdk_env})")
         if not use_sdk:
             # Defer server creation; fallback path implemented in run()
