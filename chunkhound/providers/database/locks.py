@@ -110,11 +110,28 @@ class LockManager:
 
     def read_meta(self) -> dict:
         try:
-            with open(self._lock_path, "rb") as rfh:
-                data = rfh.read().decode("utf-8")
-                if not data.strip():
-                    return {}
-                return json.loads(data)
+            # Prefer the existing handle when we have one. This avoids
+            # platform-specific sharing quirks (especially on Windows) where
+            # opening a second handle on a locked file can fail or see stale
+            # contents even though the current holder has written metadata.
+            if self._fh is not None:
+                fh = self._fh
+                try:
+                    fh.seek(0)
+                    data_bytes = fh.read()
+                except Exception:
+                    data_bytes = b""
+            else:
+                with open(self._lock_path, "rb") as rfh:
+                    data_bytes = rfh.read()
+
+            if not data_bytes:
+                return {}
+
+            data = data_bytes.decode("utf-8", errors="ignore")
+            if not data.strip():
+                return {}
+            return json.loads(data)
         except FileNotFoundError:
             return {}
         except Exception:
