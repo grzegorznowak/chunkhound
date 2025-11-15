@@ -51,7 +51,6 @@ format: uv run ruff format chunkhound
 
 # Version management
 update_version: uv run scripts/update_version.py X.Y.Z
-sync_version: uv run scripts/sync_version.py
 
 # Running
 index: uv run chunkhound index [directory]
@@ -313,16 +312,31 @@ print(f"Success! Got {len(results)} results")
 - Concurrency tests: Thread safety verification
 
 ## VERSION_MANAGEMENT
-Single source of truth: chunkhound/version.py
-Auto-synchronized to all components via imports
-NEVER manually edit version strings - use update_version.py
+**Dynamic versioning via hatch-vcs** - version automatically derived from git tags
+- Source of truth: Git tags (format: v4.0.1, v4.1.0b1, v4.1.0rc2)
+- Generated file: chunkhound/_version.py (auto-created during build, gitignored)
+- Import location: chunkhound/version.py (imports from _version.py or metadata)
+- **PEP 440 compliant**: Supports pre-release versions (alpha, beta, rc)
+- Create new version:
+  - Release: `uv run scripts/update_version.py 4.1.0`
+  - Beta: `uv run scripts/update_version.py 4.1.0b1`
+  - Release candidate: `uv run scripts/update_version.py 4.1.0rc1`
+  - Bump: `--bump major|minor|patch [prerelease]`
+    - Example: `uv run scripts/update_version.py --bump minor b1` → creates v4.1.0b1
+- NEVER manually edit version strings - create git tags instead
 
 ## PUBLISHING_PROCESS
 ### Pre-release Checklist
-1. Update version: `uv run scripts/update_version.py X.Y.Z`
+1. Create version tag: `uv run scripts/update_version.py X.Y.Z[{a|b|rc}N]` or `--bump major|minor|patch [prerelease]`
+   - Release: `uv run scripts/update_version.py 4.1.0` → creates v4.1.0
+   - Beta: `uv run scripts/update_version.py 4.1.0b1` → creates v4.1.0b1
+   - RC: `uv run scripts/update_version.py 4.1.0rc1` → creates v4.1.0rc1
+   - Bump to beta: `uv run scripts/update_version.py --bump minor b1` → creates v4.1.0b1
+   - Version automatically derived from tag during build via hatch-vcs
 2. Run smoke tests: `uv run pytest tests/test_smoke.py -v` (MANDATORY)
 3. Prepare release: `./scripts/prepare_release.sh`
 4. Test local install: `pip install dist/chunkhound-X.Y.Z-py3-none-any.whl`
+5. Push tag: `git push origin vX.Y.Z[{a|b|rc}N]`
 
 ### Dependency Locking Strategy
 - `pyproject.toml`: Flexible constraints (>=) for library compatibility

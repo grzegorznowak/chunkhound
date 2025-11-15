@@ -1422,6 +1422,7 @@ class UniversalParser:
                 "table": ChunkType.TABLE,
                 "key_value": ChunkType.KEY_VALUE,
                 "array": ChunkType.ARRAY,
+                "object": ChunkType.OBJECT,
                 "function": ChunkType.FUNCTION,
                 "class": ChunkType.CLASS,
                 "method": ChunkType.METHOD,
