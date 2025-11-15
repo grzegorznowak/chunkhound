@@ -51,7 +51,6 @@ format: uv run ruff format chunkhound
 
 # Version management
 update_version: uv run scripts/update_version.py X.Y.Z
-sync_version: uv run scripts/sync_version.py
 
 # Running
 index: uv run chunkhound index [directory]
