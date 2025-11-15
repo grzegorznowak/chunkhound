@@ -94,9 +94,22 @@ def create_tag(version: str) -> str:
         Created tag name (e.g., "v4.1.0")
 
     Raises:
-        RuntimeError: If tag already exists
+        RuntimeError: If tag already exists or working tree is dirty
     """
     tag = f"v{version}"
+
+    # Check for uncommitted changes
+    status_result = subprocess.run(
+        ["git", "status", "--porcelain"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    if status_result.stdout.strip():
+        raise RuntimeError(
+            "Working directory has uncommitted changes. "
+            "Commit or stash changes before creating a version tag."
+        )
 
     # Check if tag already exists
     result = subprocess.run(
