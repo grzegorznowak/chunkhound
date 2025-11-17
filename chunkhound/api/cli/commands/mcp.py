@@ -53,6 +53,14 @@ async def mcp_command(args: argparse.Namespace, config) -> None:
     except ImportError:
         pass
 
+    # Propagate read-only/skip-indexing intent to environment so all
+    # subprocesses and lower layers see a consistent flag.
+    try:
+        if getattr(args, "skip_indexing", False):
+            os.environ["CHUNKHOUND_MCP__SKIP_INDEXING"] = "1"
+    except Exception:
+        pass
+
     # Handle transport selection
     if hasattr(args, "http") and args.http:
         # Show MCP setup instructions for HTTP mode (stdio can't print to stdout)
@@ -79,6 +87,14 @@ async def mcp_command(args: argparse.Namespace, config) -> None:
 
         if hasattr(args, "db") and args.db:
             cmd.extend(["--db", str(args.db)])
+        # Forward path and skip-indexing to HTTP subprocess so behavior matches stdio.
+        try:
+            if hasattr(args, "path") and args.path:
+                cmd.append(str(Path(args.path)))
+            if getattr(args, "skip_indexing", False):
+                cmd.append("--skip-indexing")
+        except Exception:
+            pass
 
         # Set up environment with UTF-8 encoding for Windows compatibility
         from chunkhound.utils.windows_constants import get_utf8_env
@@ -279,8 +295,9 @@ def _show_mcp_setup_instructions(
     _safe_print("• Global configs (~/.claude/) require absolute path")
 
     if is_http:
+        _safe_print("\n• HTTP mode: Server accessible at")
         _safe_print(
-            f"\n• HTTP mode: Server accessible at http://localhost:{getattr(args, 'port', 3000)}"
+            f"  http://localhost:{getattr(args, 'port', 3000)}"
         )
         _safe_print("• HTTP mode can print setup instructions safely")
 

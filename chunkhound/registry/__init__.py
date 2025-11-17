@@ -305,8 +305,13 @@ class ProviderRegistry:
             )
 
         # Connect and register
-        provider.connect()
-        self.register_provider("database", provider, singleton=True)
+        # In MCP mode, defer opening the DuckDB connection to the server lifecycle
+        # to avoid cross-process lock conflicts for RO followers.
+        if os.environ.get("CHUNKHOUND_MCP_MODE") == "1":
+            self.register_provider("database", provider, singleton=True)
+        else:
+            provider.connect()
+            self.register_provider("database", provider, singleton=True)
 
     def _setup_embedding_provider(self) -> None:
         """Create and register the embedding provider if configured."""

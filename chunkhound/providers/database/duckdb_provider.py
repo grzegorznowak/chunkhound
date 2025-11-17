@@ -41,6 +41,7 @@ from chunkhound.providers.database.serial_executor import (
     _executor_local,
     track_operation,
 )
+from chunkhound.providers.database.locks import LockManager  # new: auto-role locking
 
 # Type hinting only
 if TYPE_CHECKING:
@@ -107,6 +108,14 @@ class DuckDBProvider(SerialDatabaseProvider):
             }
         }
 
+        # Auto-role (RW/RO) integration
+        self._lock_manager: LockManager | None = None
+        self._auto_role_enabled: bool = False
+        self._read_only: bool = False
+        self._current_role: str | None = None
+        self._role_monitor_thread = None
+        self._role_monitor_stop = None
+
     def _create_connection(self) -> Any:
         """Create and return a DuckDB connection.
 
@@ -126,12 +135,15 @@ class DuckDBProvider(SerialDatabaseProvider):
 
         # Create a NEW connection for the executor thread
         # This ensures thread safety - only this thread will use this connection
-        conn = duckdb.connect(str(self._connection_manager.db_path))
+        conn = duckdb.connect(
+            str(self._connection_manager.db_path), read_only=getattr(self, "_read_only", False)
+        )
 
-        # Load required extensions
-        conn.execute("INSTALL vss")
-        conn.execute("LOAD vss")
-        conn.execute("SET hnsw_enable_experimental_persistence = true")
+        # Load required extensions (skip for read-only to minimize RO latency)
+        if not getattr(self, "_read_only", False):
+            conn.execute("INSTALL vss")
+            conn.execute("LOAD vss")
+            conn.execute("SET hnsw_enable_experimental_persistence = true")
 
         logger.debug(
             f"Created new DuckDB connection in executor thread {threading.get_ident()}"
@@ -166,6 +178,31 @@ class DuckDBProvider(SerialDatabaseProvider):
         """Check if database connection is active - delegate to connection manager."""
         return self._connection_manager.is_connected
 
+    @property
+    def db_connected(self) -> bool:
+        """Return True if an underlying DuckDB connection is currently open."""
+        return self._connection_manager.is_connected
+
+    def close_connection_only(self) -> None:
+        """Close the underlying DuckDB connection without shutting down the executor.
+
+        This is safe for read/write idling windows; subsequent operations can
+        re-establish the connection via `connect()`.
+        """
+        try:
+            # Close thread-local executor connection first to truly release file locks
+            try:
+                if hasattr(self, "_executor") and self._executor is not None:
+                    # Best-effort; ignores errors
+                    self._executor._force_close_connections()  # type: ignore[attr-defined]
+            except Exception:
+                pass
+            # Also close the connection manager handle if present
+            if self._connection_manager.is_connected:
+                self._connection_manager.disconnect(skip_checkpoint=True)
+        except Exception:
+            pass
+
     def _extract_file_id(self, file_record: dict[str, Any] | File) -> int | None:
         """Safely extract file ID from either dict or File model - delegate to file repository."""
         return self._file_repository._extract_file_id(file_record)
@@ -173,8 +210,57 @@ class DuckDBProvider(SerialDatabaseProvider):
     def connect(self) -> None:
         """Establish database connection and initialize schema with WAL validation."""
         try:
+            # Honor global RW disable in MCP: force provider into RO mode
+            try:
+                from chunkhound.utils.mcp_env import rw_disabled
+
+                if rw_disabled():
+                    self._read_only = True
+            except Exception:
+                pass
+            # Auto-role: acquire lock and set role before opening connections
+            if self._auto_role_enabled and self._lock_manager is not None:
+                role = self._lock_manager.acquire()
+                self._current_role = role
+                self._read_only = role == "RO"
+                if not os.environ.get("CHUNKHOUND_MCP_MODE"):
+                    logger.debug(f"DuckDBProvider auto-role acquired: {role}")
+
+            # SAFETY: In RO role, avoid creating/connecting to a missing DB file.
+            # This lets follower MCP processes start before the leader creates the DB.
+            try:
+                db_path = self._connection_manager.db_path
+                db_path_str = str(db_path)
+                is_memory = db_path_str == ":memory:"
+                if self._read_only and not is_memory:
+                    from pathlib import Path as _Path
+                    if not _Path(db_path_str).exists():
+                        if not os.environ.get("CHUNKHOUND_MCP_MODE"):
+                            logger.debug("Read-only with missing DB: deferring connection")
+                        # Do not establish a DuckDB connection now; watcher may promote us later
+                        return
+            except Exception:
+                # Best effort only; fall through to normal connection
+                pass
+
             # Initialize connection manager FIRST - this handles WAL validation
-            self._connection_manager.connect()
+            try:
+                self._connection_manager.connect(read_only=self._read_only)
+            except Exception as e:
+                # DuckDB limitation: within a single process, opening multiple
+                # connections to the same DB with different read_only configs
+                # raises: "Can't open a connection to same database file with a different configuration than existing connections".
+                # In RO role, we can safely defer establishing a DB connection;
+                # read operations in MCP/tests don't require an active RO connection.
+                msg = str(e)
+                if self._read_only and "different configuration" in msg:
+                    try:
+                        from loguru import logger as _logger
+                        _logger.debug("RO connect deferred due to existing RW connection in-process")
+                    except Exception:
+                        pass
+                    return
+                raise
 
             # Call parent connect which handles executor initialization
             super().connect()
@@ -183,6 +269,190 @@ class DuckDBProvider(SerialDatabaseProvider):
             logger.error(f"DuckDB connection failed: {e}")
             raise
 
+    # ---- Auto-role public helpers ----
+
+    def enable_auto_role(
+        self,
+        *,
+        lock_path: str | Path,
+        heartbeat_ms: int = 1000,
+        lease_ttl_ms: int = 5000,
+        election_min_ms: int = 150,
+        election_max_ms: int = 600,
+    ) -> None:
+        """Enable RW/RO auto-role with a shared lock file.
+
+        Must be called before connect().
+        """
+        self._lock_manager = LockManager(
+            lock_path,
+            heartbeat_ms=heartbeat_ms,
+            lease_ttl_ms=lease_ttl_ms,
+            election_min_ms=election_min_ms,
+            election_max_ms=election_max_ms,
+        )
+        self._auto_role_enabled = True
+
+    def start_role_watcher(self) -> None:
+        """Start background watcher for auto-promotion (idempotent)."""
+        if self._lock_manager is not None:
+            self._lock_manager.start_watcher()
+        # Provider-level role monitor to reopen connections as needed
+        if self._role_monitor_thread and self._role_monitor_thread.is_alive():
+            return
+        import threading, time
+        self._role_monitor_stop = threading.Event()
+
+        def _monitor():
+            last_role = self._current_role or (self._lock_manager.get_role() if self._lock_manager else None)
+            while not self._role_monitor_stop.is_set():
+                try:
+                    new_role = self._lock_manager.get_role() if self._lock_manager else None
+                    if new_role in ("RW", "RO") and new_role != last_role:
+                        self._apply_role_change(new_role)
+                        last_role = new_role
+                except Exception:
+                    pass
+                time.sleep(0.2)
+
+        t = threading.Thread(target=_monitor, name="ProviderRoleMonitor", daemon=True)
+        self._role_monitor_thread = t
+        t.start()
+
+    def stop_role_watcher(self) -> None:
+        """Stop background role watcher (idempotent)."""
+        try:
+            if self._lock_manager is not None:
+                self._lock_manager.stop_watcher()
+        except Exception:
+            pass
+        try:
+            if self._role_monitor_stop is not None:
+                self._role_monitor_stop.set()
+        except Exception:
+            pass
+        try:
+            if self._role_monitor_thread and self._role_monitor_thread.is_alive():
+                self._role_monitor_thread.join(timeout=1.0)
+        except Exception:
+            pass
+        self._role_monitor_thread = None
+        self._role_monitor_stop = None
+
+    def get_role(self) -> str | None:
+        """Return current role according to LockManager."""
+        # Prefer the provider's last applied role if set
+        if getattr(self, "_current_role", None) in ("RW", "RO"):
+            return self._current_role  # type: ignore[return-value]
+        if self._lock_manager is None:
+            return "RW"  # default behavior when auto-role is disabled
+        return self._lock_manager.get_role()
+
+    def try_acquire_role_only(self) -> str | None:
+        """Acquire auto-role (via LockManager) without opening a DB connection.
+
+        Returns current role after acquisition ("RW" or "RO"). If auto-role is
+        disabled or acquisition fails, returns the last known role or None.
+        """
+        try:
+            if not self._auto_role_enabled or self._lock_manager is None:
+                return self._current_role
+            if self._current_role in ("RW", "RO"):
+                return self._current_role
+            role = self._lock_manager.acquire()
+            self._current_role = role
+            self._read_only = role == "RO"
+            return role
+        except Exception:
+            return self._current_role
+
+    # ---- Internal role transition helpers ----
+    def _apply_role_change(self, new_role: str) -> None:
+        from loguru import logger
+        try:
+            if new_role not in ("RW", "RO"):
+                return
+            if new_role == self._current_role:
+                return
+            # Update flags
+            self._current_role = new_role
+            self._read_only = new_role == "RO"
+            # If demoting, release exclusive lock so other processes can promote
+            try:
+                if new_role == "RO" and self._lock_manager is not None:
+                    self._lock_manager.force_demote()
+                    # Also stop any role watchers to prevent immediate self-promotion
+                    self.stop_role_watcher()
+            except Exception:
+                pass
+            # Reconnect under new access mode on the serial DB thread to
+            # preserve single-threaded guarantees and avoid DuckDB config races.
+            try:
+                self._execute_in_db_thread_sync(
+                    "reopen_under_current_role", self._read_only
+                )
+            except Exception:
+                # As a fallback (should be rare), attempt inline reopen
+                # to avoid leaving the provider in a stale role.
+                self._reopen_under_current_role()
+            if not os.environ.get("CHUNKHOUND_MCP_MODE"):
+                logger.debug(f"DuckDBProvider switched role to {new_role} and reconnected")
+        except Exception as e:
+            if not os.environ.get("CHUNKHOUND_MCP_MODE"):
+                logger.warning(f"Role change to {new_role} failed: {e}")
+
+    def _reopen_under_current_role(self) -> None:
+        # Close existing executor/connection cleanly
+        try:
+            super().disconnect(skip_checkpoint=False)
+        except Exception:
+            pass
+        try:
+            self._connection_manager.disconnect(skip_checkpoint=True)
+        except Exception:
+            pass
+        # Reopen connection manager and executor with new mode
+        self._connection_manager.connect(read_only=self._read_only)
+        super().connect()
+
+    # Executor-thread operation for safe reopen under role change
+    def _executor_reopen_under_current_role(
+        self, conn: Any, state: dict[str, Any], read_only: bool
+    ) -> None:
+        """Reopen DuckDB connection in the executor thread with the given mode.
+
+        This avoids cross-thread connect/close and ensures DuckDB sees a
+        consistent configuration per-process.
+        """
+        # Close current thread-local connection if present
+        try:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        # Disconnect connection manager (skip checkpoint - handled by caller when needed)
+        try:
+            self._connection_manager.disconnect(skip_checkpoint=True)
+        except Exception:
+            pass
+        # Connect with requested mode
+        self._read_only = bool(read_only)
+        self._connection_manager.connect(read_only=self._read_only)
+        # Create a new connection for the executor thread
+        from chunkhound.providers.database.serial_executor import _executor_local
+        new_conn = self._create_connection()
+        _executor_local.connection = new_conn
+        # In RW, ensure schema/indexes exist
+        if not self._read_only:
+            try:
+                self._executor_create_schema(new_conn, state)
+                self._executor_create_indexes(new_conn, state)
+            except Exception:
+                pass
+
     def _executor_connect(self, conn: Any, state: dict[str, Any]) -> None:
         """Executor method for connect - runs in DB thread.
 
@@ -190,6 +460,11 @@ class DuckDBProvider(SerialDatabaseProvider):
         so this method just ensures schema and indexes are created.
         """
         try:
+            # In read-only mode, skip schema/index creation and WAL cleanup
+            if getattr(self, "_read_only", False):
+                if not os.environ.get("CHUNKHOUND_MCP_MODE"):
+                    logger.debug("Read-only mode: skipping schema/index creation")
+                return
             # Perform WAL cleanup once with synchronization
             with self._wal_cleanup_lock:
                 if not self._wal_cleanup_done:
@@ -251,6 +526,11 @@ class DuckDBProvider(SerialDatabaseProvider):
 
     def disconnect(self, skip_checkpoint: bool = False) -> None:
         """Close database connection with optional checkpointing - delegate to connection manager."""
+        # If we never established a connection (e.g., RO deferral due to in-process
+        # RW connection), there is nothing to close. Avoid creating a connection
+        # during shutdown just to close it.
+        if not self._connection_manager.is_connected and self._read_only:
+            return
         try:
             # Call parent disconnect
             super().disconnect(skip_checkpoint)
@@ -259,6 +539,17 @@ class DuckDBProvider(SerialDatabaseProvider):
             self._connection_manager.disconnect(
                 skip_checkpoint=True
             )  # Skip checkpoint since we did it in executor
+
+    def close(self) -> None:
+        """Close provider and release leadership lock if held."""
+        try:
+            super().close()
+        finally:
+            try:
+                if self._lock_manager is not None:
+                    self._lock_manager.release()
+            except Exception:
+                pass
 
     def _executor_disconnect(
         self, conn: Any, state: dict[str, Any], skip_checkpoint: bool
@@ -1551,6 +1842,10 @@ class DuckDBProvider(SerialDatabaseProvider):
         # PERFORMANCE: 60s → 5s for 10k embeddings (12x speedup)
         # RECOVERY: Indexes recreated after bulk insert
         """
+        # Enforce read-only when in RO role
+        if self.get_role() == "RO":
+            raise RuntimeError("database is read-only (auto-role RO)")
+
         # Note: connection parameter is ignored in executor pattern
         return self._execute_in_db_thread_sync(
             "insert_embeddings_batch", embeddings_data, batch_size
@@ -2344,7 +2639,20 @@ class DuckDBProvider(SerialDatabaseProvider):
             return []
 
     def get_stats(self) -> dict[str, int]:
-        """Get database statistics (file count, chunk count, etc.)."""
+        """Get database statistics (file count, chunk count, etc.).
+
+        In RO follower mode without an established connection, avoid opening a
+        DuckDB connection just to compute stats. This keeps followers passive
+        until they are promoted or an operation truly requires DB access.
+        """
+        try:
+            if getattr(self, "_read_only", False):
+                # Avoid connecting implicitly in RO mode
+                cm = getattr(self, "_connection_manager", None)
+                if cm is not None and not cm.is_connected:
+                    return {"files": 0, "chunks": 0, "embeddings": 0, "size_mb": 0, "providers": 0}
+        except Exception:
+            pass
         return self._execute_in_db_thread_sync("get_stats")
 
     def _executor_get_stats(self, conn: Any, state: dict[str, Any]) -> dict[str, int]:

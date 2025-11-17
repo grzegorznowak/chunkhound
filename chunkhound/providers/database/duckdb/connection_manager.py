@@ -46,6 +46,7 @@ class DuckDBConnectionManager:
         self._db_path = db_path
         self.connection: Any | None = None
         self.config = config
+        self._read_only: bool = False
 
         # Note: Thread safety is now handled by DuckDBProvider's executor pattern
         # All database operations are serialized to a single thread
@@ -60,7 +61,7 @@ class DuckDBConnectionManager:
         """Check if database connection is active."""
         return self.connection is not None
 
-    def connect(self) -> None:
+    def connect(self, read_only: bool = False) -> None:
         """Establish database connection and initialize schema with WAL validation."""
         logger.info(f"Connecting to DuckDB database: {self.db_path}")
 
@@ -72,15 +73,30 @@ class DuckDBConnectionManager:
             if duckdb is None:
                 raise ImportError("duckdb not available")
 
-            # Connect to database with WAL validation
-            # Thread safety is now handled by DuckDBProvider's executor pattern
-            self._preemptive_wal_cleanup()
+            # Store desired access mode (respect global RW disable in MCP)
+            try:
+                from chunkhound.utils.mcp_env import rw_disabled
+
+                if rw_disabled():
+                    read_only = True
+            except Exception:
+                pass
+            self._read_only = bool(read_only)
+
+            # Connect to database with validation. In read-only mode we avoid
+            # preemptive WAL cleanup because that requires write access.
+            if not self._read_only:
+                self._preemptive_wal_cleanup()
             self._connect_with_wal_validation()
 
             logger.info("DuckDB connection established")
 
             # Load required extensions
-            self._load_extensions()
+            # Optimization: skip extension load for read-only connections to
+            # minimize latency for regex-only RO readers (extensions will be
+            # loaded lazily in provider executor when needed for semantic ops).
+            if not self._read_only:
+                self._load_extensions()
 
             # Note: Schema and index creation is now handled by DuckDBProvider's executor
 
@@ -93,8 +109,8 @@ class DuckDBConnectionManager:
     def _connect_with_wal_validation(self) -> None:
         """Connect to DuckDB with WAL corruption detection and automatic cleanup."""
         try:
-            # Attempt initial connection
-            self.connection = duckdb.connect(str(self.db_path))
+            # Attempt initial connection respecting access mode
+            self.connection = duckdb.connect(str(self.db_path), read_only=self._read_only)
             logger.debug("DuckDB connection successful")
 
         except duckdb.Error as e:
@@ -107,7 +123,7 @@ class DuckDBConnectionManager:
 
                 # Retry connection after WAL cleanup
                 try:
-                    self.connection = duckdb.connect(str(self.db_path))
+                    self.connection = duckdb.connect(str(self.db_path), read_only=self._read_only)
                     logger.info("DuckDB connection successful after WAL cleanup")
                 except Exception as retry_error:
                     logger.error(

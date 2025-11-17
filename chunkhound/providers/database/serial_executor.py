@@ -91,6 +91,36 @@ class SerialDatabaseExecutor:
             max_workers=1,  # Hardcoded - not configurable
             thread_name_prefix="serial-db",
         )
+        # Guard re-initialization in rare cases where users call disconnect()
+        # and then attempt more DB work in the same process.
+        self._reinit_lock = threading.Lock()
+
+    def _reinit_executor(self) -> None:
+        """Recreate the executor if it was previously shut down.
+
+        This preserves SINGLE_THREADED_ONLY semantics while allowing
+        short-lived connection patterns that close the provider between
+        calls. Safe to call concurrently (double-checked under lock).
+        """
+        # A tiny no-op submit to check liveness; if it fails, recreate.
+        try:
+            fut = self._db_executor.submit(lambda: None)
+            fut.result(timeout=0.01)
+            return  # still alive
+        except Exception:
+            pass
+        with self._reinit_lock:
+            # Double check after acquiring the lock
+            try:
+                fut2 = self._db_executor.submit(lambda: None)
+                fut2.result(timeout=0.01)
+                return
+            except Exception:
+                pass
+            # Create a brand new single-threaded executor
+            self._db_executor = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="serial-db"
+            )
 
     def execute_sync(
         self, provider: Any, operation_name: str, *args: Any, **kwargs: Any
@@ -129,7 +159,15 @@ class SerialDatabaseExecutor:
             return op_func(conn, state, *args, **kwargs)
 
         # Run in executor synchronously with timeout (env override)
-        future = self._db_executor.submit(executor_operation)
+        try:
+            future = self._db_executor.submit(executor_operation)
+        except RuntimeError as e:
+            # Handle "cannot schedule new futures after shutdown" gracefully
+            if "after shutdown" in str(e):
+                self._reinit_executor()
+                future = self._db_executor.submit(executor_operation)
+            else:
+                raise
         import os
         try:
             timeout_s = float(os.getenv("CHUNKHOUND_DB_EXECUTE_TIMEOUT", "30"))
@@ -184,9 +222,17 @@ class SerialDatabaseExecutor:
         ctx = contextvars.copy_context()
 
         # Run in executor with context
-        return await loop.run_in_executor(
-            self._db_executor, ctx.run, executor_operation
-        )
+        try:
+            return await loop.run_in_executor(
+                self._db_executor, ctx.run, executor_operation
+            )
+        except RuntimeError as e:
+            if "after shutdown" in str(e):
+                self._reinit_executor()
+                return await loop.run_in_executor(
+                    self._db_executor, ctx.run, executor_operation
+                )
+            raise
 
     def shutdown(self, wait: bool = True) -> None:
         """Shutdown the executor with proper cleanup.

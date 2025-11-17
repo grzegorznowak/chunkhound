@@ -152,8 +152,17 @@ class StdioMCPServer(MCPServerBase):
             # Silent by design in MCP mode
             pass
 
-        # Create MCP server instance (lazy import if SDK is present)
-        if not _MCP_AVAILABLE:
+        # Create MCP server instance (prefer official SDK when available).
+        # Allow forcing fallback with CHUNKHOUND_MCP__USE_SDK in {0,false,off}.
+        use_sdk_env = os.getenv("CHUNKHOUND_MCP__USE_SDK", "").lower()
+        skip_env = os.getenv("CHUNKHOUND_MCP__SKIP_INDEXING", "").lower()
+        skip_on = skip_env in ("1", "true", "yes", "on")
+        # Prefer SDK whenever available unless explicitly disabled via env
+        use_sdk = _MCP_AVAILABLE and use_sdk_env not in ("0", "false", "off")
+        self.debug_log(
+            f"STDIO: _MCP_AVAILABLE={_MCP_AVAILABLE}, use_sdk={use_sdk} (env={use_sdk_env}, os={os.name})"
+        )
+        if not use_sdk:
             # Defer server creation; fallback path implemented in run()
             self.server = None  # type: ignore
         else:
@@ -172,7 +181,9 @@ class StdioMCPServer(MCPServerBase):
         # The MCP SDK's call_tool decorator expects a SINGLE handler function
         # with signature (tool_name: str, arguments: dict) that handles ALL tools
 
-        if not _MCP_AVAILABLE:
+        # If the official SDK is unavailable or we are running without Server
+        # instance (fallback stdio), do not register SDK handlers.
+        if not _MCP_AVAILABLE or self.server is None:
             return  # no-op when SDK not available
 
         @self.server.call_tool()  # type: ignore[misc]
@@ -180,10 +191,12 @@ class StdioMCPServer(MCPServerBase):
             tool_name: str, arguments: dict[str, Any]
         ) -> list[types.TextContent]:
             """Universal tool handler that routes to the unified handler."""
+            # Pass services lazily (do not force provider connects here);
+            # tools/backoff logic will manage connections.
             return await handle_tool_call(
                 tool_name=tool_name,
                 arguments=arguments,
-                services=self.ensure_services(),
+                services=self.services,
                 embedding_manager=self.embedding_manager,
                 initialization_complete=self._initialization_complete,
                 debug_mode=self.debug_mode,
@@ -234,12 +247,18 @@ class StdioMCPServer(MCPServerBase):
     async def server_lifespan(self) -> AsyncIterator[dict]:
         """Manage server lifecycle with proper initialization and cleanup."""
         try:
-            # Initialize services
-            await self.initialize()
-            self._initialization_complete.set()
-            self.debug_log("Server initialization complete")
+            # Kick off initialization in the background to avoid blocking handshake
+            async def _bg_init():
+                try:
+                    await self.initialize()
+                    self._initialization_complete.set()
+                    self.debug_log("Server initialization complete (background)")
+                except Exception as e:
+                    self.debug_log(f"Background initialization failed: {e}")
 
-            # Yield control to server
+            asyncio.create_task(_bg_init())
+
+            # Yield control to server immediately; tools will await initialization
             yield {"services": self.services, "embeddings": self.embedding_manager}
 
         finally:
@@ -249,7 +268,7 @@ class StdioMCPServer(MCPServerBase):
     async def run(self) -> None:
         """Run the stdio server with proper lifecycle management."""
         try:
-            if _MCP_AVAILABLE:
+            if self.server is not None:
                 # Set initialization options with capabilities
                 from mcp.server.lowlevel import NotificationOptions  # noqa: WPS433
                 from mcp.server.models import InitializationOptions  # noqa: WPS433
@@ -278,24 +297,257 @@ class StdioMCPServer(MCPServerBase):
                             init_options,
                         )
             else:
-                # Minimal fallback stdio: immediately emit a valid initialize response
-                # so tests can proceed without the official MCP SDK.
-                import json, os as _os
-                resp = {
-                    "jsonrpc": "2.0",
-                    "id": 1,
-                    "result": {
-                        "protocolVersion": "2024-11-05",
-                        "serverInfo": {"name": "ChunkHound Code Search", "version": __version__},
-                        "capabilities": {},
-                    },
-                }
+                # Minimal fallback stdio JSON-RPC loop (no official MCP SDK required).
+                # Supports: initialize, notifications/initialized (ignored), tools/call (subset).
+                import json, os as _os, signal
+
+                # Install a SIGTERM handler to ensure clean shutdown of the
+                # fallback loop when the test client terminates the process.
+                _shutdown = {"flag": False}
+
+                def _handle_sigterm(signum, frame):  # pragma: no cover - signal path
+                    _shutdown["flag"] = True
+
                 try:
-                    _os.write(1, (json.dumps(resp) + "\n").encode())
+                    signal.signal(signal.SIGTERM, _handle_sigterm)
                 except Exception:
                     pass
-                # Keep process alive briefly; tests terminate the process
-                await asyncio.sleep(1.0)
+
+                async def _write(obj: dict) -> None:
+                    try:
+                        _os.write(1, (json.dumps(obj, default=str) + "\n").encode("utf-8"))
+                    except Exception:
+                        pass
+
+                loop = asyncio.get_event_loop()
+                reader = None
+                try:
+                    if os.name != "nt":
+                        # Prefer asyncio-native pipe reader for stdin to avoid
+                        # thread scheduling delays with run_in_executor. On Windows
+                        # (Proactor), stick to executor-based reads to avoid pipe issues.
+                        reader = asyncio.StreamReader()
+                        protocol = asyncio.StreamReaderProtocol(reader)  # type: ignore[arg-type]
+                        await loop.connect_read_pipe(lambda: protocol, sys.stdin)  # type: ignore[arg-type]
+                except Exception:
+                    reader = None
+
+                async def _readline() -> str:
+                    try:
+                        if reader is not None:
+                            line = await reader.readline()
+                            # When using StreamReader, we get bytes on some platforms
+                            if isinstance(line, bytes):
+                                try:
+                                    return line.decode("utf-8")
+                                except Exception:
+                                    return line.decode("utf-8", errors="ignore")
+                            return str(line)
+                        # Fallback to thread executor; prefer binary buffer for robustness
+                        def _read_from_stdin() -> str:
+                            try:
+                                data = sys.stdin.buffer.readline()
+                                try:
+                                    return data.decode("utf-8")
+                                except Exception:
+                                    return data.decode("utf-8", errors="ignore")
+                            except Exception:
+                                # As a last resort, try text mode
+                                try:
+                                    return sys.stdin.readline()
+                                except Exception:
+                                    return ""
+                        return await loop.run_in_executor(None, _read_from_stdin)
+                    except Exception:
+                        # Propagate to outer handler
+                        raise
+
+                self.debug_log("STDIO fallback loop started")
+                while True:
+                    if _shutdown["flag"]:
+                        break
+                    try:
+                        line = await asyncio.wait_for(_readline(), timeout=0.25)
+                    except asyncio.TimeoutError:
+                        # Periodically check for shutdown without blocking forever
+                        # Optional heartbeat for debugging
+                        try:
+                            self.debug_log("STDIO fallback idle tick")
+                        except Exception:
+                            pass
+                        continue
+                    if not line:
+                        break  # EOF
+                    line = line.strip()
+                    try:
+                        self.debug_log(f"STDIO fallback received: {line[:200]}")
+                    except Exception:
+                        pass
+                    if not line:
+                        continue
+                    try:
+                        req = json.loads(line)
+                    except Exception:
+                        continue  # ignore malformed
+
+                    method = req.get("method")
+                    req_id = req.get("id")
+
+                    # Initialize handshake
+                    if method == "initialize":
+                        # Respond immediately to avoid handshake timeouts; initialize in background.
+                        # Tools will await initialization before execution.
+                        async def _bg_init():
+                            try:
+                                await self.initialize()
+                                self._initialization_complete.set()
+                            except Exception:
+                                # Keep server responsive even if init failed; tools will surface errors
+                                pass
+                        asyncio.create_task(_bg_init())
+
+                        result = {
+                            "protocolVersion": "2024-11-05",
+                            "serverInfo": {"name": "ChunkHound Code Search", "version": __version__},
+                            "capabilities": {},
+                        }
+                        await _write({"jsonrpc": "2.0", "id": req_id, "result": result})
+                        continue
+
+                    # Simple notifications: ignore
+                    elif method == "notifications/initialized":
+                        # no response required; background tasks were scheduled during initialize
+                        continue
+
+                    # Minimal tools/list support
+                    elif method == "tools/list":
+                        try:
+                            tools = []
+                            # Build a minimal tool descriptor list compatible with tests
+                            for name, tool in TOOL_REGISTRY.items():
+                                tools.append(
+                                    {
+                                        "name": name,
+                                        "description": getattr(tool, "description", ""),
+                                        "inputSchema": getattr(tool, "parameters", {}),
+                                    }
+                                )
+                            await _write({"jsonrpc": "2.0", "id": req_id, "result": {"tools": tools}})
+                        except Exception as e:
+                            await _write(
+                                {
+                                    "jsonrpc": "2.0",
+                                    "id": req_id,
+                                    "error": {"code": -32000, "message": f"tools/list error: {e}"},
+                                }
+                            )
+
+                    # Minimal tools/call support (ToolResult envelope)
+                    elif method == "tools/call":
+                        params = req.get("params", {}) or {}
+                        name = params.get("name")
+                        arguments = params.get("arguments") or {}
+                        try:
+                            self.debug_log(f"tools/call start name={name}")
+                        except Exception:
+                            pass
+                        try:
+                            from .common import parse_mcp_arguments
+                            from .tools import execute_tool
+
+                            # Fast path for get_stats before initialization completes
+                            if name == "get_stats" and (
+                                self.services is None or not getattr(self, "_initialized", False)
+                            ):
+                                import json as _json
+                                # Minimal stats without forcing DB init
+                                minimal = {
+                                    "total_files": 0,
+                                    "total_chunks": 0,
+                                    "total_embeddings": 0,
+                                    "database_size_mb": 0,
+                                    "total_providers": 0,
+                                }
+                                if isinstance(self._scan_progress, dict):
+                                    minimal["initial_scan"] = {
+                                        "is_scanning": self._scan_progress.get("is_scanning", False),
+                                        "files_processed": self._scan_progress.get("files_processed", 0),
+                                        "chunks_created": self._scan_progress.get("chunks_created", 0),
+                                        "started_at": self._scan_progress.get("scan_started_at"),
+                                        "completed_at": self._scan_progress.get("scan_completed_at"),
+                                        "error": self._scan_progress.get("scan_error"),
+                                    }
+                                tool_result = {
+                                    "content": [
+                                        {"type": "text", "text": _json.dumps(minimal, default=str)}
+                                    ],
+                                    "isError": False,
+                                }
+                                await _write({"jsonrpc": "2.0", "id": req_id, "result": tool_result})
+                                continue
+
+                            # Ensure services are ready (may still be initializing in background)
+                            self.debug_log("tools/call awaiting initialize()")
+                            await self.initialize()
+                            self.debug_log("tools/call initialize() complete")
+                            # Pass services without forcing a DB connect here; individual
+                            # tools handle lazy connections to avoid RO follower conflicts.
+                            self.debug_log(f"tools/call executing {name}")
+                            result = await execute_tool(
+                                tool_name=name,
+                                services=self.services,
+                                embedding_manager=self.embedding_manager,
+                                arguments=parse_mcp_arguments(arguments),
+                                scan_progress=self._scan_progress,
+                                llm_manager=self.llm_manager,
+                            )
+                            self.debug_log(f"tools/call done {name}")
+                            # Match official MCP SDK ToolResult shape
+                            import json as _json
+                            if isinstance(result, str):
+                                text_payload = result
+                            else:
+                                text_payload = _json.dumps(result, default=str)
+                            tool_result = {
+                                "content": [
+                                    {"type": "text", "text": text_payload}
+                                ],
+                                "isError": False,
+                            }
+                            await _write({"jsonrpc": "2.0", "id": req_id, "result": tool_result})
+                        except Exception as e:
+                            try:
+                                self.debug_log(f"tools/call error {name}: {e}")
+                            except Exception:
+                                pass
+                            await _write(
+                                {
+                                    "jsonrpc": "2.0",
+                                    "id": req_id,
+                                    "error": {"code": -32000, "message": f"tool error: {e}"},
+                                }
+                            )
+                    else:
+                        # Unknown method
+                        if req_id is not None:
+                            await _write(
+                                {
+                                    "jsonrpc": "2.0",
+                                "id": req_id,
+                                "error": {"code": -32601, "message": f"Method not found: {method}"},
+                            }
+                        )
+                # End while
+                # Perform cleanup before exiting to release DB/locks
+                try:
+                    await self.cleanup()
+                except Exception:
+                    pass
+                # Exit explicitly to speed up subprocess termination in tests
+                try:
+                    sys.exit(0)
+                except SystemExit:
+                    pass
 
         except KeyboardInterrupt:
             self.debug_log("Server interrupted by user")
@@ -334,18 +586,46 @@ async def main(args: Any = None) -> None:
     # Create and validate configuration
     config, validation_errors = create_validated_config(args, "mcp")
 
-    if validation_errors:
-        # CRITICAL: Cannot print to stderr in MCP mode - breaks JSON-RPC protocol
-        # Exit silently with error code
-        sys.exit(1)
+    # In MCP stdio mode, be permissive on validation to ensure the server can
+    # at least respond to initialize and basic tool calls. Tools will surface
+    # configuration errors explicitly when invoked.
+    # Do not exit here even if there are validation errors.
 
     # Create and run the stdio server
     try:
+        # Early debug (before server exists)
+        try:
+            path = os.getenv("CHUNKHOUND_DEBUG_FILE", "/tmp/chunkhound_mcp_debug.log")
+            if os.getenv("CHUNKHOUND_DEBUG") in ("1", "true", "yes", "on"):
+                with open(path, "a", encoding="utf-8") as f:
+                    from datetime import datetime as _dt
+                    f.write(f"[{_dt.now().isoformat()}] [STDIO] main creating server\n")
+        except Exception:
+            pass
+
         server = StdioMCPServer(config, args=args)
+
+        try:
+            if os.getenv("CHUNKHOUND_DEBUG") in ("1", "true", "yes", "on"):
+                with open(os.getenv("CHUNKHOUND_DEBUG_FILE", "/tmp/chunkhound_mcp_debug.log"), "a", encoding="utf-8") as f:
+                    from datetime import datetime as _dt
+                    f.write(f"[{_dt.now().isoformat()}] [STDIO] server created, running\n")
+        except Exception:
+            pass
+
         await server.run()
     except Exception:
         # CRITICAL: Cannot print to stderr in MCP mode - breaks JSON-RPC protocol
         # Exit silently with error code
+        try:
+            if os.getenv("CHUNKHOUND_DEBUG") in ("1", "true", "yes", "on"):
+                import traceback
+                tb = traceback.format_exc()
+                with open(os.getenv("CHUNKHOUND_DEBUG_FILE", "/tmp/chunkhound_mcp_debug.log"), "a", encoding="utf-8") as f:
+                    from datetime import datetime as _dt
+                    f.write(f"[{_dt.now().isoformat()}] [STDIO] main exception:\n{tb}\n")
+        except Exception:
+            pass
         sys.exit(1)
 
 

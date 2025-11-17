@@ -17,9 +17,29 @@ See: https://docs.python.org/3/library/asyncio-subprocess.html#asyncio-subproces
 import asyncio
 import json
 import logging
+import os
+import time
 from typing import Any, cast
 
 logger = logging.getLogger(__name__)
+
+
+def _env_true(val: str | None) -> bool:
+    if not val:
+        return False
+    return str(val).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _dbg(msg: str) -> None:
+    try:
+        if not (_env_true(os.getenv("CH_TEST_JSONRPC_DEBUG")) or _env_true(os.getenv("CHUNKHOUND_DEBUG"))):
+            return
+        path = os.getenv("CH_TEST_JSONRPC_DEBUG_FILE") or os.getenv("CHUNKHOUND_DEBUG_FILE") or "/tmp/chunkhound_jsonrpc_debug.log"
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(f"[{time.time():.6f}] [JSONRPC] {msg}\n")
+            f.flush()
+    except Exception:
+        pass
 
 
 class SubprocessJsonRpcError(Exception):
@@ -113,6 +133,7 @@ class SubprocessJsonRpcClient:
         if self._reader_task is not None:
             raise RuntimeError("Client already started")
 
+        _dbg("client.start -> spawning reader task")
         self._reader_task = asyncio.create_task(self._read_responses())
 
     async def send_request(
@@ -159,23 +180,30 @@ class SubprocessJsonRpcClient:
 
         try:
             request_json = json.dumps(request) + "\n"
+            _dbg(f"send_request id={request_id} method={method} bytes={len(request_json)}")
             # stdin is guaranteed to exist by __init__ check
             assert self._process.stdin is not None
             self._process.stdin.write(request_json.encode("utf-8"))
+            _dbg(f"send_request write ok id={request_id}")
             try:
                 await self._process.stdin.drain()
+                _dbg(f"send_request drain ok id={request_id}")
             except (BrokenPipeError, ConnectionResetError) as e:
                 # Subprocess crashed before we could send
+                _dbg(f"send_request drain crash id={request_id} err={e}")
                 raise SubprocessCrashError(
                     f"Subprocess crashed during request send: {e}"
                 ) from e
 
             # Wait for response with timeout
             try:
+                _dbg(f"awaiting response id={request_id} timeout={timeout}")
                 response = await asyncio.wait_for(response_future, timeout=timeout)
+                _dbg(f"response received id={request_id}")
             except asyncio.TimeoutError:
                 # Clean up pending request
                 self._pending_requests.pop(request_id, None)
+                _dbg(f"timeout id={request_id} method={method} after={timeout}s")
                 raise JsonRpcTimeoutError(
                     f"Request {method} (id={request_id}) timed out after {timeout}s"
                 )
@@ -191,11 +219,35 @@ class SubprocessJsonRpcClient:
 
             # Return result
             if "result" not in response:
+                _dbg(f"malformed response id={request_id}: {response}")
                 raise SubprocessJsonRpcError(
                     f"Response missing 'result' field: {response}"
                 )
 
-            return cast(dict[str, Any], response["result"])
+            result_obj = response["result"]
+            # Compatibility: unwrap MCP ToolResult shape into a plain dict when possible
+            # Expected shape from official MCP SDK: { content: [ { type: 'text', text: '{json}' } ], isError: false }
+            if (
+                method == "tools/call"
+                and isinstance(result_obj, dict)
+                and isinstance(result_obj.get("content"), list)
+                and result_obj["content"]
+                and isinstance(result_obj["content"][0], dict)
+                and "text" in result_obj["content"][0]
+            ):
+                try:
+                    text = result_obj["content"][0]["text"]
+                    parsed = json.loads(text)
+                    if isinstance(parsed, dict):
+                        # Compatibility: return parsed fields while preserving original content
+                        merged: dict[str, Any] = {**parsed}
+                        merged.setdefault("content", result_obj["content"])  # expose ToolResult for tests expecting it
+                        return merged
+                except Exception:
+                    # Fall through to returning raw result
+                    pass
+
+            return cast(dict[str, Any], result_obj)
 
         except Exception:
             # Clean up pending request on any error
@@ -230,11 +282,14 @@ class SubprocessJsonRpcClient:
         notification_json = json.dumps(notification) + "\n"
         # stdin is guaranteed to exist by __init__ check
         assert self._process.stdin is not None
+        _dbg(f"send_notification method={method} bytes={len(notification_json)}")
         self._process.stdin.write(notification_json.encode("utf-8"))
         try:
             await self._process.stdin.drain()
+            _dbg(f"send_notification drain ok method={method}")
         except (BrokenPipeError, ConnectionResetError) as e:
             # Subprocess crashed before we could send
+            _dbg(f"send_notification drain crash method={method} err={e}")
             raise SubprocessCrashError(
                 f"Subprocess crashed during notification send: {e}"
             ) from e
@@ -250,12 +305,25 @@ class SubprocessJsonRpcClient:
 
         self._closed = True
 
-        # Cancel background reader task
+        # Proactively terminate subprocess first to unblock reader fast
+        if self._process.returncode is None:
+            self._process.terminate()
+            try:
+                await asyncio.wait_for(self._process.wait(), timeout=1.5)
+            except asyncio.TimeoutError:
+                logger.warning("Subprocess didn't terminate, killing it")
+                self._process.kill()
+                try:
+                    await asyncio.wait_for(self._process.wait(), timeout=1.5)
+                except asyncio.TimeoutError:
+                    logger.warning("Subprocess didn't die after SIGKILL; continuing shutdown")
+
+        # Cancel background reader task with timeout tolerance
         if self._reader_task is not None:
             self._reader_task.cancel()
             try:
-                await self._reader_task
-            except asyncio.CancelledError:
+                await asyncio.wait_for(self._reader_task, timeout=0.5)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
                 pass
 
         # Cancel all pending requests
@@ -263,16 +331,6 @@ class SubprocessJsonRpcClient:
             if not future.done():
                 future.cancel()
         self._pending_requests.clear()
-
-        # Terminate subprocess
-        if self._process.returncode is None:
-            self._process.terminate()
-            try:
-                await asyncio.wait_for(self._process.wait(), timeout=2.0)
-            except asyncio.TimeoutError:
-                logger.warning("Subprocess didn't terminate, killing it")
-                self._process.kill()
-                await self._process.wait()
 
     async def _read_responses(self) -> None:
         """Background task that continuously reads responses from stdout.
@@ -290,26 +348,31 @@ class SubprocessJsonRpcClient:
                     line_bytes = await self._process.stdout.readline()
                 except Exception as e:
                     logger.error(f"Error reading from subprocess: {e}")
+                    _dbg(f"reader exception: {e}")
                     break
 
                 # Check if subprocess terminated
                 if not line_bytes:
                     # EOF - subprocess terminated
+                    _dbg("reader EOF from subprocess")
                     self._handle_subprocess_terminated()
                     break
 
                 # Parse JSON response
                 try:
                     line = line_bytes.decode("utf-8").strip()
+                    _dbg(f"reader line: {line[:200]}")
                     if not line:
                         continue
 
                     response = json.loads(line)
                 except json.JSONDecodeError as e:
                     logger.error(f"Failed to parse JSON response: {line_bytes!r} - {e}")
+                    _dbg(f"reader JSON decode error: {e}")
                     continue
                 except Exception as e:
                     logger.error(f"Error processing response: {e}")
+                    _dbg(f"reader processing error: {e}")
                     continue
 
                 # Match response to pending request
@@ -319,14 +382,17 @@ class SubprocessJsonRpcClient:
 
                     if future is not None and not future.done():
                         future.set_result(response)
+                        _dbg(f"reader matched response id={request_id}")
                     else:
                         logger.warning(
                             "Received response for unknown or completed "
                             f"request id={request_id}"
                         )
+                        _dbg(f"reader unknown response id={request_id}")
                 else:
                     # Notification or other message without id
                     logger.debug(f"Received notification: {response}")
+                    _dbg(f"reader notification: {response}")
 
         except asyncio.CancelledError:
             # Expected during shutdown
@@ -344,6 +410,7 @@ class SubprocessJsonRpcClient:
             "Subprocess terminated unexpectedly "
             f"(exit code: {self._process.returncode})"
         )
+        _dbg(f"reader terminated exit={self._process.returncode}")
 
         for future in self._pending_requests.values():
             if not future.done():

@@ -40,7 +40,7 @@ async def research_command(args: argparse.Namespace, config: Config) -> None:
         sys.exit(1)
 
     # Registry is configured in database_factory.create_services().
-    # Avoid double configuration here to prevent opening the DB twice and causing a self-lock.
+    # Avoid double configuration to prevent opening the DB twice and self-locks.
 
     # Initialize embedding manager (exactly like MCP server)
     embedding_manager = EmbeddingManager()
@@ -109,7 +109,12 @@ async def research_command(args: argparse.Namespace, config: Config) -> None:
 
             # Output the markdown result (already formatted by the service)
             print("\n")  # Add newline after progress output
-            print(result.get("answer", f"Research incomplete: Unable to analyze '{args.query}'. Try a more specific query or check that relevant code exists."))
+            # Break long fallback message across variables to satisfy linters
+            fallback = (
+                f"Research incomplete: Unable to analyze '{args.query}'. "
+                "Try a more specific query or check that relevant code exists."
+            )
+            print(result.get("answer", fallback))
 
         except Exception as e:
             formatter.error(f"Research failed: {e}")

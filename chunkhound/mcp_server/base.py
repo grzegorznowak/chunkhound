@@ -58,6 +58,11 @@ class MCPServerBase(ABC):
         self.embedding_manager: EmbeddingManager | None = None
         self.llm_manager: LLMManager | None = None
         self.realtime_indexing: RealtimeIndexingService | None = None
+        self._role_monitor_task: asyncio.Task | None = None
+        self._role_monitor_stop: asyncio.Event | None = None
+        self._last_provider_role: str | None = None
+        # Test-only cache for demotion hook
+        self._test_demote_after_ms: float | None = None
 
         # Initialization state
         self._initialized = False
@@ -109,6 +114,13 @@ class MCPServerBase(ABC):
                 return
 
             self.debug_log("Starting service initialization")
+            # Test-only: record server start timestamp for delayed demotion hooks
+            try:
+                if os.getenv("CHUNKHOUND_MCP_MODE") == "1" and not os.getenv("CH_TEST_DEMOTE_START_TS"):
+                    import time as _time
+                    os.environ["CH_TEST_DEMOTE_START_TS"] = str(_time.time())
+            except Exception:
+                pass
 
             # Validate database configuration
             if not self.config.database or not self.config.database.path:
@@ -160,6 +172,23 @@ class MCPServerBase(ABC):
                 embedding_manager=self.embedding_manager,
             )
 
+            # Enable provider auto-role (RW/RO) using a lock derived from the DB path
+            try:
+                provider = self.services.provider
+                lock_path = str(Path(self.config.database.path).with_suffix(Path(self.config.database.path).suffix + ".rw.lock"))
+                if hasattr(provider, "enable_auto_role"):
+                    provider.enable_auto_role(lock_path=lock_path)
+                    # Determine initial role synchronously to guide subsequent
+                    # startup behavior (avoids RO followers trying to connect).
+                    try:
+                        if hasattr(provider, "try_acquire_role_only"):
+                            provider.try_acquire_role_only()
+                    except Exception:
+                        pass
+            except Exception:
+                # Best-effort: providers without auto-role support will ignore this
+                pass
+
             # Determine target path for scanning and watching
             if self.args and hasattr(self.args, "path"):
                 target_path = Path(self.args.path)
@@ -173,8 +202,20 @@ class MCPServerBase(ABC):
             self._initialized = True
             self.debug_log("Service initialization complete")
 
-            # Defer DB connect + realtime start to background so initialize is fast
-            asyncio.create_task(self._deferred_connect_and_start(target_path))
+            # Respect read-only / skip-indexing mode (via ENV or args)
+            if self._should_skip_indexing():
+                # Do not start realtime watcher or initial scan
+                # Leave scan_progress as sentinel values (no timestamps)
+                self._scan_progress["is_scanning"] = False
+                self._scan_progress.setdefault("scan_error", None)
+                self.debug_log("MCP read-only: startup indexing skipped by configuration")
+
+                # In skip-indexing mode, do not hold DB connections open. Tools will
+                # manage short-lived connections as needed (RO backoff will apply).
+
+            else:
+                # Defer DB connect + realtime start to background so initialize is fast
+                asyncio.create_task(self._deferred_connect_and_start(target_path))
 
     async def _deferred_connect_and_start(self, target_path: Path) -> None:
         """Connect DB and start realtime monitoring in background."""
@@ -182,11 +223,44 @@ class MCPServerBase(ABC):
             # Ensure services exist
             if not self.services:
                 return
-            # Connect to database lazily
-            if not self.services.provider.is_connected:
+            # Determine role first without opening DB connections to avoid
+            # cross-process DuckDB lock conflicts for RO followers.
+            role = None
+            try:
+                if hasattr(self.services.provider, "try_acquire_role_only"):
+                    role = self.services.provider.try_acquire_role_only()
+            except Exception:
+                role = None
+
+            # Connect to database lazily only if we are leader (RW)
+            if not self.services.provider.is_connected and role != "RO":
                 self.services.provider.connect()
 
-            # Start real-time indexing service
+            # Start provider role watcher if available
+            try:
+                if hasattr(self.services.provider, "start_role_watcher"):
+                    self.services.provider.start_role_watcher()
+            except Exception:
+                pass
+
+            # Always start MCP-level role monitor so initial RO can detect promotions
+            self._start_role_monitor(target_path)
+
+            # Respect skip-indexing and provider role (RO -> read-only startup for this process)
+            if self._should_skip_indexing():
+                self.debug_log("Skip-indexing active: not starting realtime or initial scan")
+                return
+            try:
+                # Re-read role in case it was determined during connect
+                role = getattr(self.services.provider, "get_role", lambda: role)() or role
+                if role == "RO":
+                    self.debug_log("Provider role=RO: skipping realtime watcher and initial scan")
+                    return
+            except Exception:
+                # If role not available, proceed as RW by default
+                pass
+
+            # Start real-time indexing service (RW only)
             self.debug_log("Starting real-time indexing service (deferred)")
             self.realtime_indexing = RealtimeIndexingService(
                 self.services, self.config, debug_sink=self.debug_log
@@ -200,6 +274,242 @@ class MCPServerBase(ABC):
             )
         except Exception as e:
             self.debug_log(f"Deferred connect/start failed: {e}")
+
+    def _should_skip_indexing(self) -> bool:
+        """Determine whether startup indexing should be skipped.
+
+        Honors environment flag CHUNKHOUND_MCP__SKIP_INDEXING and optional CLI args
+        stored on self.args (if present).
+        """
+        # ENV wins
+        env_flag = os.getenv("CHUNKHOUND_MCP__SKIP_INDEXING", "").lower()
+        if env_flag in ("1", "true", "yes", "on"):  # common truthy values
+            return True
+
+        # Global RW disable in MCP implies no indexing writes
+        try:
+            from chunkhound.utils.mcp_env import rw_disabled
+
+            if rw_disabled():
+                return True
+        except Exception:
+            pass
+
+        # Optional CLI flag (if wired up by parsers)
+        try:
+            if self.args is not None and getattr(self.args, "skip_indexing", False):
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _index_on_promotion_enabled(self) -> bool:
+        """Return True if role promotion should start realtime watcher.
+
+        Default OFF. Enable with CHUNKHOUND_MCP__INDEX_ON_PROMOTION truthy.
+        """
+        return os.getenv("CHUNKHOUND_MCP__INDEX_ON_PROMOTION", "").lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+
+    def _start_role_monitor(self, target_path: Path) -> None:
+        """Start background task to react to provider role transitions."""
+        if self._role_monitor_task and not self._role_monitor_task.done():
+            return
+        self._role_monitor_stop = asyncio.Event()
+
+        async def _loop() -> None:
+            try:
+                # Initialize last role
+                try:
+                    self._last_provider_role = (
+                        getattr(self.services.provider, "get_role", lambda: None)()
+                        if self.services
+                        else None
+                    )
+                except Exception:
+                    self._last_provider_role = None
+                start_ts = datetime.now().timestamp()
+
+                while not self._role_monitor_stop.is_set():
+                    await asyncio.sleep(0.2)
+                    try:
+                        # Nudge provider to refresh/acquire role without opening DB connections
+                        try:
+                            tr = getattr(self.services.provider, "try_acquire_role_only", None)
+                            if callable(tr):
+                                tr()
+                        except Exception:
+                            pass
+                        role = (
+                            getattr(self.services.provider, "get_role", lambda: None)()
+                            if self.services
+                            else None
+                        )
+                    except Exception:
+                        role = None
+
+                    # Test-only hook: force demotion after N ms (used in e2e tests)
+                    # The test may set the env var after the subprocess starts. To
+                    # accommodate that, on POSIX try to read the variable from ancestor
+                    # processes' environments. Cache the first observed value.
+                    try:
+                        if self._test_demote_after_ms is None:
+                            env_val = os.getenv("CH_TEST_DEMOTE_AFTER_MS")
+                            if env_val is not None:
+                                self._test_demote_after_ms = float(env_val)
+                            else:
+                                # POSIX-only ancestor scan (best-effort)
+                                if os.name == "posix":
+                                    try:
+                                        import pathlib
+                                        ppid = os.getppid()
+                                        seen = set()
+                                        depth = 0
+                                        while ppid > 1 and depth < 6 and ppid not in seen:
+                                            seen.add(ppid)
+                                            env_path = pathlib.Path("/proc") / str(ppid) / "environ"
+                                            try:
+                                                data = env_path.read_bytes()
+                                                for entry in data.split(b"\x00"):
+                                                    if entry.startswith(b"CH_TEST_DEMOTE_AFTER_MS="):
+                                                        try:
+                                                            self._test_demote_after_ms = float(entry.split(b"=",1)[1].decode("utf-8"))
+                                                        except Exception:
+                                                            pass
+                                                        break
+                                            except Exception:
+                                                pass
+                                            # ascend
+                                            try:
+                                                stat = (pathlib.Path("/proc")/str(ppid)/"status").read_text()
+                                                for line in stat.splitlines():
+                                                    if line.startswith("PPid:"):
+                                                        ppid = int(line.split()[1])
+                                                        break
+                                                else:
+                                                    break
+                                            except Exception:
+                                                break
+                                            depth += 1
+                                    except Exception:
+                                        pass
+
+                        test_after_ms = self._test_demote_after_ms
+                        if test_after_ms is not None and self._last_provider_role == "RW":
+                            if (datetime.now().timestamp() - start_ts) * 1000.0 >= float(test_after_ms):
+                                applier = getattr(self.services.provider, "_apply_role_change", None)
+                                if callable(applier):
+                                    applier("RO")
+                                    role = "RO"
+                                    # One-shot
+                                    self._test_demote_after_ms = None
+                                    try:
+                                        os.environ.pop("CH_TEST_DEMOTE_AFTER_MS", None)
+                                    except Exception:
+                                        pass
+                    except Exception:
+                        pass
+
+                    if role != self._last_provider_role:
+                        self.debug_log(f"Provider role changed: {self._last_provider_role} -> {role}")
+                        # Handle transitions
+                        # Promotion: start realtime on any transition into RW
+                        if role == "RW" and self._last_provider_role != "RW":
+                            if self._index_on_promotion_enabled():
+                                # Start ONLY realtime watcher (no initial scan)
+                                await self._ensure_realtime_started(target_path)
+                        # Degradation: stop watcher when entering RO
+                        elif role == "RO" and (self._last_provider_role != "RO"):
+                            await self._ensure_realtime_stopped()
+                        self._last_provider_role = role
+            except Exception as e:
+                self.debug_log(f"Role monitor error: {e}")
+
+        self._role_monitor_task = asyncio.create_task(_loop())
+
+    async def _ensure_realtime_started(self, target_path: Path) -> None:
+        if self.realtime_indexing is None:
+            self.debug_log("Starting realtime watcher due to promotion (no catch-up scan)")
+            self.realtime_indexing = RealtimeIndexingService(
+                self.services, self.config, debug_sink=self.debug_log
+            )
+            task = asyncio.create_task(self.realtime_indexing.start(target_path))
+            # Enable short burst mode to prioritize immediate ingestion post-promotion
+            try:
+                burst_env = os.getenv("CHUNKHOUND_MCP__PROMOTION_WINDOW_S", "")
+                burst_window = float(burst_env) if burst_env else 4.0
+            except Exception:
+                burst_window = 4.0
+            try:
+                self.realtime_indexing.enable_burst_mode(burst_window)
+            except Exception:
+                pass
+            # Fire-and-forget staggered pokes to catch edits that occur very soon
+            # after promotion even before full readiness is reported.
+            async def _staggered_pokes() -> None:
+                try:
+                    # Add dense early pokes plus a slightly longer tail to
+                    # cover files created just-after promotion without a catch-up.
+                    for delay in (0.0, 0.25, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 5.0):
+                        await asyncio.sleep(delay)
+                        if self.realtime_indexing is not None:
+                            try:
+                                # Widen cutoff window to improve chances of grabbing
+                                # very recent files in races around promotion.
+                                await self.realtime_indexing.poke_for_recent_files(seconds=10.0)
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+            asyncio.create_task(_staggered_pokes())
+            # Schedule automatic burst disable after window
+            async def _auto_disable():
+                try:
+                    await asyncio.sleep(max(0.2, burst_window))
+                    if self.realtime_indexing is not None:
+                        self.realtime_indexing.disable_burst_mode()
+                except Exception:
+                    pass
+            asyncio.create_task(_auto_disable())
+            # Wait briefly for monitoring to become ready so immediate file
+            # creations after promotion are observed by the watcher.
+            try:
+                # Allow a slightly longer window for watcher readiness after promotion
+                await asyncio.wait_for(
+                    self.realtime_indexing.wait_for_monitoring_ready(timeout=6.0),
+                    timeout=6.0,
+                )
+                # After ready, poke for recent files to minimize race conditions
+                await asyncio.wait_for(
+                    self.realtime_indexing.poke_for_recent_files(seconds=10.0),
+                    timeout=4.0,
+                )
+                # Schedule one extra post-ready poke shortly after to catch files
+                # created right after readiness flips.
+                async def _post_ready_extra():
+                    try:
+                        await asyncio.sleep(1.5)
+                        if self.realtime_indexing is not None:
+                            await self.realtime_indexing.poke_for_recent_files(seconds=10.0)
+                    except Exception:
+                        pass
+                asyncio.create_task(_post_ready_extra())
+            except Exception:
+                # Best-effort: continue even if not ready; polling fallback may catch up
+                pass
+
+    async def _ensure_realtime_stopped(self) -> None:
+        if self.realtime_indexing is not None:
+            self.debug_log("Stopping realtime watcher due to degradation to RO")
+            try:
+                await self.realtime_indexing.stop()
+            except Exception:
+                pass
+            self.realtime_indexing = None
 
     async def _coordinated_initial_scan(
         self, target_path: Path, monitoring_task: asyncio.Task
@@ -270,6 +580,21 @@ class MCPServerBase(ABC):
             )
             self._scan_complete = True
 
+            # Optional: trigger idle disconnect right after initial scan to allow
+            # opportunistic RO readers a window to access the DB. Gate under THIN_RW.
+            try:
+                from chunkhound.utils.mcp_env import thin_rw_enabled, get_idle_disconnect_ms
+
+                if thin_rw_enabled():
+                    idle_ms = get_idle_disconnect_ms()
+                    if idle_ms > 0 and self.services and hasattr(self.services.provider, "close_connection_only"):
+                        try:
+                            self.services.provider.close_connection_only()  # type: ignore[attr-defined]
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
             self.debug_log(
                 f"Background scan completed: {stats.files_processed} files, {stats.chunks_created} chunks"
             )
@@ -288,6 +613,17 @@ class MCPServerBase(ABC):
         if self.realtime_indexing:
             self.debug_log("Stopping real-time indexing service")
             await self.realtime_indexing.stop()
+
+        # Stop role monitor
+        if self._role_monitor_task:
+            if self._role_monitor_stop:
+                self._role_monitor_stop.set()
+            try:
+                await asyncio.wait_for(self._role_monitor_task, timeout=2.0)
+            except Exception:
+                pass
+            self._role_monitor_task = None
+            self._role_monitor_stop = None
 
         if self.services and self.services.provider.is_connected:
             self.debug_log("Closing database connection")

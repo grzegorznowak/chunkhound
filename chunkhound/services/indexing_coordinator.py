@@ -699,8 +699,45 @@ class IndexingCoordinator(BaseService):
             "chunk_ids_needing_embeddings": [],
         }
 
+        # Respect global/feature RW disable in MCP: short-circuit storage path
+        try:
+            from chunkhound.utils.mcp_env import indexing_writes_enabled
+
+            if not indexing_writes_enabled():
+                return {
+                    "total_files": 0,
+                    "total_chunks": 0,
+                    "errors": [
+                        {
+                            "file": "-",
+                            "error": "Indexing writes disabled by configuration",
+                        }
+                    ],
+                    "chunk_ids_needing_embeddings": [],
+                }
+        except Exception:
+            pass
+
         # Track file_ids for single-file case
         file_ids = []
+
+        # MCP writer duty-cycle gating to create periodic RO windows during sustained writes
+        gate_on_ms = gate_off_ms = 0
+        gate_period_start_ms = 0.0
+        try:
+            from chunkhound.utils.mcp_env import get_rw_gate_ms
+
+            gate_on_ms, gate_off_ms = get_rw_gate_ms()
+            if gate_on_ms < 0:
+                gate_on_ms = 0
+            if gate_off_ms < 0:
+                gate_off_ms = 0
+            if gate_on_ms > 0 and gate_off_ms > 0:
+                import time as _t
+
+                gate_period_start_ms = _t.time() * 1000.0
+        except Exception:
+            gate_on_ms = gate_off_ms = 0
 
         # Process each file independently (per-file transaction)
         for result in results:
@@ -829,6 +866,48 @@ class IndexingCoordinator(BaseService):
                             self._db.commit_transaction(force_checkpoint=True)
                         except Exception:
                             pass
+
+                    # MCP: create short RO windows even under sustained write load
+                    # by releasing the executor connection between files.
+                    # This enables followers to connect during initial scans.
+                    try:
+                        import os as _os
+                        if _os.getenv("CHUNKHOUND_MCP_MODE") == "1":
+                            closer = getattr(self._db, "close_connection_only", None)
+                            if callable(closer):
+                                closer()
+                    except Exception:
+                        pass
+
+                    # Thin-RW: create RO windows by releasing connection promptly
+                    try:
+                        from chunkhound.utils.mcp_env import thin_rw_enabled
+
+                        if thin_rw_enabled():
+                            closer = getattr(self._db, "close_connection_only", None)
+                            if callable(closer):
+                                closer()
+                            # Duty-cycle gating: ensure at least OFF window each period
+                            if gate_on_ms > 0 and gate_off_ms > 0:
+                                try:
+                                    import time as _t
+                                    now_ms = _t.time() * 1000.0
+                                    period_ms = float(gate_on_ms + gate_off_ms)
+                                    # Reset period start periodically to avoid drift
+                                    if now_ms - gate_period_start_ms > 10 * period_ms:
+                                        gate_period_start_ms = now_ms
+                                    elapsed = now_ms - gate_period_start_ms
+                                    pos = elapsed % period_ms
+                                    if pos >= gate_on_ms:
+                                        # Inside OFF window: sleep remaining OFF duration
+                                        off_elapsed = pos - gate_on_ms
+                                        remaining_ms = max(0.0, float(gate_off_ms) - off_elapsed)
+                                        if remaining_ms > 0:
+                                            await asyncio.sleep(remaining_ms / 1000.0)
+                                except Exception:
+                                    pass
+                    except Exception:
+                        pass
 
                     # Update progress
                     if file_task is not None and self.progress:

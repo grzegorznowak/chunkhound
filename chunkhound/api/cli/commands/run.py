@@ -152,7 +152,8 @@ async def run_command(args: argparse.Namespace, config: Config) -> None:
                     if gpc is not None:
                         prof["git_pathspecs_capped"] = bool(gpc)
                 if prof:
-                    print(_json.dumps({"startup_profile": prof}, indent=2), file=sys.stderr)
+                    _profiling_json = _json.dumps({"startup_profile": prof}, indent=2)
+                    print(_profiling_json, file=sys.stderr)
             except Exception:
                 pass
 
@@ -165,8 +166,11 @@ async def run_command(args: argparse.Namespace, config: Config) -> None:
             # Never prompt in MCP mode (stdio must not emit prompts/output)
             if skipped_timeouts and os.environ.get("CHUNKHOUND_MCP_MODE") == "1":
                 formatter.info(
-                    f"{len(skipped_timeouts)} files timed out. "
-                    "Prompts are disabled in MCP mode. To exclude them, add to .chunkhound.json under indexing.exclude."
+                    (
+                        f"{len(skipped_timeouts)} files timed out. "
+                        "Prompts are disabled in MCP mode. To exclude them, add to "
+                        ".chunkhound.json under indexing.exclude."
+                    )
                 )
                 return
 
@@ -179,7 +183,11 @@ async def run_command(args: argparse.Namespace, config: Config) -> None:
 
             # Only prompt in interactive TTY and when there are timeouts
             if skipped_timeouts and sys.stdin.isatty():
-                base_dir = Path(args.path).resolve() if hasattr(args, "path") else Path.cwd().resolve()
+                base_dir = (
+                    Path(args.path).resolve()
+                    if hasattr(args, "path")
+                    else Path.cwd().resolve()
+                )
 
                 # Convert to unique relative paths within the project
                 rel_paths: list[str] = []
@@ -194,10 +202,14 @@ async def run_command(args: argparse.Namespace, config: Config) -> None:
                         seen.add(rel)
                         rel_paths.append(rel)
 
-                formatter.info(
+                _msg = (
                     f"{len(rel_paths)} timed-out files can be excluded from future runs."
                 )
-                reply = input("Add these to indexing.exclude in .chunkhound.json? [y/N]: ").strip().lower()
+                formatter.info(_msg)
+                reply = input(
+                    "Add these to indexing.exclude in "
+                    ".chunkhound.json? [y/N]: "
+                ).strip().lower()
                 if reply in ("y", "yes"):
                     local_config_path = base_dir / ".chunkhound.json"
                     # Load or initialize config data
@@ -330,9 +342,12 @@ async def _simulate_index(args: argparse.Namespace, config: Config) -> None:
     Minimal implementation: perform discovery via the coordinator and print
     the discovered files sorted. Later we may reflect change-detection.
     """
-    base_dir = Path(args.path).resolve() if hasattr(args, "path") else Path.cwd().resolve()
+    base_dir = (
+        Path(args.path).resolve() if hasattr(args, "path") else Path.cwd().resolve()
+    )
 
-    # Optional debug output about ignore configuration (stderr to avoid breaking JSON piping)
+    # Optional debug output about ignore configuration (stderr)
+    # Keep JSON piping safe by avoiding stdout here
     try:
         if getattr(args, "debug_ignores", False):
             from chunkhound.core.config.indexing_config import IndexingConfig as _IdxCfg
@@ -369,7 +384,10 @@ async def _simulate_index(args: argparse.Namespace, config: Config) -> None:
     try:
         # Prefer an in-memory DB to keep simulate side-effect free
         # Only override when path is unset or points to a non-existent parent.
-        db_path = Path(getattr(config.database, "path", Path(":memory:")) or Path(":memory:"))
+        db_path = Path(
+            getattr(config.database, "path", Path(":memory:"))
+            or Path(":memory:")
+        )
         if str(db_path) != ":memory":  # typos
             if str(db_path) != ":memory:" and not db_path.parent.exists():
                 # If parent path doesn't exist, switch to in-memory
