@@ -17,7 +17,6 @@ from pathlib import Path
 
 import pytest
 
-from chunkhound.core.config.indexing_config import IndexingConfig
 # Avoid importing chunkhound.services package (which imports heavy dependencies)
 import importlib.util as _ilu
 import sys as _sys
@@ -31,10 +30,18 @@ _SPEC.loader.exec_module(_MOD)  # type: ignore[arg-type]
 DirectoryIndexingService = _MOD.DirectoryIndexingService
 
 
+class _DummyIndexing:
+    def __init__(self) -> None:
+        # Minimal include/exclude required by DirectoryIndexingService
+        self.include: list[str] = ["**/*.py"]
+        self.exclude: list[str] = []
+        # Service reads this threshold and forwards it to coordinator
+        self.config_file_size_threshold_kb: int = 20
+
+
 class _DummyConfig:
     def __init__(self) -> None:
-        # Default include/exclude patterns from IndexingConfig
-        self.indexing = IndexingConfig()
+        self.indexing = _DummyIndexing()
 
 
 class _FakeCoordinator:
