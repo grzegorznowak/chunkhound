@@ -63,7 +63,7 @@ mcp_http: uv run chunkhound mcp http --port 5173
 - "segmentation fault": Concurrent DB access attempted
 - "Rate limit exceeded": Reduce embedding_batch_size or max_concurrent_batches
 - "Out of memory": Reduce chunk_batch_size or file_batch_size
-- JSON-RPC errors: Check for print() statements in mcp_server.py
+- JSON-RPC errors: Check for print() statements in mcp_server/ (stdio.py, http_server.py, tools.py)
 - "unsupported operand type(s) for |: 'str' and 'NoneType'": Forward reference with | operator (remove quotes)
 
 ## DIRECTORY_STRUCTURE
@@ -71,13 +71,17 @@ mcp_http: uv run chunkhound mcp http --port 5173
 chunkhound/
 ├── providers/         # Database and embedding implementations
 ├── services/          # Orchestration and batching logic
-├── core/             # Data models and configuration
-├── interfaces/       # Protocol definitions (contracts)
-├── api/              # CLI and HTTP interfaces
-├── mcp_server.py     # MCP stdio server
-├── mcp_http_server.py # MCP HTTP server
-├── database.py       # Legacy compatibility wrapper
-└── CLAUDE.md files   # Directory-specific LLM context
+├── core/              # Data models and configuration
+├── interfaces/        # Protocol definitions (contracts)
+├── api/               # CLI and HTTP interfaces
+├── mcp_server/        # MCP server implementations
+│   ├── stdio.py       # Stdio transport server
+│   ├── http_server.py # HTTP transport server
+│   ├── tools.py       # Unified tool registry (single source of truth)
+│   ├── base.py        # Common server base class
+│   └── common.py      # Shared utilities
+├── database.py        # Legacy compatibility wrapper
+└── CLAUDE.md files    # Directory-specific LLM context
 ```
 
 ## TECHNOLOGY_STACK
