@@ -5,11 +5,11 @@ This note captures the current, experiment-backed stance on database concurrency
 ## Summary
 
 - **DuckDB**: Designed for a single owning process per database file. When a second process attempts to connect to the same `.duckdb` file, DuckDB fails fast with a locking error.
-- **LanceDB**: In practice, can tolerate one writer process plus multiple reader processes, provided:
+- **LanceDB**: The library is designed to support concurrent access (multiple readers and at least one writer) and, in practice, can tolerate one writer process plus multiple reader processes under our test conditions, provided:
   - Each process uses its own LanceDB connection.
   - Processes are started with the `spawn` start method (not `fork`).
   - Only one process performs writes for a given database directory at any time.
-- **ChunkHound policy**: Regardless of backend behavior, ChunkHound treats each database path as owned by a single process and routes all access through `SerialDatabaseProvider` to avoid lock contention and corruption.
+- **ChunkHound policy**: ChunkHound deliberately treats each database path as owned by a single process and routes all access through `SerialDatabaseProvider`. This is a project-level simplification for predictability and consistency across backends, not a statement that LanceDB itself is unable to handle concurrency.
 
 ## Experiments
 
@@ -41,11 +41,22 @@ These experiments are intentionally isolated: they do **not** use ChunkHound pro
 
 ## Operational Guidance
 
-- Treat every configured database path as owned by a **single process** in production, regardless of backend (`duckdb` or `lancedb`).
-- Rely on `SerialDatabaseProvider` and its single-threaded executor to:
-  - Serialize all database operations inside the owning process.
-  - Avoid concurrent writes and lock contention.
-- If you need multiple MCP endpoints or CLIs:
-  - Either route them through the same owning process (e.g., via HTTP/RPC).
-  - Or give each process its own independent database path; do **not** share a single DuckDB/LanceDB directory across processes.
-- Use the experimental probes only for investigation and regression checks, not as a justification to relax the single-owner rule in core ChunkHound paths.
+### Backend reality (from experiments)
+
+- DuckDB:
+  - A second process attempting to connect to a database file already opened by another process fails immediately with a locking error, even in read-only mode.
+  - Practically, this means “one OS process at a time per DuckDB file” for the scenarios we tested.
+- LanceDB:
+  - With `spawn`-started processes, separate connections, and a single writer, we observed stable 1-writer + N-reader behavior on chunk+embedding workloads.
+  - Readers not only stayed error-free, they also saw newly inserted rows while the writer was active.
+
+### How ChunkHound uses them today
+
+- ChunkHound is intentionally conservative and treats every configured database path as owned by a **single process**, regardless of backend.
+- All database access in the core system flows through `SerialDatabaseProvider` and its single-threaded executor to:
+  - Serialize operations inside the owning process.
+  - Keep the concurrency model identical for DuckDB and LanceDB and avoid backend-specific surprises.
+- If you need multiple MCP endpoints or CLIs around a single index in a production-like setting:
+  - Either route through the same owning process (e.g., via HTTP/RPC).
+  - Or give each process its own independent database path rather than sharing one DuckDB/LanceDB directory.
+- When experimenting with LanceDB **outside** the core ChunkHound stack, the 1-writer + N-reader pattern demonstrated by the probe is a valid option, but it is currently **out of scope** for the supported ChunkHound architecture.
