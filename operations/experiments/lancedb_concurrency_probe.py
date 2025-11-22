@@ -11,10 +11,10 @@ Notes:
 - Requires `lancedb`, `pyarrow`, and `numpy`.
 
 Usage examples:
-  uv run python scripts/experiments/lancedb_concurrency_probe.py \
+  uv run python operations/experiments/lancedb_concurrency_probe.py \
       --db /tmp/ldbt --rows 20000 --readers 8 --writers 1 --duration 20
 
-  uv run python scripts/experiments/lancedb_concurrency_probe.py \
+  uv run python operations/experiments/lancedb_concurrency_probe.py \
       --db /tmp/ldbt --rows 20000 --readers 8 --writers 0 --duration 20
 """
 
@@ -25,7 +25,7 @@ import os
 import random
 import time
 from dataclasses import dataclass
-from multiprocessing import Event, Process, Queue
+from multiprocessing import Event, Process, Queue, get_context
 from pathlib import Path
 from typing import Any
 
@@ -185,9 +185,24 @@ class Metrics:
     reads_err: int = 0
     writes_ok: int = 0
     writes_err: int = 0
+    # Number of search iterations that returned at least one newly inserted row (id > seed_rows)
+    fresh_read_iterations: int = 0
+    # Total count of result rows that came from newly inserted ids
+    fresh_read_results: int = 0
+    # Number of newly inserted rows created by writers (beyond initial seed_data rows)
+    new_rows_inserted: int = 0
 
 
-def reader_worker(db_dir: Path, dims: int, provider: str, model: str, duration: float, start_evt: Event, out_q: Queue) -> None:
+def reader_worker(
+    db_dir: Path,
+    dims: int,
+    provider: str,
+    model: str,
+    seed_rows: int,
+    duration: float,
+    start_evt: Event,
+    out_q: Queue,
+) -> None:
     _, _, np = _import_lance()
     conn = connect(db_dir)
     ensure_schema(conn, dims)
@@ -201,21 +216,40 @@ def reader_worker(db_dir: Path, dims: int, provider: str, model: str, duration: 
         try:
             q = rng.normal(size=dims).astype("float32").tolist()
             # Filter by provider/model to stress index + predicate
-            res = (
+            rows = (
                 conn.open_table("chunks")
                 .search(q, vector_column_name="embedding")
                 .where(f"provider = '{provider}' AND model = '{model}' AND embedding IS NOT NULL")
                 .limit(5)
                 .to_list()
             )
-            _ = len(res)
+            fresh = 0
+            for row in rows:
+                row_id = row.get("id")
+                if isinstance(row_id, int) and row_id > seed_rows:
+                    fresh += 1
+
+            if fresh > 0:
+                metrics.fresh_read_iterations += 1
+                metrics.fresh_read_results += fresh
+
             metrics.reads_ok += 1
         except Exception:
             metrics.reads_err += 1
     out_q.put(metrics)
 
 
-def writer_worker(db_dir: Path, dims: int, provider: str, model: str, ids: list[int], duration: float, start_evt: Event, out_q: Queue) -> None:
+def writer_worker(
+    db_dir: Path,
+    dims: int,
+    provider: str,
+    model: str,
+    seed_rows: int,
+    ids: list[int],
+    duration: float,
+    start_evt: Event,
+    out_q: Queue,
+) -> None:
     _, pa, np = _import_lance()
     conn = connect(db_dir)
     ensure_schema(conn, dims)
@@ -229,22 +263,53 @@ def writer_worker(db_dir: Path, dims: int, provider: str, model: str, ids: list[
     chunks = conn.open_table("chunks")
     # Moderate batch size to keep writer busy
     batch = 256
+    next_id = seed_rows + 1
     while time.time() < end_time:
         try:
-            sample = random.sample(ids, k=min(batch, len(ids)))
-            updates = []
-            for cid in sample:
+            # 1) Update a subset of existing rows (simulates re-embedding)
+            if ids:
+                sample = random.sample(ids, k=min(batch // 2, len(ids)))
+                updates = []
+                for cid in sample:
+                    vec = rng.normal(size=dims).astype("float32").tolist()
+                    updates.append(
+                        {
+                            "id": cid,
+                            "embedding": vec,
+                            "provider": provider,
+                            "model": model,
+                        }
+                    )
+                chunks.merge_insert("id").when_matched_update_all().when_not_matched_insert_all().execute(updates)
+
+            # 2) Insert brand new rows with embeddings (simulates new chunks being indexed)
+            new_rows = []
+            for _ in range(batch // 2):
+                cid = next_id
+                next_id += 1
+                ids.append(cid)
                 vec = rng.normal(size=dims).astype("float32").tolist()
-                updates.append(
+                new_rows.append(
                     {
                         "id": cid,
+                        "file_id": cid,
+                        "content": "new_chunk",
+                        "start_line": 0,
+                        "end_line": 0,
+                        "chunk_type": "code",
+                        "language": "text",
+                        "name": f"rw_sym_{cid}",
                         "embedding": vec,
                         "provider": provider,
                         "model": model,
+                        "created_time": time.time(),
                     }
                 )
-            # merge_insert idempotently updates rows
-            chunks.merge_insert("id").when_matched_update_all().when_not_matched_insert_all().execute(updates)
+
+            if new_rows:
+                chunks.add(pa.Table.from_pylist(new_rows))
+                metrics.new_rows_inserted += len(new_rows)
+
             metrics.writes_ok += 1
         except Exception:
             metrics.writes_err += 1
@@ -256,17 +321,25 @@ def run_probe(db_dir: Path, dims: int, rows: int, readers: int, writers: int, du
     ids = seed_data(conn, rows, dims, provider="prov", model="mdl")
     ensure_vector_index(conn, dims, index_type=index_type)
 
-    start_evt: Event = Event()
-    out_q: Queue = Queue()
+    # Use spawn start method to avoid inheriting LanceDB state across forks.
+    ctx = get_context("spawn")
+    start_evt = ctx.Event()
+    out_q = ctx.Queue()
     procs: list[Process] = []
 
     for _ in range(readers):
-        p = Process(target=reader_worker, args=(db_dir, dims, "prov", "mdl", duration, start_evt, out_q))
+        p = ctx.Process(
+            target=reader_worker,
+            args=(db_dir, dims, "prov", "mdl", rows, duration, start_evt, out_q),
+        )
         p.daemon = True
         procs.append(p)
 
     for _ in range(writers):
-        p = Process(target=writer_worker, args=(db_dir, dims, "prov", "mdl", ids, duration, start_evt, out_q))
+        p = ctx.Process(
+            target=writer_worker,
+            args=(db_dir, dims, "prov", "mdl", rows, ids, duration, start_evt, out_q),
+        )
         p.daemon = True
         procs.append(p)
 
@@ -286,12 +359,18 @@ def run_probe(db_dir: Path, dims: int, rows: int, readers: int, writers: int, du
         agg.reads_err += m.reads_err
         agg.writes_ok += m.writes_ok
         agg.writes_err += m.writes_err
+        agg.fresh_read_iterations += m.fresh_read_iterations
+        agg.fresh_read_results += m.fresh_read_results
+        agg.new_rows_inserted += m.new_rows_inserted
 
     return {
         "reads_ok": agg.reads_ok,
         "reads_err": agg.reads_err,
         "writes_ok": agg.writes_ok,
         "writes_err": agg.writes_err,
+        "fresh_read_iterations": agg.fresh_read_iterations,
+        "fresh_read_results": agg.fresh_read_results,
+        "new_rows_inserted": agg.new_rows_inserted,
     }
 
 
@@ -339,4 +418,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
