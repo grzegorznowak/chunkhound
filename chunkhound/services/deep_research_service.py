@@ -1246,6 +1246,13 @@ class DeepResearchService:
             )
         )
 
+        # Safety: empty files cannot be expanded meaningfully
+        if not lines:
+            logger.debug(
+                f"Empty file content for {file_path}, skipping boundary expansion"
+            )
+            return start_line, end_line
+
         # Convert to 0-indexed for array access
         start_idx = max(0, start_line - 1)
         end_idx = min(len(lines) - 1, end_line - 1)
