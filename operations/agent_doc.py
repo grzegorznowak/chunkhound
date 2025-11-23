@@ -21,7 +21,9 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import subprocess
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -358,6 +360,7 @@ async def _run_semantic_overview_query(
     hyde_plan: str | None = None,
     debug_dir: Path | None = None,
     lexical_sidecar: bool = False,
+    gap_fill: bool = False,
 ) -> str:
     """Run a faster, semantic-search-only overview synthesis.
 
@@ -469,20 +472,67 @@ async def _run_semantic_overview_query(
             "Try running with code_research mode instead."
         )
 
-    # Deduplicate results by (path, start_line, end_line) and sort by score
-    dedup: dict[tuple[str, int | None, int | None], dict[str, Any]] = {}
-    for result in all_results:
-        path = result.get("path") or result.get("file_path") or ""
-        key = (path, result.get("start_line"), result.get("end_line"))
-        if not path:
-            continue
-        existing = dedup.get(key)
-        if existing is None or result.get("score", 0.0) > existing.get("score", 0.0):
-            dedup[key] = result
+    # Deduplicate results by (path, start_line, end_line) and sort by score.
+    # We may recompute this after optional gap-filling.
+    def _dedup_and_sort(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        local_dedup: dict[tuple[str, int | None, int | None], dict[str, Any]] = {}
+        for res in results:
+            path = res.get("path") or res.get("file_path") or ""
+            key = (path, res.get("start_line"), res.get("end_line"))
+            if not path:
+                continue
+            existing = local_dedup.get(key)
+            if existing is None or res.get("score", 0.0) > existing.get("score", 0.0):
+                local_dedup[key] = res
+        return sorted(
+            local_dedup.values(), key=lambda r: r.get("score", 0.0), reverse=True
+        )
 
-    merged_results = sorted(
-        dedup.values(), key=lambda r: r.get("score", 0.0), reverse=True
-    )
+    merged_results = _dedup_and_sort(all_results)
+
+    # Optional gap-filling pass: use tokens derived from the existing merged
+    # landscape to run small, targeted regex searches and pull in snippets
+    # from additional files within the same scoped path.
+    if gap_fill:
+        extra_results: list[dict[str, Any]] = []
+        seen_paths: set[str] = set()
+        for res in merged_results:
+            path = (res.get("path") or res.get("file_path") or "").replace("\\", "/")
+            if path:
+                seen_paths.add(path)
+
+        tokens = _extract_gap_fill_tokens(merged_results)
+        max_new_files = 6
+        new_files: set[str] = set()
+
+        for token in tokens:
+            if len(new_files) >= max_new_files:
+                break
+            pattern = rf"\\b{re.escape(token)}\\b"
+            try:
+                regex_batch, _ = await search_service.search_regex_async(
+                    pattern=pattern,
+                    page_size=20,
+                    offset=0,
+                    path_filter=path_filter,
+                )
+            except Exception:
+                continue
+
+            for res in regex_batch:
+                path = (res.get("path") or res.get("file_path") or "").replace("\\", "/")
+                if not path:
+                    continue
+                if path in seen_paths or path in new_files:
+                    continue
+                extra_results.append(res)
+                new_files.add(path)
+                if len(new_files) >= max_new_files:
+                    break
+
+        if extra_results:
+            all_results.extend(extra_results)
+            merged_results = _dedup_and_sort(all_results)
 
     # Build a compact context block from top results and capture provenance.
     # We cap the total number of snippets but also cap per-file to improve
@@ -777,6 +827,60 @@ def _build_lexical_pattern_from_query(query: str) -> str | None:
             return rf"\\b{token}\\b"
 
     return None
+
+
+def _extract_gap_fill_tokens(merged_results: list[dict[str, Any]]) -> list[str]:
+    """Extract candidate tokens for gap-filling from merged semantic results.
+
+    This inspects file paths to derive stem-like tokens that are already
+    present in the scoped project (for example, 'scanner', 'precedences',
+    'module'). It remains project-agnostic and does not rely on domain
+    knowledge.
+    """
+    token_counts: Counter[str] = Counter()
+
+    # Small, generic stopword set to avoid very common, low-signal tokens.
+    stopwords = {
+        "project",
+        "source",
+        "src",
+        "test",
+        "tests",
+        "module",
+        "import",
+        "export",
+        "file",
+        "files",
+        "config",
+        "core",
+        "data",
+        "type",
+        "types",
+        "docs",
+        "readme",
+        "build",
+        "setup",
+        "package",
+    }
+
+    for result in merged_results:
+        path = (result.get("path") or result.get("file_path") or "").replace("\\", "/")
+        if not path:
+            continue
+        name = path.rsplit("/", 1)[-1]
+        stem = name.split(".", 1)[0]
+        # Split stem into tokens on non-alphanumeric boundaries
+        for raw in re.split(r"[^A-Za-z0-9_]+", stem):
+            token = raw.strip()
+            if not token:
+                continue
+            lower = token.lower()
+            if len(lower) < 4 or lower in stopwords:
+                continue
+            token_counts[lower] += 1
+
+    # Return top tokens by frequency; keep the list small to bound extra work.
+    return [tok for tok, _ in token_counts.most_common(8)]
 
 
 def _categorize_file_path(path: str) -> str:
@@ -1162,6 +1266,7 @@ async def _generate_agent_doc(
     out_dir: Optional[Path] = None,
     debug_dump: bool = False,
     semantic_lexical_sidecar: bool = True,
+    semantic_gap_fill: bool = False,
 ) -> None:
     """Main implementation that coordinates config, research, and writing."""
     # Ensure we resolve paths early to avoid surprises
@@ -1377,6 +1482,7 @@ async def _generate_agent_doc(
                 hyde_plan=hyde_plan,
                 debug_dir=debug_dir,
                 lexical_sidecar=semantic_lexical_sidecar,
+                gap_fill=semantic_gap_fill,
             )
         else:
             overview_prompt = _build_research_prompt(
@@ -1549,6 +1655,16 @@ def main() -> None:
             "semantic search to broaden coverage within the scoped path."
         ),
     )
+    parser.add_argument(
+        "--semantic-gap-fill",
+        action="store_true",
+        help=(
+            "Enable an experimental gap-filling pass for semantic mode. When enabled, "
+            "semantic search may issue additional small regex searches based on file "
+            "names discovered in the initial semantic landscape to pull in snippets "
+            "from additional files within the scoped folder."
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -1586,11 +1702,15 @@ def main() -> None:
             args.debug_dump or os.getenv("CH_AGENT_DOC_DEBUG") == "1"
         )
 
-        # Lexical sidecar is enabled by default but can be disabled via CLI or env.
-        # Env wins over default, CLI wins over env.
-        sidecar_env = os.getenv("CH_AGENT_DOC_SEMANTIC_LEXICAL_SIDECAR", "1")
-        sidecar_from_env = sidecar_env != "0"
+        # Lexical sidecar is disabled by default and can be enabled via env.
+        # CLI flag only disables it when explicitly enabled in the environment.
+        sidecar_env = os.getenv("CH_AGENT_DOC_SEMANTIC_LEXICAL_SIDECAR", "0")
+        sidecar_from_env = sidecar_env == "1"
         semantic_lexical_sidecar = sidecar_from_env and not args.no_semantic_lexical_sidecar
+
+        # Gap-filling is experimental and opt-in. It can be enabled via env or CLI.
+        gap_fill_env = os.getenv("CH_AGENT_DOC_SEMANTIC_GAP_FILL", "0")
+        semantic_gap_fill = gap_fill_env == "1" or args.semantic_gap_fill
 
         asyncio.run(
             _generate_agent_doc(
@@ -1604,6 +1724,7 @@ def main() -> None:
                 out_dir=out_dir,
                 debug_dump=debug_dump,
                 semantic_lexical_sidecar=semantic_lexical_sidecar,
+                semantic_gap_fill=semantic_gap_fill,
             )
         )
     except KeyboardInterrupt:
