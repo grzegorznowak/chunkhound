@@ -1,6 +1,7 @@
 """Deep Research Service for ChunkHound - BFS-based semantic exploration."""
 
 import asyncio
+import os
 import re
 import threading
 from dataclasses import dataclass, field
@@ -289,9 +290,21 @@ class DeepResearchService:
         # Emit main start event
         await self._emit_event("main_start", f"Starting deep research: {query[:60]}...")
 
-        # Fixed max depth (empirically proven optimal)
+        # Fixed max depth (empirically proven optimal), with optional override via
+        # environment variable for experimental use (for example, agent-doc runs).
         max_depth = 1
-        logger.info(f"Using max_depth={max_depth} (fixed)")
+        override = os.getenv("CH_CODE_RESEARCH_MAX_DEPTH")
+        if override is not None:
+            try:
+                value = int(override)
+                if value >= 0:
+                    max_depth = value
+            except ValueError:
+                logger.warning(
+                    f"Invalid CH_CODE_RESEARCH_MAX_DEPTH={override!r}, "
+                    "falling back to default max_depth=1"
+                )
+        logger.info(f"Using max_depth={max_depth}")
 
         # Calculate dynamic synthesis budgets based on repository size
         stats = self._db_services.provider.get_stats()
@@ -534,6 +547,32 @@ class DeepResearchService:
             "aggregation_stats": aggregated["stats"],
             "token_budget": budget_info,
         }
+
+        # Expose the subset of files and chunks that were actually used for
+        # synthesis so orchestrators (like agent-doc) can build a unified
+        # Sources footer without re-running searches. This is additive metadata
+        # and does not affect tool behavior for existing code_research users.
+        try:
+            sources_files = list(budgeted_files.keys())
+            sources_chunks: list[dict[str, Any]] = []
+            for chunk in prioritized_chunks:
+                file_path = chunk.get("file_path")
+                if not file_path:
+                    continue
+                sources_chunks.append(
+                    {
+                        "file_path": file_path,
+                        "start_line": chunk.get("start_line"),
+                        "end_line": chunk.get("end_line"),
+                    }
+                )
+            metadata["sources"] = {
+                "files": sources_files,
+                "chunks": sources_chunks,
+            }
+        except Exception:
+            # Sources metadata is best-effort; never break main flow.
+            pass
 
         logger.info(f"Deep research completed: {metadata}")
 

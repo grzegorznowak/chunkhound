@@ -146,14 +146,10 @@ def split_agent_doc_text(text: str, meta: dict[str, Any], base_output_dir: Path 
     )
     operations_cmds = maybe_slice(
         "## 4. Operations, Commands, and Testing",
-        "## 5. Change Summary Since",
-    )
-    change_summary = maybe_slice(
-        "## 5. Change Summary Since",
-        "## 6. Known Pitfalls and Debugging Patterns",
+        "## 5. Known Pitfalls and Debugging Patterns",
     )
     pitfalls = maybe_slice(
-        "## 6. Known Pitfalls and Debugging Patterns",
+        "## 5. Known Pitfalls and Debugging Patterns",
         "## 7. Subsystem Deep Dives",
     )
     deep_dives_block = maybe_slice(
@@ -272,12 +268,6 @@ def split_agent_doc_text(text: str, meta: dict[str, Any], base_output_dir: Path 
             title="Operations, Commands, and Testing",
             description="CLI commands, testing strategy, and operational workflows.",
             content=operations_cmds,
-        ),
-        SectionSpec(
-            filename="21_change_summary.md",
-            title="Change Summary Since Baseline",
-            description="High-level summary of changes since the baseline commit.",
-            content=change_summary,
         ),
         SectionSpec(
             filename="22_known_pitfalls_and_debugging_patterns.md",
