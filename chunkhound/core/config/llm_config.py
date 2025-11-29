@@ -93,6 +93,33 @@ class LLMConfig(BaseSettings):
         description="Codex CLI reasoning effort override for synthesis-stage operations",
     )
 
+    # Optional specialization for agent-doc final assembly (HyDE + map merge)
+    assembly_provider: Literal[
+        "openai",
+        "ollama",
+        "claude-code-cli",
+        "codex-cli",
+    ] | None = Field(
+        default=None,
+        description="Override provider for agent-doc final assembly (HyDE + map-only merge)",
+    )
+
+    assembly_model: str | None = Field(
+        default=None,
+        description="Override model for agent-doc final assembly (HyDE + map-only merge).",
+    )
+
+    # Backwards-compatible alias for assembly_model used in some configs.
+    assembly_synthesis_model: str | None = Field(
+        default=None,
+        description="Alias for assembly_model used by some configurations.",
+    )
+
+    assembly_reasoning_effort: Literal["minimal", "low", "medium", "high"] | None = Field(
+        default=None,
+        description="Codex/OpenAI reasoning effort override for agent-doc final assembly.",
+    )
+
     api_key: SecretStr | None = Field(
         default=None, description="API key for authentication (provider-specific)"
     )
@@ -128,6 +155,7 @@ class LLMConfig(BaseSettings):
         "codex_reasoning_effort",
         "codex_reasoning_effort_utility",
         "codex_reasoning_effort_synthesis",
+        "assembly_reasoning_effort",
         mode="before",
     )
     def normalize_codex_effort(cls, v: str | None) -> str | None:  # noqa: N805

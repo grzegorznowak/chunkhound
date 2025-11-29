@@ -1,7 +1,7 @@
 import pytest
 
-import operations.agent_doc as agent_doc_mod
-from operations.agent_doc import _run_research_query
+import operations.deep_doc.deep_doc as deep_doc_mod
+from operations.deep_doc.deep_doc import _run_research_query
 
 
 @pytest.mark.asyncio
@@ -24,7 +24,7 @@ async def test_run_research_query_passes_scope_as_path(monkeypatch: pytest.Monke
         captured["path"] = path
         return {"answer": "OK"}
 
-    monkeypatch.setattr(agent_doc_mod, "deep_research_impl", _fake_deep_research_impl, raising=True)
+    monkeypatch.setattr(deep_doc_mod, "deep_research_impl", _fake_deep_research_impl, raising=True)
 
     services = object()
     embedding_manager = object()
@@ -60,4 +60,3 @@ async def test_run_research_query_passes_scope_as_path(monkeypatch: pytest.Monke
         scope_label=None,
     )
     assert captured["path"] is None
-

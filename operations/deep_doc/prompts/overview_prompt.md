@@ -58,7 +58,10 @@ Guidelines:
 - Aim for a long, detailed document rather than a brief overview. It is
   acceptable (and preferred) to spend many paragraphs on each subsystem as long
   as the structure stays clear.
-- Under "Subsystem Guides", group information by natural submodules or packages
+- Under "Subsystem Guides", start with 1–3 overview paragraphs (before any '###'
+  headings) that explain how the main subsystems relate to each other and how to
+  read the rest of the section. After that, group information by natural
+  submodules or packages
   within the in-scope folder (for example, core libraries, providers, services,
   interfaces, CLI/API entrypoints, utilities, operations, tests). For each
   package or logical area, follow this internal pattern:

@@ -20,14 +20,17 @@ Each finding below comes from a separate map-level analysis pass over the scoped
 
 Your task:
 - Read and integrate all findings into a single coherent documentation set suitable for future AI agents that cannot call tools.
-- Produce a single markdown document with these exact top-level headings:
+- Produce a single markdown document that starts with:
   # Agent Doc
-  ## 1. Project Identity and Constraints
-  ## 2. Architecture Overview
-  ## 3. Subsystem Guides
-  ## 4. Operations, Commands, and Testing
-  ## 5. Known Pitfalls and Debugging Patterns
-- Under "Architecture Overview" and "Subsystem Guides", include one or more Mermaid diagrams that make the system structure as clear as possible, covering:
+- Below that root heading, choose natural `##` and `###` sections that best reflect the actual architecture, subsystems, and operational flows implied by the findings. Do NOT feel constrained to a fixed numbered 1–6 scheme.
+- Ensure that, somewhere in the document, you clearly cover:
+  - Project identity and critical constraints (especially performance, batching, and concurrency rules).
+  - Overall architecture and lifecycle for the in-scope folder: how requests, commands, or jobs flow through the system.
+  - Major subsystems or modules, their responsibilities, and how they interact.
+  - Operations, CLI/API entrypoints, testing strategy, and how to safely run or extend the system.
+  - Known pitfalls, gotchas, and debugging patterns visible from error handling, tests, and operations code.
+- When summarizing structured information (for example: subsystems and their responsibilities, commands and their effects, configuration flags and their impact, or common failure modes and symptoms), prefer concise markdown tables to make comparisons and relationships easy to scan.
+- Under the main architecture and subsystem sections, include one or more Mermaid diagrams that make the system structure as clear as possible, covering:
   - Intra-subsystem flows (within a module or package).
   - Inter-subsystem interactions (between modules, services, and entrypoints).
   - Key data flows, boundaries, and external dependencies (e.g., databases, queues, MCP servers).
@@ -38,7 +41,6 @@ Your task:
   - Put spaces, slashes, and other punctuation only in the label, never in the ID.
   - Do NOT include citation markers like `[3]` or `[N]` inside any Mermaid diagram; keep citations in the surrounding markdown text.
   - Do NOT append extra text after a node label before an edge (avoid patterns like `node\"][3] --> target`).
-- Under "Subsystem Guides", group information by natural submodules or packages within the in-scope folder and describe their responsibilities, interactions, extension patterns, and how they appear in the diagrams.
 - Integrate all findings, remove duplication, and resolve contradictions; when in doubt, prefer the most precise or conservative description.
 - Preserve all existing [N] citations from the findings and keep them attached to the statements they support.
 - Do NOT invent new [N] citations or change citation numbers.

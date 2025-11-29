@@ -53,8 +53,8 @@ Output format:
   - Group hooks by inferred subsystems (for example: "Core / Config / Models",
     "Providers / Storage", "Services", "Interfaces / API / CLI", "MCP Servers",
     "Operations", "Tests").
-  - Under each group, add 1–3 bullet points. Each bullet must be a *single research
-    question or investigation target*, not a full answer.
+  - Under each group, add multiple bullet points.
+    Each bullet must be a *single research question or investigation target*, not a full answer.
   - Phrase hooks as things to investigate, such as:
     - Identify the core configuration and data model modules and describe how they
       likely anchor the rest of the system.
@@ -74,8 +74,8 @@ Guidelines:
 - Prefer concise bullet lists over long prose paragraphs, but you may use vivid,
   imaginative wording inside each bullet as long as the research question remains clear.
 - Err on the side of being over-generative rather than conservative: for a non-trivial
-  scope, it is better to produce many hooks (dozens, if appropriate) than to miss
-  important corners of the system.
+  scope, produce a long, exploratory plan with many hooks (dozens, if appropriate) and
+  several distinct subsystem groups rather than a short outline.
 - Every `- ` bullet under "Global Hooks" and "Subsystem Hooks" should be a standalone
   research question that would make sense as a deep code_research query.
 - Do NOT include citations, sources tables, or a full Agent Doc; your output is a plan

@@ -24,10 +24,8 @@ bench-cluster:
 		--output .chunkhound/benches/cluster-stress-dev/cluster_eval.json
 
 agent-doc:
-	uv run python operations/agent_doc.py \
+	uv run python operations/deep_doc/deep_doc.py \
 		$(if $(WORKSPACE),--path $(WORKSPACE),) \
 		$(if $(SCOPE),--scope $(SCOPE),) \
 		$(if $(HYDE_ONLY),--hyde-only,) \
-		$(if $(HYDE_BOOTSTRAP),--hyde-bootstrap,) \
-		$(if $(MODE),--mode $(MODE),) \
 		$(if $(OUT_DIR),--out-dir $(OUT_DIR),)
