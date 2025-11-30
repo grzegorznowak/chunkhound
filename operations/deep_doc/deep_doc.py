@@ -742,6 +742,62 @@ def _build_hyde_scope_prompt(
     snippet_char_budget = max(0, snippet_token_budget * 4)
     max_chars_per_file = hyde_cfg.max_snippet_chars
 
+    # Heuristic filters for binary/heavy files that should not contribute
+    # code snippets (but still appear in the file listing so HyDE can see
+    # the tree layout).
+    binary_exts = {
+        # Images
+        ".png",
+        ".jpg",
+        ".jpeg",
+        ".gif",
+        ".webp",
+        ".ico",
+        ".bmp",
+        ".tiff",
+        ".tif",
+        # Fonts
+        ".ttf",
+        ".otf",
+        ".woff",
+        ".woff2",
+        # Archives / compressed
+        ".zip",
+        ".tar",
+        ".gz",
+        ".bz2",
+        ".xz",
+        ".7z",
+        ".rar",
+        # Documents / media
+        ".pdf",
+        ".mp3",
+        ".mp4",
+        ".mov",
+        ".avi",
+        ".mkv",
+        ".wav",
+        ".flac",
+        # Compiled artifacts
+        ".so",
+        ".dll",
+        ".dylib",
+        ".o",
+        ".a",
+        ".obj",
+        ".exe",
+        ".class",
+        ".jar",
+        # Raw binaries / blobs / DBs
+        ".bin",
+        ".db",
+        ".sqlite",
+        ".sqlite3",
+        ".duckdb",
+        ".lance",
+    }
+    max_snippet_file_bytes = 1_000_000  # ~1 MiB
+
     file_infos: list[tuple[str, Path, int]] = []
     total_bytes = 0
 
@@ -752,6 +808,11 @@ def _build_hyde_scope_prompt(
                 continue
             size = path.stat().st_size
         except Exception:
+            continue
+        # Skip obviously binary or oversized files for snippet purposes.
+        if path.suffix.lower() in binary_exts:
+            continue
+        if size > max_snippet_file_bytes:
             continue
         if size <= 0:
             continue
@@ -781,6 +842,13 @@ def _build_hyde_scope_prompt(
                 continue
 
             try:
+                # Read a small prefix first to cheaply detect binary content.
+                # If it looks binary, skip this file for snippets.
+                with path.open("rb") as f:
+                    raw_prefix = f.read(8192)
+                if b"\x00" in raw_prefix:
+                    continue
+                # Decode the full file as text for sampling.
                 text = path.read_text(encoding="utf-8", errors="replace")
             except Exception:
                 continue
@@ -867,21 +935,6 @@ async def _run_hyde_only_query(
     except Exception:
         return "Synthesis provider unavailable for HyDE-only mode."
 
-    # Strong system message to keep HyDE project-agnostic and focused on planning,
-    # while encouraging creative, slightly flamboyant hypotheses and rich hook sets.
-    system_msg = (
-        "You are generating a hypothetical research plan for an unknown software "
-        "project based only on file and directory names. You have no prior knowledge "
-        "of its real name, domain, or tech stack. Do not mention specific product, "
-        "repository, or technology names. Speak only in generic, project-agnostic "
-        "terms such as 'database', 'search index', 'configuration module', "
-        "'API layer', etc. Your output must be a plan (hooks/questions), not a "
-        "final architecture document. Err on the side of over-generating hooks: "
-        "for larger scopes, produce many imaginative, richly worded research "
-        "questions, as long as each '-' bullet is a clear, self-contained hook "
-        "that could drive a deep code-research pass."
-    )
-
     # Allow deep, expansive plans by default. The default max token budget is
     # generous (30k) so HyDE can write long, exploratory research plans. When
     # provided, HydeConfig controls the budget and still enforces the same
@@ -893,7 +946,6 @@ async def _run_hyde_only_query(
     try:
         response = await provider.complete(
             prompt=prompt,
-            system=system_msg,
             max_completion_tokens=max_tokens,
         )
         if not response or not getattr(response, "content", None):
@@ -1475,6 +1527,7 @@ async def _run_deep_doc_body_pipeline(
     diff_since_created: list[str],
     diff_since_previous: list[str],
     hyde_plan: str | None,
+    out_dir: Optional[Path],
 ) -> tuple[str, dict[str, str], list[dict[str, Any]], int, bool, bool]:
     """Run deep-research / HyDE pipelines and assemble the main body.
 
@@ -1526,6 +1579,21 @@ async def _run_deep_doc_body_pipeline(
             hyde_cfg=hyde_cfg,
             project_root=project_root,
         )
+
+        # Optional debugging hooks: allow inspecting the exact HyDE scope
+        # prompt, and optionally stop after writing it without calling the LLM.
+        dump_prompt = os.getenv("CH_AGENT_DOC_HYDE_DUMP_PROMPT", "0") == "1"
+        prompt_only = os.getenv("CH_AGENT_DOC_HYDE_PROMPT_ONLY", "0") == "1"
+        if out_dir is not None and (dump_prompt or prompt_only):
+            safe_scope = scope_label.replace("/", "_") or "root"
+            prompt_path = out_dir / f"hyde_scope_prompt_{safe_scope}.md"
+            prompt_path.parent.mkdir(parents=True, exist_ok=True)
+            prompt_path.write_text(overview_prompt, encoding="utf-8")
+        if prompt_only:
+            # Stop after emitting the prompt file so it can be inspected
+            # manually.
+            raise SystemExit(0)
+
         overview_answer = await _run_hyde_only_query(
             llm_manager=llm_manager,
             prompt=overview_prompt,
@@ -1935,6 +2003,7 @@ async def _generate_agent_doc(
         diff_since_created=diff_since_created,
         diff_since_previous=diff_since_previous,
         hyde_plan=hyde_plan,
+        out_dir=out_dir,
     )
 
     # Populate generation_stats for visibility into the generation process.
