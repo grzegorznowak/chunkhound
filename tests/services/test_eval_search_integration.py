@@ -1,15 +1,13 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
 
-import pytest
-
-from chunkhound.tools.eval.search import _async_main
+from tests.utils import get_safe_subprocess_env
 
 
-@pytest.mark.asyncio
-async def test_eval_search_regex_smoke(tmp_path: Path) -> None:
+def test_eval_search_regex_smoke(tmp_path: Path) -> None:
     """End-to-end smoke test for eval.search in regex mode.
 
     Runs the harness against a tiny synthetic corpus (single language)
@@ -18,7 +16,12 @@ async def test_eval_search_regex_smoke(tmp_path: Path) -> None:
     """
 
     output_path = tmp_path / "eval_search_regex.json"
-    argv = [
+    cmd = [
+        "uv",
+        "run",
+        "python",
+        "-m",
+        "chunkhound.tools.eval_search",
         "--mode",
         "mixed",
         "--search-mode",
@@ -31,8 +34,15 @@ async def test_eval_search_regex_smoke(tmp_path: Path) -> None:
         str(output_path),
     ]
 
-    exit_code = await _async_main(argv)
-    assert exit_code == 0
+    result = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env=get_safe_subprocess_env(),
+    )
+
+    assert result.returncode == 0, f"eval_search failed: {result.stderr or result.stdout}"
     assert output_path.is_file()
 
     payload = json.loads(output_path.read_text(encoding="utf-8"))
@@ -41,4 +51,3 @@ async def test_eval_search_regex_smoke(tmp_path: Path) -> None:
     assert payload["languages"] == ["python"]
     assert payload["ks"] == [1]
     assert payload["per_query"], "expected at least one query in eval output"
-
