@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import gc
 import json
 import tempfile
 import time
@@ -23,8 +24,9 @@ from loguru import logger
 
 from chunkhound.core.config.config import Config
 from chunkhound.core.types.common import Language
-from chunkhound.database_factory import create_services
+from chunkhound.database_factory import DatabaseServices, create_services
 from chunkhound.services.directory_indexing_service import DirectoryIndexingService
+from chunkhound.utils.windows_constants import IS_WINDOWS, WINDOWS_DB_CLEANUP_DELAY
 
 from .language_samples import QueryDefinition, create_corpus, parse_languages_arg
 from .metrics import (
@@ -35,6 +37,32 @@ from .metrics import (
     build_json_payload,
     format_human_summary,
 )
+
+
+def _cleanup_services(services: DatabaseServices | None) -> None:
+    """Best-effort database cleanup with Windows handle release.
+
+    Ensures DuckDB connections are closed before temporary directories are
+    removed so Windows can delete chunks.db without WinError 32.
+    """
+    if services is None:
+        return
+
+    provider = services.provider
+    try:
+        if hasattr(provider, "close"):
+            provider.close()
+        elif hasattr(provider, "disconnect"):
+            provider.disconnect()
+    except Exception as e:  # pragma: no cover - defensive cleanup
+        logger.warning(f"Error during eval_search database cleanup: {e}")
+
+    # Help the interpreter release any remaining references promptly
+    gc.collect()
+
+    # On Windows, allow a short delay for the OS to release file handles
+    if IS_WINDOWS:
+        time.sleep(WINDOWS_DB_CLEANUP_DELAY)
 
 
 def _build_config(project_dir: Path, config_path: str | None) -> Config:
@@ -69,24 +97,29 @@ async def _index_corpus(
     configured embedding provider. This is required for semantic evaluation
     (search_mode=semantic).
     """
-    services = create_services(db_path=db_path, config=config)
+    services: DatabaseServices | None = None
+    try:
+        services = create_services(db_path=db_path, config=config)
 
-    indexing_service = DirectoryIndexingService(
-        indexing_coordinator=services.indexing_coordinator,
-        config=config,
-        progress_callback=lambda msg: logger.debug(f"[index] {msg}"),
-        progress=None,
-    )
-
-    stats = await indexing_service.process_directory(
-        project_dir,
-        no_embeddings=not with_embeddings,
-    )
-
-    if stats.errors_encountered:
-        logger.warning(
-            f"Indexing completed with {len(stats.errors_encountered)} errors"
+        indexing_service = DirectoryIndexingService(
+            indexing_coordinator=services.indexing_coordinator,
+            config=config,
+            progress_callback=lambda msg: logger.debug(f"[index] {msg}"),
+            progress=None,
         )
+
+        stats = await indexing_service.process_directory(
+            project_dir,
+            no_embeddings=not with_embeddings,
+        )
+
+        if stats.errors_encountered:
+            logger.warning(
+                f"Indexing completed with {len(stats.errors_encountered)} errors"
+            )
+    finally:
+        # Ensure DuckDB connections are closed so temp dirs can be removed on Windows
+        _cleanup_services(services)
 
 
 async def _run_queries(
@@ -97,80 +130,85 @@ async def _run_queries(
     search_mode: str,
 ) -> list[QueryMetrics]:
     """Run queries and collect per-query metrics."""
-    services = create_services(db_path=db_path, config=config)
-    search_service = services.search_service
+    services: DatabaseServices | None = None
+    try:
+        services = create_services(db_path=db_path, config=config)
+        search_service = services.search_service
 
-    per_query_metrics: list[QueryMetrics] = []
-    max_k = max(ks) if ks else 10
+        per_query_metrics: list[QueryMetrics] = []
+        max_k = max(ks) if ks else 10
 
-    for query in queries:
-        start = time.perf_counter()
-        if search_mode == "semantic":
-            search_text = query.semantic_query
-            results, _ = await search_service.search_semantic(
-                query=search_text,
-                page_size=max_k,
-                offset=0,
-            )
-            search_type = "semantic"
-        else:
-            search_text = query.pattern
-            results, _ = await search_service.search_regex_async(
-                pattern=search_text,
-                page_size=max_k,
-                offset=0,
-                path_filter=None,
-            )
-            search_type = "regex"
-
-        latency_ms = (time.perf_counter() - start) * 1000.0
-
-        result_paths = [r.get("file_path") for r in results if r.get("file_path")]
-        relevant = set(query.relevant_paths)
-
-        first_rank: int | None = None
-        for idx, path in enumerate(result_paths, start=1):
-            if path in relevant:
-                first_rank = idx
-                break
-
-        metrics_by_k: dict[int, dict[str, float]] = {}
-
-        for k in ks:
-            top_k = result_paths[:k]
-            hits = len(relevant.intersection(top_k))
-            total_relevant = len(relevant)
-
-            recall = float(hits) / float(total_relevant) if total_relevant else 0.0
-            if k > 0:
-                precision = (
-                    float(hits) / float(min(k, len(result_paths)))
-                    if result_paths
-                    else 0.0
+        for query in queries:
+            start = time.perf_counter()
+            if search_mode == "semantic":
+                search_text = query.semantic_query
+                results, _ = await search_service.search_semantic(
+                    query=search_text,
+                    page_size=max_k,
+                    offset=0,
                 )
+                search_type = "semantic"
             else:
-                precision = 0.0
+                search_text = query.pattern
+                results, _ = await search_service.search_regex_async(
+                    pattern=search_text,
+                    page_size=max_k,
+                    offset=0,
+                    path_filter=None,
+                )
+                search_type = "regex"
 
-            metrics_by_k[k] = {
-                "recall": recall,
-                "precision": precision,
-                "hit_count": float(hits),
-            }
+            latency_ms = (time.perf_counter() - start) * 1000.0
 
-        per_query_metrics.append(
-            QueryMetrics(
-                query_id=query.id,
-                language=query.language,
-                pattern=search_text,
-                search_type=search_type,
-                latency_ms=latency_ms,
-                total_results=len(result_paths),
-                first_relevant_rank=first_rank,
-                metrics_by_k=metrics_by_k,
+            result_paths = [r.get("file_path") for r in results if r.get("file_path")]
+            relevant = set(query.relevant_paths)
+
+            first_rank: int | None = None
+            for idx, path in enumerate(result_paths, start=1):
+                if path in relevant:
+                    first_rank = idx
+                    break
+
+            metrics_by_k: dict[int, dict[str, float]] = {}
+
+            for k in ks:
+                top_k = result_paths[:k]
+                hits = len(relevant.intersection(top_k))
+                total_relevant = len(relevant)
+
+                recall = float(hits) / float(total_relevant) if total_relevant else 0.0
+                if k > 0:
+                    precision = (
+                        float(hits) / float(min(k, len(result_paths)))
+                        if result_paths
+                        else 0.0
+                    )
+                else:
+                    precision = 0.0
+
+                metrics_by_k[k] = {
+                    "recall": recall,
+                    "precision": precision,
+                    "hit_count": float(hits),
+                }
+
+            per_query_metrics.append(
+                QueryMetrics(
+                    query_id=query.id,
+                    language=query.language,
+                    pattern=search_text,
+                    search_type=search_type,
+                    latency_ms=latency_ms,
+                    total_results=len(result_paths),
+                    first_relevant_rank=first_rank,
+                    metrics_by_k=metrics_by_k,
+                )
             )
-        )
 
-    return per_query_metrics
+        return per_query_metrics
+    finally:
+        # Ensure DuckDB connections are closed so temp dirs can be removed on Windows
+        _cleanup_services(services)
 
 
 async def _run_mode_mixed(
@@ -480,4 +518,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
