@@ -286,3 +286,6 @@ chunkhound/_version.py
 
 # metrics
 cluster_eval.json
+
+# Temporary documentation
+.tmp-docs/
