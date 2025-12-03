@@ -1856,9 +1856,9 @@ class DuckDBProvider(SerialDatabaseProvider):
 
             if normalized_path is not None:
                 query += " AND f.path LIKE ?"
-                params.append(
-                    f"{normalized_path}%"
-                )  # Simple prefix match on relative paths
+                # Use substring match so callers can pass repo-relative paths
+                # even when the database base_directory is higher (e.g., monorepo root).
+                params.append(f"%{normalized_path}%")
 
             # Get total count for pagination
             # Build count query separately to avoid string replacement issues
@@ -1878,9 +1878,8 @@ class DuckDBProvider(SerialDatabaseProvider):
 
             if normalized_path is not None:
                 count_query += " AND f.path LIKE ?"
-                count_params.append(
-                    f"{normalized_path}%"
-                )  # Simple prefix match on relative paths
+                # Substring match for consistency with main query
+                count_params.append(f"%{normalized_path}%")
 
             total_count = conn.execute(count_query, count_params).fetchone()[0]
 
@@ -1968,9 +1967,8 @@ class DuckDBProvider(SerialDatabaseProvider):
 
             if normalized_path is not None:
                 where_conditions.append("f.path LIKE ?")
-                params.append(
-                    f"{normalized_path}%"
-                )  # Simple prefix match on relative paths
+                # Allow matching repo-relative segments inside stored paths
+                params.append(f"%{normalized_path}%")
 
             where_clause = " AND ".join(where_conditions)
 
@@ -2046,10 +2044,17 @@ class DuckDBProvider(SerialDatabaseProvider):
         model: str,
         limit: int = 10,
         threshold: float | None = None,
+        path_filter: str | None = None,
     ) -> list[dict[str, Any]]:
         """Find chunks similar to the given chunk using its embedding."""
         return self._execute_in_db_thread_sync(
-            "find_similar_chunks", chunk_id, provider, model, limit, threshold
+            "find_similar_chunks",
+            chunk_id,
+            provider,
+            model,
+            limit,
+            threshold,
+            path_filter,
         )
 
     def _executor_find_similar_chunks(
@@ -2061,9 +2066,13 @@ class DuckDBProvider(SerialDatabaseProvider):
         model: str,
         limit: int,
         threshold: float | None,
+        path_filter: str | None,
     ) -> list[dict[str, Any]]:
         """Executor method for find_similar_chunks - runs in DB thread."""
         try:
+            # Validate and normalize path filter for consistent scoping behavior
+            normalized_path = self._validate_and_normalize_path_filter(path_filter)
+
             # Find which table contains this chunk's embedding (reuse existing pattern)
             embedding_tables = self._executor_get_all_embedding_tables(conn, state)
             target_embedding = None
@@ -2136,6 +2145,14 @@ class DuckDBProvider(SerialDatabaseProvider):
                 f"AND distance <= {threshold}" if threshold is not None else ""
             )
 
+            # Optional path scoping condition
+            path_condition = ""
+            params: list[Any] = [target_embedding, provider, model, chunk_id]
+            if normalized_path is not None:
+                path_condition = "AND f.path LIKE ?"
+                # Substring match so repo-relative scopes still work when base_directory is higher
+                params.append(f"%{normalized_path}%")
+
             # Query for similar chunks (exclude the original chunk)
             # Cast the target embedding to match the table's embedding type
             query = f"""
@@ -2155,14 +2172,15 @@ class DuckDBProvider(SerialDatabaseProvider):
                 WHERE e.provider = ?
                 AND e.model = ?
                 AND c.id != ?
+                {path_condition}
                 {threshold_condition}
                 ORDER BY distance ASC
                 LIMIT ?
             """
 
-            results = conn.execute(
-                query, [target_embedding, provider, model, chunk_id, limit]
-            ).fetchall()
+            params.append(limit)
+
+            results = conn.execute(query, params).fetchall()
 
             # Format results
             result_list = [
