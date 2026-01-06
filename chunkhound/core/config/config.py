@@ -332,6 +332,9 @@ class Config(BaseModel):
 
         # Check for missing configuration
         missing_config = self.get_missing_config()
+        if command == "gap":
+            # Gap is stateless and does not require embeddings, even if partially configured.
+            missing_config = [m for m in missing_config if not m.startswith("embedding.")]
         if missing_config:
             errors.extend(
                 f"Missing required configuration: {item}" for item in missing_config

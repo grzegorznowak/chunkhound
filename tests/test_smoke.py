@@ -79,6 +79,7 @@ class TestCLICommands:
             ["chunkhound", "search", "--help"],
             ["chunkhound", "research", "--help"],
             ["chunkhound", "map", "--help"],
+            ["chunkhound", "gap", "--help"],
             ["chunkhound", "mcp", "--help"],
             ["chunkhound", "calibrate", "--help"],
         ],
