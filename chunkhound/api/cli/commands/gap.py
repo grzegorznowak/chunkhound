@@ -57,7 +57,10 @@ async def gap_command(args: argparse.Namespace, config: Config) -> None:
         warnings.append(
             GapWarning(
                 code="RECOVERY_DOWNGRADED_AGGRESSIVE_TO_SAFE",
-                message="recovery=aggressive is not available in v1; downgraded to safe",
+                message=(
+                    "recovery=aggressive is not available in v1; "
+                    "downgraded to safe"
+                ),
                 meta={"requested": requested_recovery, "effective": effective_recovery},
             )
         )

@@ -73,6 +73,13 @@ def test_gap_emits_valid_gap_v1_json_contract() -> None:
         timings = payload["stats"]["timings"]
         assert all(float(v) == 0.0 for v in timings.values())
 
+        # Gap excludes synthetic file-structure placeholders to avoid collisions
+        assert all(
+            (c.get("new") or c.get("old") or {}).get("symbol") != "file_structure"
+            for c in payload["changes"]
+            if c.get("entity_kind") == "symbol"
+        )
+
 
 def test_gap_deterministic_runs_are_byte_identical() -> None:
     with tempfile.TemporaryDirectory() as tmp:

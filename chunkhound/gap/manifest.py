@@ -127,6 +127,12 @@ def extract_file_symbols(
             include_comments=include_comments,
             include_docs=include_docs,
         )
+        # Exclude synthetic file-level structure chunks (import lists, etc.) which are
+        # not semantic entities and collide across files (e.g., `file_structure`).
+        and not (
+            c.chunk_type == ChunkType.NAMESPACE
+            and (getattr(c, "symbol", None) or "") == "file_structure"
+        )
     ]
 
     # Assign deterministic ordinals within the file.

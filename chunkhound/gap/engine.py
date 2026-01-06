@@ -24,6 +24,7 @@ from chunkhound.gap.models import (
     GapTimings,
     GapWarning,
 )
+from chunkhound.gap.recovery import recover_safe_text_hash
 
 
 class GapEngine:
@@ -268,6 +269,11 @@ class GapEngine:
             a_entries=a_symbol_entries,
             b_entries=b_symbol_entries,
         )
+
+        warnings_recovery: list[GapWarning] = []
+        if recovery_mode == "safe":
+            symbol_changes, warnings_recovery = recover_safe_text_hash(symbol_changes)
+            warnings_out.extend(warnings_recovery)
 
         changes = list(file_changes) + list(symbol_changes)
         sort_gap_changes(changes)
