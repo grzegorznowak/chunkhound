@@ -14,7 +14,7 @@ PrimaryKeyKind = Literal["symbol_key", "stable_key"]
 
 
 _PART_SUFFIX_RE = re.compile(r"(?:_part\d+)+$")
-_LINE_BASED_SYMBOL_RE = re.compile(r"_line_\d+$")
+_LINE_BASED_SYMBOL_RE = re.compile(r"(?:_line_\d+|heading_\d+)$")
 
 
 def _strip_chunk_part_suffix(symbol: str) -> str:

@@ -234,3 +234,56 @@ def test_gap_detects_symbol_content_change_in_place() -> None:
         ]
         assert updates
         assert any(u["content_changed"] is True for u in updates)
+
+
+def test_gap_stats_prints_rich_human_report() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        a_dir = root / "a"
+        b_dir = root / "b"
+        a_dir.mkdir()
+        b_dir.mkdir()
+
+        # Unchanged
+        (a_dir / "same.py").write_text("def same():\n    return 1\n", encoding="utf-8")
+        (b_dir / "same.py").write_text("def same():\n    return 1\n", encoding="utf-8")
+
+        # Modified
+        (a_dir / "mod.py").write_text("def mod():\n    return 1\n", encoding="utf-8")
+        (b_dir / "mod.py").write_text("def mod():\n    return 2\n", encoding="utf-8")
+
+        # Removed / Added
+        (a_dir / "removed.py").write_text(
+            "def removed():\n    return 1\n", encoding="utf-8"
+        )
+        (b_dir / "added.py").write_text(
+            "def added():\n    return 1\n", encoding="utf-8"
+        )
+
+        res = subprocess.run(
+            [
+                "uv",
+                "run",
+                "chunkhound",
+                "gap",
+                str(a_dir),
+                str(b_dir),
+                "--stats",
+                "--deterministic",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=20,
+            env=get_safe_subprocess_env(),
+        )
+        assert res.returncode == 0, res.stderr
+
+        out = res.stdout
+        assert "gap.v1 A->B" in out
+        assert "scope: full" in out
+        assert "files: a_total=3 b_total=3 added=1 removed=1 modified=1 unchanged=1" in out
+        assert "symbols(parsed_changed_files):" in out
+        assert "symbol_changes:" in out
+        assert "identity_collisions(parsed_changed_files):" in out
+        assert "recovery: mode=" in out
+        assert "warnings: total=" in out

@@ -10,6 +10,7 @@ from loguru import logger
 from chunkhound.core.config.config import Config
 from chunkhound.gap.engine import GapEngine
 from chunkhound.gap.models import GapWarning
+from chunkhound.gap.stats_report import render_gap_stats_report
 
 
 def _write_json(text: str, out: str) -> None:
@@ -70,28 +71,38 @@ async def gap_command(args: argparse.Namespace, config: Config) -> None:
         effective_recovery = "safe"
 
     engine = GapEngine()
-    report = engine.run(
-        a_root=a_root,
-        b_root=b_root,
-        indexing=config.indexing,
-        recovery_mode=effective_recovery,
-        deterministic=deterministic,
-        warnings=warnings,
-    )
-
-    report_dict = report.to_dict()
-
-    json_text = json.dumps(report_dict, indent=2, sort_keys=True) + "\n"
-
-    if out is not None:
-        _write_json(json_text, str(out))
-
+    details = None
     if want_stats and not want_json_only:
-        # Minimal placeholder until stats engine lands.
-        sys.stdout.write(
-            f"gap.v1 {report_dict['direction']} changes={len(report_dict['changes'])}\n"
+        report, details = engine.run_with_details(
+            a_root=a_root,
+            b_root=b_root,
+            indexing=config.indexing,
+            recovery_mode=effective_recovery,
+            deterministic=deterministic,
+            warnings=warnings,
+        )
+    else:
+        report = engine.run(
+            a_root=a_root,
+            b_root=b_root,
+            indexing=config.indexing,
+            recovery_mode=effective_recovery,
+            deterministic=deterministic,
+            warnings=warnings,
         )
 
+    json_text = None
+    if out is not None or want_json_only:
+        report_dict = report.to_dict()
+        json_text = json.dumps(report_dict, indent=2, sort_keys=True) + "\n"
+
+        if out is not None:
+            _write_json(json_text, str(out))
+
+    if want_stats and not want_json_only:
+        assert details is not None
+        sys.stdout.write(render_gap_stats_report(report=report, details=details))
+
     # If user asked for JSON-only and no --out path, default to stdout
-    if want_json_only and out is None:
+    if want_json_only and out is None and json_text is not None:
         _write_json(json_text, "-")

@@ -156,4 +156,181 @@ def test_safe_recovery_is_multiset_deterministic_under_collisions() -> None:
     assert all(c.op == "update" for c in recovered)
     assert all(c.had_collision is True for c in recovered)
     assert all(c.collision_group_size == 2 for c in recovered)
+    assert all(c.confidence == 0.5 for c in recovered)
 
+
+def test_safe_recovery_skips_oversized_bucket_and_emits_warning() -> None:
+    removed = [
+        GapChangeItem(
+            entity_kind="symbol",
+            op="remove",
+            moved=False,
+            renamed=False,
+            content_changed=True,
+            reason="symbol_anchor",
+            confidence=1.0,
+            primary_key_kind="stable_key",
+            key_strength=1,
+            had_collision=False,
+            collision_group_size=1,
+            old=_sym_handle(
+                path=f"a{i}.py",
+                symbol="foo",
+                text_hash="t1",
+                stable_key_hash=f"ra{i}",
+                ordinal_in_file=i,
+            ),
+            new=None,
+        )
+        for i in range(1, 10)
+    ]
+    added = [
+        GapChangeItem(
+            entity_kind="symbol",
+            op="add",
+            moved=False,
+            renamed=False,
+            content_changed=True,
+            reason="symbol_anchor",
+            confidence=1.0,
+            primary_key_kind="stable_key",
+            key_strength=1,
+            had_collision=False,
+            collision_group_size=1,
+            old=None,
+            new=_sym_handle(
+                path=f"b{i}.py",
+                symbol="foo",
+                text_hash="t1",
+                stable_key_hash=f"aa{i}",
+                ordinal_in_file=i,
+            ),
+        )
+        for i in range(1, 10)
+    ]
+
+    recovered, warnings = recover_safe_text_hash([*removed, *added])
+    assert len(recovered) == len(removed) + len(added)
+    assert all(c.op in {"add", "remove"} for c in recovered)
+
+    assert len(warnings) == 1
+    assert warnings[0].code == "RECOVERY_SAFE_BUCKET_SKIPPED"
+    assert (warnings[0].meta or {}).get("cap") == 8
+    assert (warnings[0].meta or {}).get("adds") == 9
+    assert (warnings[0].meta or {}).get("removes") == 9
+
+
+def test_safe_recovery_caps_total_pairs_and_emits_warning() -> None:
+    removed = [
+        GapChangeItem(
+            entity_kind="symbol",
+            op="remove",
+            moved=False,
+            renamed=False,
+            content_changed=True,
+            reason="symbol_anchor",
+            confidence=1.0,
+            primary_key_kind="stable_key",
+            key_strength=1,
+            had_collision=False,
+            collision_group_size=1,
+            old=_sym_handle(
+                path=f"a{i}.py",
+                symbol="foo",
+                text_hash="t1",
+                stable_key_hash=f"ra{i}",
+                ordinal_in_file=i,
+            ),
+            new=None,
+        )
+        for i in range(1, 6)
+    ]
+    added = [
+        GapChangeItem(
+            entity_kind="symbol",
+            op="add",
+            moved=False,
+            renamed=False,
+            content_changed=True,
+            reason="symbol_anchor",
+            confidence=1.0,
+            primary_key_kind="stable_key",
+            key_strength=1,
+            had_collision=False,
+            collision_group_size=1,
+            old=None,
+            new=_sym_handle(
+                path=f"b{i}.py",
+                symbol="foo",
+                text_hash="t1",
+                stable_key_hash=f"aa{i}",
+                ordinal_in_file=i,
+            ),
+        )
+        for i in range(1, 6)
+    ]
+
+    recovered, warnings = recover_safe_text_hash(
+        [*removed, *added],
+        recovery_max_total_recovered=3,
+    )
+
+    assert len([c for c in recovered if c.op == "update"]) == 3
+    assert len([c for c in recovered if c.op == "add"]) == 2
+    assert len([c for c in recovered if c.op == "remove"]) == 2
+
+    assert any(w.code == "RECOVERY_SAFE_CAPPED_TOTAL" for w in warnings)
+    capped = next(w for w in warnings if w.code == "RECOVERY_SAFE_CAPPED_TOTAL")
+    assert (capped.meta or {}).get("cap") == 3
+    assert (capped.meta or {}).get("attempted") == 5
+    assert (capped.meta or {}).get("applied") == 3
+
+
+def test_safe_recovery_placeholder_numeric_drift_does_not_count_as_rename() -> None:
+    removed = GapChangeItem(
+        entity_kind="symbol",
+        op="remove",
+        moved=False,
+        renamed=False,
+        content_changed=True,
+        reason="symbol_anchor",
+        confidence=1.0,
+        primary_key_kind="stable_key",
+        key_strength=1,
+        had_collision=False,
+        collision_group_size=1,
+        old=_sym_handle(
+            path="a.py",
+            symbol="block_line_224",
+            text_hash="t1",
+            stable_key_hash="ra",
+        ),
+        new=None,
+    )
+    added = GapChangeItem(
+        entity_kind="symbol",
+        op="add",
+        moved=False,
+        renamed=False,
+        content_changed=True,
+        reason="symbol_anchor",
+        confidence=1.0,
+        primary_key_kind="stable_key",
+        key_strength=1,
+        had_collision=False,
+        collision_group_size=1,
+        old=None,
+        new=_sym_handle(
+            path="b.py",
+            symbol="block_line_230",
+            text_hash="t1",
+            stable_key_hash="aa",
+        ),
+    )
+
+    recovered, warnings = recover_safe_text_hash([removed, added])
+    assert warnings == []
+    assert len(recovered) == 1
+    assert recovered[0].op == "update"
+    assert recovered[0].moved is True
+    assert recovered[0].renamed is False
