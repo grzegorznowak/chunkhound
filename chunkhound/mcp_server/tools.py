@@ -21,7 +21,6 @@ except (ImportError, AttributeError):
 from chunkhound.database_factory import DatabaseServices
 from chunkhound.embeddings import EmbeddingManager
 from chunkhound.llm_manager import LLMManager
-from chunkhound.services.deep_research_service import DeepResearchService
 from chunkhound.version import __version__
 
 # Response size limits (tokens)
@@ -645,6 +644,8 @@ async def deep_research_impl(
 
     # Create code research service with dynamic tool name
     # This ensures followup suggestions automatically update if tool is renamed
+    from chunkhound.services.deep_research_service import DeepResearchService
+
     research_service = DeepResearchService(
         database_services=services,
         embedding_manager=embedding_manager,

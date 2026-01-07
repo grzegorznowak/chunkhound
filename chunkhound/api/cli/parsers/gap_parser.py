@@ -33,6 +33,12 @@ def add_gap_subparser(subparsers: Any) -> argparse.ArgumentParser:
         help="Write JSON to this path, or '-' for stdout",
     )
     gap_parser.add_argument(
+        "--out-dir",
+        type=str,
+        default=None,
+        help="Write gap artifacts (gap.json, themes.*, stats.txt) into this folder",
+    )
+    gap_parser.add_argument(
         "--json",
         action="store_true",
         help="Emit JSON only (no human text)",
@@ -58,4 +64,3 @@ def add_gap_subparser(subparsers: Any) -> argparse.ArgumentParser:
 
 
 __all__: list[str] = ["add_gap_subparser"]
-

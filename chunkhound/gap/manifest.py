@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal
 
 import xxhash
@@ -29,6 +29,7 @@ class ParsedFileSymbols:
     rel_path: str
     symbols: list[SymbolEntry]
     parse_failed: bool
+    texts_by_ordinal: dict[int, str] = field(default_factory=dict)
 
 
 def create_gap_parser_factory() -> ParserFactory:
@@ -137,11 +138,12 @@ def extract_file_symbols(
 
     # Assign deterministic ordinals within the file.
     pre: list[
-        tuple[tuple[int, int, str, str, str], SymbolIdentity, GapSymbolHandle]
+        tuple[tuple[int, int, str, str, str], SymbolIdentity, GapSymbolHandle, str]
     ] = []
     for c in filtered:
         identity = build_symbol_identity(c)
         text_hash = _xxh3_64_text_hash(c.code)
+        normalized_code = normalize_content(c.code)
 
         handle = GapSymbolHandle(
             path=file.rel_path,
@@ -165,11 +167,12 @@ def extract_file_symbols(
             handle.symbol,
             handle.text_hash,
         )
-        pre.append((sort_key, identity, handle))
+        pre.append((sort_key, identity, handle, normalized_code))
 
     pre.sort(key=lambda x: x[0])
     entries: list[SymbolEntry] = []
-    for idx, (_, identity, handle) in enumerate(pre, start=1):
+    texts_by_ordinal: dict[int, str] = {}
+    for idx, (_, identity, handle, normalized_code) in enumerate(pre, start=1):
         handle2 = GapSymbolHandle(
             path=handle.path,
             start_line=handle.start_line,
@@ -184,6 +187,7 @@ def extract_file_symbols(
             start_byte=handle.start_byte,
             end_byte=handle.end_byte,
         )
+        texts_by_ordinal[idx] = normalized_code
         entries.append(
             SymbolEntry(
                 primary_key_hash=identity.primary_key_hash,
@@ -194,6 +198,11 @@ def extract_file_symbols(
         )
 
     return (
-        ParsedFileSymbols(rel_path=file.rel_path, symbols=entries, parse_failed=False),
+        ParsedFileSymbols(
+            rel_path=file.rel_path,
+            symbols=entries,
+            parse_failed=False,
+            texts_by_ordinal=texts_by_ordinal,
+        ),
         warnings,
     )
