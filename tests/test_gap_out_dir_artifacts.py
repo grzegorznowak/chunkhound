@@ -45,7 +45,7 @@ def test_gap_out_dir_writes_artifacts_without_embeddings() -> None:
         assert (out_dir / "themes.json").exists()
         assert (out_dir / "themes.md").exists()
         assert (out_dir / "run.json").exists()
+        assert (out_dir / "move_suggestions.json").exists()
 
         payload = json.loads((out_dir / "gap.json").read_text(encoding="utf-8"))
         assert payload["schema_version"] == "gap.v1"
-

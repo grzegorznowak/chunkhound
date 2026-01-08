@@ -65,3 +65,4 @@ def test_gap_out_dir_with_embedding_config_failure_leaves_only_gap_and_stats() -
         assert not (out_dir / "themes.json").exists()
         assert not (out_dir / "themes.md").exists()
         assert not (out_dir / "run.json").exists()
+        assert not (out_dir / "move_suggestions.json").exists()

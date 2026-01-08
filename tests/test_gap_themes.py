@@ -22,6 +22,7 @@ from chunkhound.gap.models import (
     GapTimings,
 )
 from chunkhound.gap.themes import (
+    IsotopePairing,
     ThemeItem,
     build_fallback_theme_output,
     build_theme_documents,
@@ -227,6 +228,140 @@ def test_build_theme_documents_truncates_to_max_tokens_per_doc() -> None:
     assert len(docs) == 1
     assert len(items) == 1
     assert estimate_tokens(docs[0]) <= 200
+
+
+def test_render_themes_markdown_includes_isotope_pairing_when_provided() -> None:
+    old = GapSymbolHandle(
+        path="a.py",
+        start_line=1,
+        end_line=1,
+        symbol="foo",
+        chunk_type="function",
+        text_hash="x",
+        ordinal_in_file=1,
+        parse_status="ok",
+    )
+    new = GapSymbolHandle(
+        path="b.py",
+        start_line=1,
+        end_line=1,
+        symbol="foo",
+        chunk_type="function",
+        text_hash="y",
+        ordinal_in_file=1,
+        parse_status="ok",
+    )
+    report = GapReport(
+        schema_version="gap.v1",
+        direction="A->B",
+        invariants=GapInvariants(
+            hash_alg="xxh3_64",
+            normalization=GapNormalizationInvariants(
+                id="normalize_content.v1", include_comments=False, include_docs=False
+            ),
+            chunker_version="cast@v1",
+            recovery_mode="off",
+            deterministic=True,
+            embed_model_id=None,
+            forced=False,
+        ),
+        inputs=GapInputs(
+            a=GapInputRef(source_kind="path", source_ref="a", source_hash="a"),
+            b=GapInputRef(source_kind="path", source_ref="b", source_hash="b"),
+        ),
+        scope=GapScope(
+            scope_mode="full",
+            scope_hash="x",
+            changed_files_count=1,
+            rename_hints_count=0,
+        ),
+        warnings=[],
+        stats=GapStats(counts=GapCounts(), timings=GapTimings()),
+        changes=[
+            GapChangeItem(
+                entity_kind="symbol",
+                op="remove",
+                moved=False,
+                renamed=False,
+                content_changed=True,
+                reason="symbol_anchor",
+                confidence=1.0,
+                primary_key_kind="stable_key",
+                key_strength=1,
+                had_collision=False,
+                collision_group_size=1,
+                old=old,
+                new=None,
+            ),
+            GapChangeItem(
+                entity_kind="symbol",
+                op="add",
+                moved=False,
+                renamed=False,
+                content_changed=True,
+                reason="symbol_anchor",
+                confidence=1.0,
+                primary_key_kind="stable_key",
+                key_strength=1,
+                had_collision=False,
+                collision_group_size=1,
+                old=None,
+                new=new,
+            ),
+        ],
+    )
+
+    out = build_fallback_theme_output(
+        items=[
+            ThemeItem(
+                change_index=0,
+                entity_kind="symbol",
+                op="remove",
+                reason="symbol_anchor",
+                confidence=1.0,
+                chunk_type="function",
+                path="a.py",
+                symbol="foo",
+            ),
+            ThemeItem(
+                change_index=1,
+                entity_kind="symbol",
+                op="add",
+                reason="symbol_anchor",
+                confidence=1.0,
+                chunk_type="function",
+                path="b.py",
+                symbol="foo",
+            ),
+        ],
+        label="x",
+    )
+
+    isotope_pairs = {
+        0: IsotopePairing(
+            pair_id=7,
+            role="remove",
+            counterpart_change_index=1,
+            method="llm_tiebreak",
+            confidence=0.72,
+            rationale="matched by sentinel",
+        ),
+        1: IsotopePairing(
+            pair_id=7,
+            role="add",
+            counterpart_change_index=0,
+            method="llm_tiebreak",
+            confidence=0.72,
+            rationale="matched by sentinel",
+        ),
+    }
+
+    md = render_themes_markdown(output=out, report=report, isotope_pairs=isotope_pairs)
+    assert "paired_by=llm_tiebreak" in md
+    assert "[ISO:llm_tiebreak]" in md
+    assert "a.py:1-1" in md
+    assert "b.py:1-1" in md
+    assert "rationale='matched by sentinel'" in md
 
 
 async def test_embed_in_batches_returns_one_embedding_per_text() -> None:

@@ -4,6 +4,7 @@ import argparse
 import json
 import sys
 from pathlib import Path
+from typing import Any
 
 from loguru import logger
 
@@ -13,6 +14,7 @@ from chunkhound.gap.engine import GapEngine
 from chunkhound.gap.models import GapWarning
 from chunkhound.gap.stats_report import render_gap_stats_report
 from chunkhound.gap.themes import (
+    IsotopePairing,
     build_fallback_theme_output,
     build_theme_documents,
     build_theme_output,
@@ -20,6 +22,10 @@ from chunkhound.gap.themes import (
     embed_in_batches,
     render_themes_markdown,
     write_theme_artifacts,
+)
+from chunkhound.gap.move_suggestions import (
+    build_move_suggestions_payload,
+    write_move_suggestions,
 )
 
 
@@ -47,6 +53,57 @@ def _cleanup_theme_artifacts(out_dir: Path) -> None:
             (out_dir / name).unlink()
         except FileNotFoundError:
             pass
+
+
+def _build_isotope_pairs_from_suggestions_payload(
+    payload: dict[str, Any],
+) -> dict[int, IsotopePairing]:
+    out: dict[int, IsotopePairing] = {}
+    suggestions = payload.get("suggestions")
+    if not isinstance(suggestions, list):
+        return out
+
+    for item in suggestions:
+        if not isinstance(item, dict):
+            continue
+        pair_id = item.get("pair_id")
+        rem_idx = item.get("remove_change_index")
+        add_idx = item.get("add_change_index")
+        method = item.get("method")
+        confidence = item.get("confidence")
+        rationale = item.get("rationale")
+
+        if not isinstance(pair_id, int):
+            continue
+        if not isinstance(rem_idx, int) or not isinstance(add_idx, int):
+            continue
+        if not isinstance(method, str):
+            continue
+        if isinstance(confidence, int):
+            confidence = float(confidence)
+        if not isinstance(confidence, float):
+            continue
+        if rationale is not None and not isinstance(rationale, str):
+            rationale = None
+
+        out[int(rem_idx)] = IsotopePairing(
+            pair_id=int(pair_id),
+            role="remove",
+            counterpart_change_index=int(add_idx),
+            method=method,
+            confidence=float(confidence),
+            rationale=rationale,
+        )
+        out[int(add_idx)] = IsotopePairing(
+            pair_id=int(pair_id),
+            role="add",
+            counterpart_change_index=int(rem_idx),
+            method=method,
+            confidence=float(confidence),
+            rationale=rationale,
+        )
+
+    return out
 
 
 async def gap_command(args: argparse.Namespace, config: Config) -> None:
@@ -141,6 +198,21 @@ async def gap_command(args: argparse.Namespace, config: Config) -> None:
                 out_dir_path / "stats.txt",
             )
 
+    # Advisory move/update suggestions (do not mutate gap.json); only written under --out-dir.
+    # We compute early so downstream renderers can use it, but we write it only after
+    # theme artifact generation succeeds to preserve existing failure semantics.
+    move_suggestions_payload: dict[str, Any] | None = None
+    isotope_pairs: dict[int, IsotopePairing] | None = None
+    if out_dir_path is not None:
+        move_suggestions_payload = build_move_suggestions_payload(
+            report=report,
+            # TODO: add CLI flags to tune block inclusion and caps for block-heavy diffs.
+            include_blocks=True,
+        )
+        isotope_pairs = _build_isotope_pairs_from_suggestions_payload(
+            move_suggestions_payload
+        )
+
     # Theme clustering (symbols only); always produce when it won't corrupt JSON stdout,
     # and always emit artifacts under --out-dir.
     want_themes = (out_dir_path is not None) or (not want_json_only and out != "-")
@@ -203,7 +275,15 @@ async def gap_command(args: argparse.Namespace, config: Config) -> None:
                 await provider.shutdown()
 
         if out_dir_path is not None:
-            write_theme_artifacts(out_dir=out_dir_path, report=report, output=theme_output)
+            write_theme_artifacts(
+                out_dir=out_dir_path,
+                report=report,
+                output=theme_output,
+                isotope_pairs=isotope_pairs,
+            )
+
+        if out_dir_path is not None and move_suggestions_payload is not None:
+            write_move_suggestions(out_dir=out_dir_path, payload=move_suggestions_payload)
 
         if out_dir_path is None and not want_json_only:
             if want_stats and details is not None:

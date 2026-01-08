@@ -48,11 +48,25 @@ def test_gap_out_dir_themes_artifacts_are_byte_identical_without_embeddings() ->
         res2 = _run_gap(a_dir=a_dir, b_dir=b_dir, out_dir=out2)
         assert res2.returncode == 0, res2.stderr
 
-        expected = {"gap.json", "stats.txt", "themes.json", "themes.md", "run.json"}
+        expected = {
+            "gap.json",
+            "stats.txt",
+            "themes.json",
+            "themes.md",
+            "run.json",
+            "move_suggestions.json",
+        }
         assert {p.name for p in out1.iterdir()} == expected
         assert {p.name for p in out2.iterdir()} == expected
 
-        for name in ("gap.json", "stats.txt", "themes.json", "themes.md", "run.json"):
+        for name in (
+            "gap.json",
+            "stats.txt",
+            "themes.json",
+            "themes.md",
+            "run.json",
+            "move_suggestions.json",
+        ):
             b1 = (out1 / name).read_bytes()
             b2 = (out2 / name).read_bytes()
             assert b1 == b2, f"{name} differs between deterministic runs"

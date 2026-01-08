@@ -87,3 +87,11 @@ def test_gap_out_dir_emits_themes_json_contract() -> None:
             "warnings_total",
         ):
             assert k in run_payload
+
+        suggestions_payload = json.loads(
+            (out_dir / "move_suggestions.json").read_text(encoding="utf-8")
+        )
+        assert suggestions_payload["schema_version"] == "gap.suggestions.v1"
+        assert suggestions_payload["source_schema_version"] == "gap.v1"
+        assert suggestions_payload["source_scope_hash"] == run_payload["scope_hash"]
+        assert isinstance(suggestions_payload.get("suggestions"), list)

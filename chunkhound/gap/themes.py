@@ -7,7 +7,7 @@ import json
 import re
 from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 import hdbscan  # type: ignore[import-untyped]
@@ -39,6 +39,16 @@ class ThemeOutput:
     allow_single_cluster: bool
     theme_labels: dict[int, str]
     themes: dict[int, list[ThemeItem]]
+
+
+@dataclass(frozen=True)
+class IsotopePairing:
+    pair_id: int
+    role: Literal["add", "remove"]
+    counterpart_change_index: int
+    method: str
+    confidence: float
+    rationale: str | None = None
 
 
 _TERM_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]{2,}")
@@ -262,7 +272,12 @@ def build_fallback_theme_output(*, items: list[ThemeItem], label: str) -> ThemeO
     )
 
 
-def render_themes_markdown(*, output: ThemeOutput, report: GapReport | None = None) -> str:
+def render_themes_markdown(
+    *,
+    output: ThemeOutput,
+    report: GapReport | None = None,
+    isotope_pairs: dict[int, IsotopePairing] | None = None,
+) -> str:
     theme_items = sorted(
         output.themes.items(),
         key=lambda kv: _theme_sort_key(kv[0], kv[1]),
@@ -278,6 +293,8 @@ def render_themes_markdown(*, output: ThemeOutput, report: GapReport | None = No
     )
     lines.append("")
 
+    emitted_pairs: set[int] = set()
+
     for theme_id, items in theme_items:
         label = _theme_label(output=output, theme_id=theme_id)
         lines.append(f"## Theme {theme_id}: {label} ({len(items)})")
@@ -291,10 +308,75 @@ def render_themes_markdown(*, output: ThemeOutput, report: GapReport | None = No
             for it in sorted(by_path[path], key=_theme_item_sort_key):
                 sym = it.symbol or "(unknown)"
                 ct = it.chunk_type or "symbol"
-                lines.append(
-                    f"  - {it.op} {ct} `{sym}` (reason={it.reason}, confidence={it.confidence:.2f}, change_index={it.change_index})"
+                pairing = (
+                    isotope_pairs.get(int(it.change_index))
+                    if isotope_pairs is not None
+                    else None
                 )
-        lines.append("")
+                if pairing is None:
+                    lines.append(
+                        f"  - {it.op} {ct} `{sym}` (reason={it.reason}, confidence={it.confidence:.2f}, change_index={it.change_index})"
+                    )
+                    continue
+
+                lines.append(
+                    f"  - {it.op} {ct} `{sym}` (reason={it.reason}, confidence={it.confidence:.2f}, change_index={it.change_index}, paired_by={pairing.method}, pair_id={pairing.pair_id}, pair_role={pairing.role}, paired_with={pairing.counterpart_change_index})"
+                )
+
+                if (
+                    report is None
+                    or pairing.role != "remove"
+                    or pairing.pair_id in emitted_pairs
+                ):
+                    continue
+
+                emitted_pairs.add(pairing.pair_id)
+
+                rem_idx = int(it.change_index)
+                add_idx = int(pairing.counterpart_change_index)
+                if (
+                    rem_idx < 0
+                    or rem_idx >= len(report.changes)
+                    or add_idx < 0
+                    or add_idx >= len(report.changes)
+                ):
+                    continue
+
+                rem_change = report.changes[rem_idx]
+                add_change = report.changes[add_idx]
+
+                old = (
+                    rem_change.old
+                    if isinstance(rem_change, GapChangeItem)
+                    and isinstance(rem_change.old, GapSymbolHandle)
+                    else None
+                )
+                new = (
+                    add_change.new
+                    if isinstance(add_change, GapChangeItem)
+                    and isinstance(add_change.new, GapSymbolHandle)
+                    else None
+                )
+
+                old_desc = "(unknown old)"
+                new_desc = "(unknown new)"
+                if old is not None:
+                    old_desc = (
+                        f"{old.chunk_type} `{old.symbol}` {old.path}:{old.start_line}-{old.end_line} ord={old.ordinal_in_file}"
+                    )
+                if new is not None:
+                    new_desc = (
+                        f"{new.chunk_type} `{new.symbol}` {new.path}:{new.start_line}-{new.end_line} ord={new.ordinal_in_file}"
+                    )
+
+                rationale = ""
+                if pairing.rationale:
+                    rationale = f" rationale={pairing.rationale!r}"
+
+                lines.append(
+                    f"  - [ISO:{pairing.method}] suggest_update {old_desc} -> {new_desc} (remove_change_index={rem_idx}, add_change_index={add_idx}, confidence={pairing.confidence:.2f}, pair_id={pairing.pair_id}){rationale}"
+                )
+            lines.append("")
 
     if report is not None:
         file_changes: list[tuple[int, GapChangeItem]] = [
@@ -337,7 +419,13 @@ def render_themes_markdown(*, output: ThemeOutput, report: GapReport | None = No
     return "\n".join(lines).rstrip() + "\n"
 
 
-def write_theme_artifacts(*, out_dir: Path, report: GapReport, output: ThemeOutput) -> None:
+def write_theme_artifacts(
+    *,
+    out_dir: Path,
+    report: GapReport,
+    output: ThemeOutput,
+    isotope_pairs: dict[int, IsotopePairing] | None = None,
+) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     file_change_indexes = [
@@ -388,7 +476,10 @@ def write_theme_artifacts(*, out_dir: Path, report: GapReport, output: ThemeOutp
         encoding="utf-8",
     )
     (out_dir / "themes.md").write_text(
-        render_themes_markdown(output=output, report=report), encoding="utf-8"
+        render_themes_markdown(
+            output=output, report=report, isotope_pairs=isotope_pairs
+        ),
+        encoding="utf-8",
     )
 
     run_info: dict[str, Any] = {
@@ -412,6 +503,7 @@ def write_theme_artifacts(*, out_dir: Path, report: GapReport, output: ThemeOutp
 
 
 __all__ = [
+    "IsotopePairing",
     "ThemeItem",
     "ThemeOutput",
     "build_theme_documents",
