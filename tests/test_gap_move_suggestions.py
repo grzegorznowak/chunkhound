@@ -771,3 +771,245 @@ async def test_build_move_suggestions_payload_llm_tiebreak_skips_when_disabled()
     assert isinstance(llm_meta, dict)
     assert llm_meta.get("status") == "disabled"
     assert llm_meta.get("incomplete") is False
+
+
+@pytest.mark.asyncio
+async def test_build_move_suggestions_payload_llm_dry_run_collects_prompts_without_calling_llm() -> None:
+    embedding_provider = _TagEmbeddingProvider()
+    dry_run_calls: list[tuple[str, str]] = []
+
+    old = _handle(path="a.py", chunk_type="function", symbol="old_sym", text_hash="x")
+    new1 = _handle(path="b.py", chunk_type="function", symbol="new_sym_1", text_hash="y")
+    new2 = _handle(path="c.py", chunk_type="function", symbol="new_sym_2", text_hash="z")
+    report = _make_report(
+        changes=[
+            GapChangeItem(
+                entity_kind="symbol",
+                op="remove",
+                moved=False,
+                renamed=False,
+                content_changed=True,
+                reason="symbol_anchor",
+                confidence=1.0,
+                primary_key_kind="stable_key",
+                key_strength=1,
+                had_collision=False,
+                collision_group_size=1,
+                old=old,
+                new=None,
+            ),
+            GapChangeItem(
+                entity_kind="symbol",
+                op="add",
+                moved=False,
+                renamed=False,
+                content_changed=True,
+                reason="symbol_anchor",
+                confidence=1.0,
+                primary_key_kind="stable_key",
+                key_strength=1,
+                had_collision=False,
+                collision_group_size=1,
+                old=None,
+                new=new1,
+            ),
+            GapChangeItem(
+                entity_kind="symbol",
+                op="add",
+                moved=False,
+                renamed=False,
+                content_changed=True,
+                reason="symbol_anchor",
+                confidence=1.0,
+                primary_key_kind="stable_key",
+                key_strength=1,
+                had_collision=False,
+                collision_group_size=1,
+                old=None,
+                new=new2,
+            ),
+        ]
+    )
+
+    payload = await build_move_suggestions_payload(
+        report=report,
+        include_blocks=True,
+        embedding_provider=embedding_provider,  # type: ignore[arg-type]
+        texts_a_by_path_ordinal={("a.py", 1): "PAIR1"},
+        texts_b_by_path_ordinal={("b.py", 1): "PAIR1", ("c.py", 1): "PAIR2"},
+        embed_min_score=1.1,
+        embed_min_margin=1.1,
+        llm_enabled=True,
+        llm_provider=None,
+        llm_dry_run=True,
+        llm_dry_run_collector=dry_run_calls,
+    )
+
+    suggestions = payload.get("suggestions")
+    assert isinstance(suggestions, list)
+    assert not suggestions
+
+    llm_meta = payload.get("llm")
+    assert isinstance(llm_meta, dict)
+    assert llm_meta.get("status") == "dry_run"
+    assert llm_meta.get("incomplete") is True
+
+    assert len(dry_run_calls) == 1
+    filename, content = dry_run_calls[0]
+    assert filename.startswith("llm_call_")
+    assert "## Prompt" in content
+
+
+@pytest.mark.asyncio
+async def test_build_move_suggestions_payload_llm_dry_run_skips_when_top_score_below_min_score() -> None:
+    embedding_provider = _TagEmbeddingProvider()
+    dry_run_calls: list[tuple[str, str]] = []
+
+    old = _handle(path="a.py", chunk_type="function", symbol="old_sym", text_hash="x")
+    new1 = _handle(path="b.py", chunk_type="function", symbol="new_sym_1", text_hash="y")
+    report = _make_report(
+        changes=[
+            GapChangeItem(
+                entity_kind="symbol",
+                op="remove",
+                moved=False,
+                renamed=False,
+                content_changed=True,
+                reason="symbol_anchor",
+                confidence=1.0,
+                primary_key_kind="stable_key",
+                key_strength=1,
+                had_collision=False,
+                collision_group_size=1,
+                old=old,
+                new=None,
+            ),
+            GapChangeItem(
+                entity_kind="symbol",
+                op="add",
+                moved=False,
+                renamed=False,
+                content_changed=True,
+                reason="symbol_anchor",
+                confidence=1.0,
+                primary_key_kind="stable_key",
+                key_strength=1,
+                had_collision=False,
+                collision_group_size=1,
+                old=None,
+                new=new1,
+            ),
+        ]
+    )
+
+    payload = await build_move_suggestions_payload(
+        report=report,
+        include_blocks=True,
+        embedding_provider=embedding_provider,  # type: ignore[arg-type]
+        texts_a_by_path_ordinal={("a.py", 1): "PAIR1"},
+        texts_b_by_path_ordinal={("b.py", 1): "SIM085"},
+        embed_min_score=1.1,
+        embed_min_margin=1.1,
+        llm_enabled=True,
+        llm_provider=None,
+        llm_dry_run=True,
+        llm_dry_run_collector=dry_run_calls,
+        llm_min_score=0.90,
+    )
+
+    suggestions = payload.get("suggestions")
+    assert isinstance(suggestions, list)
+    assert not suggestions
+    assert not dry_run_calls
+
+    skipped = payload.get("skipped_reasons")
+    assert isinstance(skipped, dict)
+    assert skipped.get("llm_top_score_below_min_score") == 1
+
+
+@pytest.mark.asyncio
+async def test_build_move_suggestions_payload_llm_dry_run_trims_to_fit_token_budget() -> None:
+    embedding_provider = _TagEmbeddingProvider()
+    dry_run_calls: list[tuple[str, str]] = []
+
+    old = _handle(path="a.py", chunk_type="function", symbol="old_sym", text_hash="x")
+    new1 = _handle(path="b.py", chunk_type="function", symbol="new_sym_1", text_hash="y")
+    new2 = _handle(path="c.py", chunk_type="function", symbol="new_sym_2", text_hash="z")
+    report = _make_report(
+        changes=[
+            GapChangeItem(
+                entity_kind="symbol",
+                op="remove",
+                moved=False,
+                renamed=False,
+                content_changed=True,
+                reason="symbol_anchor",
+                confidence=1.0,
+                primary_key_kind="stable_key",
+                key_strength=1,
+                had_collision=False,
+                collision_group_size=1,
+                old=old,
+                new=None,
+            ),
+            GapChangeItem(
+                entity_kind="symbol",
+                op="add",
+                moved=False,
+                renamed=False,
+                content_changed=True,
+                reason="symbol_anchor",
+                confidence=1.0,
+                primary_key_kind="stable_key",
+                key_strength=1,
+                had_collision=False,
+                collision_group_size=1,
+                old=None,
+                new=new1,
+            ),
+            GapChangeItem(
+                entity_kind="symbol",
+                op="add",
+                moved=False,
+                renamed=False,
+                content_changed=True,
+                reason="symbol_anchor",
+                confidence=1.0,
+                primary_key_kind="stable_key",
+                key_strength=1,
+                had_collision=False,
+                collision_group_size=1,
+                old=None,
+                new=new2,
+            ),
+        ]
+    )
+
+    payload = await build_move_suggestions_payload(
+        report=report,
+        include_blocks=True,
+        embedding_provider=embedding_provider,  # type: ignore[arg-type]
+        texts_a_by_path_ordinal={("a.py", 1): "PAIR1 " + ("x" * 3000)},
+        texts_b_by_path_ordinal={
+            ("b.py", 1): "PAIR1 " + ("x" * 3000),
+            ("c.py", 1): "PAIR2 " + ("x" * 3000),
+        },
+        embed_min_score=1.1,
+        embed_min_margin=1.1,
+        llm_enabled=True,
+        llm_provider=None,
+        llm_dry_run=True,
+        llm_dry_run_collector=dry_run_calls,
+        llm_min_score=0.0,
+        llm_top_k=2,
+        llm_max_prompt_tokens=1700,  # force trimming
+    )
+
+    llm_meta = payload.get("llm")
+    assert isinstance(llm_meta, dict)
+    assert llm_meta.get("status") == "dry_run"
+
+    assert len(dry_run_calls) == 1
+    _, content = dry_run_calls[0]
+    assert "- included: 1" in content
+    assert "- available: 2" in content

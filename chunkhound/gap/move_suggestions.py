@@ -444,6 +444,14 @@ def _truncate_for_llm(text: str, *, max_chars: int) -> str:
     return text[: max_chars - 1] + "…"
 
 
+def _estimate_tokens_for_prompt(text: str) -> int:
+    # Deterministic, provider-agnostic estimation to keep gating stable across
+    # environments (do not consult registry config).
+    if not text:
+        return 0
+    return max(1, int(len(text) / 3.0))
+
+
 def _llm_tiebreak_schema() -> dict[str, Any]:
     return {
         "type": "object",
@@ -501,9 +509,59 @@ def _build_llm_tiebreak_prompt(
     return "\n".join(lines).strip()
 
 
+def _render_llm_call_markdown(
+    *,
+    call_index: int,
+    remove: _Candidate,
+    candidates: list[tuple[_Candidate, float]],
+    candidates_available: int,
+    prompt: str,
+    schema: dict[str, Any],
+) -> str:
+    h = remove.handle
+    lines: list[str] = []
+    lines.append(f"# LLM Call {call_index}")
+    lines.append("")
+    lines.append("## Remove")
+    lines.append(
+        f"- change_index: {remove.change_index}\n"
+        f"- chunk_type: {h.chunk_type}\n"
+        f"- symbol: {h.symbol}\n"
+        f"- path: {h.path}\n"
+        f"- lines: {h.start_line}-{h.end_line}\n"
+        f"- ordinal_in_file: {h.ordinal_in_file}"
+    )
+    lines.append("")
+    lines.append("## Candidates")
+    lines.append(f"- included: {len(candidates)}")
+    lines.append(f"- available: {int(candidates_available)}")
+    if candidates:
+        lines.append(
+            f"- top_score: {candidates[0][1]:.3f} (add_change_index={candidates[0][0].change_index})"
+        )
+        if len(candidates) > 1:
+            lines.append(
+                f"- runner_up_score: {candidates[1][1]:.3f} (add_change_index={candidates[1][0].change_index})"
+            )
+    lines.append("")
+    lines.append("## JSON Schema")
+    lines.append("```json")
+    lines.append(json.dumps(schema, indent=2, sort_keys=True))
+    lines.append("```")
+    lines.append("")
+    lines.append("## Prompt")
+    lines.append(f"- estimated_tokens: {_estimate_tokens_for_prompt(prompt)}")
+    lines.append("")
+    lines.append("```")
+    lines.append(prompt)
+    lines.append("```")
+    lines.append("")
+    return "\n".join(lines)
+
+
 async def _suggest_llm_tiebreak_pairs(
     *,
-    llm_provider: LLMProvider,
+    llm_provider: LLMProvider | None,
     adds_by_change_index: dict[int, _Candidate],
     removes: list[_Candidate],
     candidates_by_remove: dict[int, list[tuple[int, float]]],
@@ -511,6 +569,11 @@ async def _suggest_llm_tiebreak_pairs(
     texts_b_by_path_ordinal: dict[tuple[str, int], str],
     used_adds: set[int],
     used_removes: set[int],
+    dry_run_collector: list[tuple[str, str]] | None,
+    dry_run: bool,
+    min_score: float,
+    top_k: int,
+    max_prompt_tokens: int,
 ) -> tuple[list[MoveSuggestion], Counter[str], str, bool]:
     suggestions: list[MoveSuggestion] = []
     skipped: Counter[str] = Counter()
@@ -538,6 +601,18 @@ async def _suggest_llm_tiebreak_pairs(
             skipped["llm_no_remaining_candidates"] += 1
             continue
 
+        candidates_available = len(candidates)
+        candidates.sort(key=lambda kv: (-float(kv[1]), int(kv[0].change_index)))
+
+        top_score = float(candidates[0][1])
+        if top_score < float(min_score):
+            skipped["llm_top_score_below_min_score"] += 1
+            continue
+
+        effective_top_k = max(1, int(top_k))
+        candidates = candidates[:effective_top_k]
+
+        # Token-budget-based trimming: drop lowest-ranked candidates until prompt fits.
         prompt = _build_llm_tiebreak_prompt(
             remove=rem,
             candidates=candidates,
@@ -545,9 +620,51 @@ async def _suggest_llm_tiebreak_pairs(
             texts_b_by_path_ordinal=texts_b_by_path_ordinal,
             max_chars_per_text=2000,
         )
+        while (
+            candidates
+            and _estimate_tokens_for_prompt(prompt) > int(max_prompt_tokens)
+            and len(candidates) > 1
+        ):
+            candidates = candidates[:-1]
+            prompt = _build_llm_tiebreak_prompt(
+                remove=rem,
+                candidates=candidates,
+                texts_a_by_path_ordinal=texts_a_by_path_ordinal,
+                texts_b_by_path_ordinal=texts_b_by_path_ordinal,
+                max_chars_per_text=2000,
+            )
+        if candidates and _estimate_tokens_for_prompt(prompt) > int(max_prompt_tokens):
+            skipped["llm_prompt_over_token_limit"] += 1
+            continue
+
+        if dry_run:
+            if dry_run_collector is not None:
+                filename = f"llm_call_{len(dry_run_collector)+1:04d}.md"
+                dry_run_collector.append(
+                    (
+                        filename,
+                        _render_llm_call_markdown(
+                            call_index=len(dry_run_collector) + 1,
+                            remove=rem,
+                            candidates=candidates,
+                            candidates_available=candidates_available,
+                            prompt=prompt,
+                            schema=schema,
+                        ),
+                    )
+                )
+            skipped["llm_dry_run_no_call"] += 1
+            continue
+
+        if llm_provider is None:
+            skipped["llm_provider_missing"] += 1
+            had_error = True
+            continue
 
         try:
-            result = await llm_provider.complete_structured(prompt=prompt, json_schema=schema)
+            result = await llm_provider.complete_structured(
+                prompt=prompt, json_schema=schema
+            )
         except Exception:
             skipped["llm_call_failed"] += 1
             had_error = True
@@ -605,8 +722,8 @@ async def _suggest_llm_tiebreak_pairs(
         status = "partial"
         incomplete = True
     else:
-        status = "complete"
-        incomplete = False
+        status = "dry_run" if dry_run else "complete"
+        incomplete = bool(dry_run)
 
     return suggestions, skipped, status, incomplete
 
@@ -625,6 +742,11 @@ async def build_move_suggestions_payload(
     embed_batch_size: int = 100,
     llm_provider: LLMProvider | None = None,
     llm_enabled: bool = True,
+    llm_dry_run: bool = False,
+    llm_dry_run_collector: list[tuple[str, str]] | None = None,
+    llm_min_score: float = 0.90,
+    llm_top_k: int = 8,
+    llm_max_prompt_tokens: int = 8000,
 ) -> dict[str, Any]:
     adds_raw, removes_raw = collect_unresolved(report, include_blocks=include_blocks)
     adds: list[_Candidate] = []
@@ -664,7 +786,7 @@ async def build_move_suggestions_payload(
             min_score_block=float(embed_min_score_block),
             min_margin_block=float(embed_min_margin_block),
             batch_size=max(100, int(embed_batch_size)),
-            want_candidates=bool(llm_enabled and llm_provider is not None),
+            want_candidates=bool(llm_dry_run or (llm_enabled and llm_provider is not None)),
         )
 
     used_adds = {int(s.add_change_index) for s in heuristic_suggestions + embed_suggestions}
@@ -687,11 +809,11 @@ async def build_move_suggestions_payload(
     elif embedding_provider is None:
         llm_status = "skipped_no_embedding_candidates"
         llm_incomplete = True
-    elif llm_provider is None:
-        llm_status = "not_configured"
-        llm_incomplete = True
     elif not candidates_by_remove:
         llm_status = "skipped_no_embedding_candidates"
+        llm_incomplete = True
+    elif (not llm_dry_run) and llm_provider is None:
+        llm_status = "not_configured"
         llm_incomplete = True
     else:
         adds_by_change_index = {int(c.change_index): c for c in adds_left}
@@ -709,6 +831,11 @@ async def build_move_suggestions_payload(
             texts_b_by_path_ordinal=texts_b_by_path_ordinal or {},
             used_adds=used_adds,
             used_removes=used_removes,
+            dry_run_collector=llm_dry_run_collector,
+            dry_run=bool(llm_dry_run),
+            min_score=float(llm_min_score),
+            top_k=int(llm_top_k),
+            max_prompt_tokens=int(llm_max_prompt_tokens),
         )
 
     all_suggestions = (
@@ -756,6 +883,10 @@ async def build_move_suggestions_payload(
             },
             "llm": {
                 "enabled": bool(llm_enabled),
+                "dry_run": bool(llm_dry_run),
+                "min_score": float(llm_min_score),
+                "top_k": int(llm_top_k),
+                "max_prompt_tokens": int(llm_max_prompt_tokens),
             },
         },
         "counts_by_method": dict(counts_by_method),

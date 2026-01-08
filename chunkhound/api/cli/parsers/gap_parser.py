@@ -23,8 +23,9 @@ def add_gap_subparser(subparsers: Any) -> argparse.ArgumentParser:
 
     add_common_arguments(gap_parser)
 
-    # Gap reuses indexing include/exclude + ignore settings, but does not require DB/embeddings.
-    add_config_arguments(gap_parser, ["indexing"])
+    # Gap reuses indexing include/exclude + ignore settings, and supports disabling
+    # embeddings via --no-embeddings to keep deterministic/no-network runs stable.
+    add_config_arguments(gap_parser, ["indexing", "embedding"])
 
     gap_parser.add_argument(
         "--out",
@@ -69,6 +70,41 @@ def add_gap_subparser(subparsers: Any) -> argparse.ArgumentParser:
         "--no-move-suggestions-llm",
         action="store_true",
         help="Disable the LLM tiebreak stage for move_suggestions (heuristics/embeddings only)",
+    )
+    gap_parser.add_argument(
+        "--move-suggestions-llm-dry-run",
+        action="store_true",
+        help=(
+            "Debug: write each LLM tiebreak prompt to llm_call_N.md under --out-dir "
+            "without invoking any LLM provider"
+        ),
+    )
+    gap_parser.add_argument(
+        "--move-suggestions-llm-min-score",
+        type=float,
+        default=0.90,
+        help=(
+            "Minimum embedding similarity required to attempt LLM tiebreak for a remove "
+            "(default: 0.90)"
+        ),
+    )
+    gap_parser.add_argument(
+        "--move-suggestions-llm-top-k",
+        type=int,
+        default=8,
+        help=(
+            "Maximum number of embedding-ranked candidates to include per LLM tiebreak prompt "
+            "(default: 8; may be reduced to fit token budget)"
+        ),
+    )
+    gap_parser.add_argument(
+        "--move-suggestions-llm-max-prompt-tokens",
+        type=int,
+        default=8000,
+        help=(
+            "Maximum estimated prompt tokens for LLM tiebreak (default: 8000; candidates trimmed "
+            "to fit)"
+        ),
     )
     gap_parser.add_argument(
         "--move-suggestions-embed-min-score",

@@ -203,6 +203,16 @@ async def gap_command(args: argparse.Namespace, config: Config) -> None:
     move_suggestions_llm_disabled = bool(
         getattr(args, "no_move_suggestions_llm", False)
     )
+    move_suggestions_llm_dry_run = bool(
+        getattr(args, "move_suggestions_llm_dry_run", False)
+    )
+    move_suggestions_llm_min_score = float(
+        getattr(args, "move_suggestions_llm_min_score", 0.90)
+    )
+    move_suggestions_llm_top_k = int(getattr(args, "move_suggestions_llm_top_k", 8))
+    move_suggestions_llm_max_prompt_tokens = int(
+        getattr(args, "move_suggestions_llm_max_prompt_tokens", 8000)
+    )
     move_suggestions_embed_min_score = float(
         getattr(args, "move_suggestions_embed_min_score", 0.82)
     )
@@ -222,6 +232,7 @@ async def gap_command(args: argparse.Namespace, config: Config) -> None:
     if want_themes:
         move_suggestions_payload: dict[str, Any] | None = None
         isotope_pairs: dict[int, IsotopePairing] | None = None
+        move_suggestions_llm_dry_run_calls: list[tuple[str, str]] | None = None
 
         docs, theme_items = build_theme_documents(
             report=report,
@@ -258,7 +269,14 @@ async def gap_command(args: argparse.Namespace, config: Config) -> None:
                 # Only used under --out-dir, and written only after themes succeed.
                 if out_dir_path is not None and not move_suggestions_disabled:
                     llm_provider = None
-                    if not move_suggestions_llm_disabled and config.llm is not None:
+                    llm_dry_run_calls: list[tuple[str, str]] = []
+                    move_suggestions_llm_dry_run_calls = llm_dry_run_calls
+
+                    if (
+                        not move_suggestions_llm_disabled
+                        and not move_suggestions_llm_dry_run
+                        and config.llm is not None
+                    ):
                         try:
                             utility_config, synthesis_config = (
                                 config.llm.get_provider_configs()
@@ -283,7 +301,15 @@ async def gap_command(args: argparse.Namespace, config: Config) -> None:
                         embed_min_margin_block=move_suggestions_embed_min_margin_block,
                         embed_batch_size=batch_size,
                         llm_provider=llm_provider,
-                        llm_enabled=not move_suggestions_llm_disabled,
+                        llm_enabled=bool(
+                            (not move_suggestions_llm_disabled)
+                            or move_suggestions_llm_dry_run
+                        ),
+                        llm_dry_run=bool(move_suggestions_llm_dry_run),
+                        llm_dry_run_collector=llm_dry_run_calls,
+                        llm_min_score=move_suggestions_llm_min_score,
+                        llm_top_k=move_suggestions_llm_top_k,
+                        llm_max_prompt_tokens=move_suggestions_llm_max_prompt_tokens,
                     )
                     isotope_pairs = _build_isotope_pairs_from_suggestions_payload(
                         move_suggestions_payload
@@ -323,6 +349,8 @@ async def gap_command(args: argparse.Namespace, config: Config) -> None:
             and not move_suggestions_disabled
             and move_suggestions_payload is None
         ):
+            llm_dry_run_calls: list[tuple[str, str]] = []
+            move_suggestions_llm_dry_run_calls = llm_dry_run_calls
             move_suggestions_payload = await build_move_suggestions_payload(
                 report=report,
                 include_blocks=True,
@@ -335,7 +363,14 @@ async def gap_command(args: argparse.Namespace, config: Config) -> None:
                 embed_min_margin_block=move_suggestions_embed_min_margin_block,
                 embed_batch_size=100,
                 llm_provider=None,
-                llm_enabled=not move_suggestions_llm_disabled,
+                llm_enabled=bool(
+                    (not move_suggestions_llm_disabled) or move_suggestions_llm_dry_run
+                ),
+                llm_dry_run=bool(move_suggestions_llm_dry_run),
+                llm_dry_run_collector=llm_dry_run_calls,
+                llm_min_score=move_suggestions_llm_min_score,
+                llm_top_k=move_suggestions_llm_top_k,
+                llm_max_prompt_tokens=move_suggestions_llm_max_prompt_tokens,
             )
             isotope_pairs = _build_isotope_pairs_from_suggestions_payload(
                 move_suggestions_payload
@@ -348,6 +383,18 @@ async def gap_command(args: argparse.Namespace, config: Config) -> None:
                 output=theme_output,
                 isotope_pairs=isotope_pairs,
             )
+            if (
+                move_suggestions_llm_dry_run
+                and move_suggestions_llm_dry_run_calls is not None
+                and move_suggestions_llm_dry_run_calls
+            ):
+                for filename, content in move_suggestions_llm_dry_run_calls:
+                    try:
+                        (out_dir_path / filename).write_text(content, encoding="utf-8")
+                    except Exception as e:
+                        logger.warning(
+                            f"Failed to write move suggestions LLM dry-run artifact {filename}: {e}"
+                        )
 
         if (
             out_dir_path is not None

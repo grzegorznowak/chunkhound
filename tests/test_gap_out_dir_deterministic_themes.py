@@ -22,6 +22,7 @@ def _run_gap(*, a_dir: Path, b_dir: Path, out_dir: Path) -> subprocess.Completed
             "--out-dir",
             str(out_dir),
             "--deterministic",
+            "--no-embeddings",
         ],
         capture_output=True,
         text=True,

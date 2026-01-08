@@ -34,6 +34,7 @@ def test_gap_out_dir_emits_themes_json_contract() -> None:
                 "--out-dir",
                 str(out_dir),
                 "--deterministic",
+                "--no-embeddings",
             ],
             capture_output=True,
             text=True,

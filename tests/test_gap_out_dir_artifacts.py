@@ -32,6 +32,7 @@ def test_gap_out_dir_writes_artifacts_without_embeddings() -> None:
                 "--out-dir",
                 str(out_dir),
                 "--deterministic",
+                "--no-embeddings",
             ],
             capture_output=True,
             text=True,
