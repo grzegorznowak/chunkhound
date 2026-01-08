@@ -23,6 +23,7 @@ from chunkhound.gap.themes import (
     render_themes_markdown,
     write_theme_artifacts,
 )
+from chunkhound.llm_manager import LLMManager
 from chunkhound.gap.move_suggestions import (
     build_move_suggestions_payload,
     write_move_suggestions,
@@ -198,25 +199,30 @@ async def gap_command(args: argparse.Namespace, config: Config) -> None:
                 out_dir_path / "stats.txt",
             )
 
-    # Advisory move/update suggestions (do not mutate gap.json); only written under --out-dir.
-    # We compute early so downstream renderers can use it, but we write it only after
-    # theme artifact generation succeeds to preserve existing failure semantics.
-    move_suggestions_payload: dict[str, Any] | None = None
-    isotope_pairs: dict[int, IsotopePairing] | None = None
-    if out_dir_path is not None:
-        move_suggestions_payload = build_move_suggestions_payload(
-            report=report,
-            # TODO: add CLI flags to tune block inclusion and caps for block-heavy diffs.
-            include_blocks=True,
-        )
-        isotope_pairs = _build_isotope_pairs_from_suggestions_payload(
-            move_suggestions_payload
-        )
+    move_suggestions_disabled = bool(getattr(args, "no_move_suggestions", False))
+    move_suggestions_llm_disabled = bool(
+        getattr(args, "no_move_suggestions_llm", False)
+    )
+    move_suggestions_embed_min_score = float(
+        getattr(args, "move_suggestions_embed_min_score", 0.82)
+    )
+    move_suggestions_embed_min_margin = float(
+        getattr(args, "move_suggestions_embed_min_margin", 0.06)
+    )
+    move_suggestions_embed_min_score_block = float(
+        getattr(args, "move_suggestions_embed_min_score_block", 0.88)
+    )
+    move_suggestions_embed_min_margin_block = float(
+        getattr(args, "move_suggestions_embed_min_margin_block", 0.10)
+    )
 
     # Theme clustering (symbols only); always produce when it won't corrupt JSON stdout,
     # and always emit artifacts under --out-dir.
     want_themes = (out_dir_path is not None) or (not want_json_only and out != "-")
     if want_themes:
+        move_suggestions_payload: dict[str, Any] | None = None
+        isotope_pairs: dict[int, IsotopePairing] | None = None
+
         docs, theme_items = build_theme_documents(
             report=report,
             texts_a_by_path_ordinal=texts_a_by_path_ordinal,
@@ -247,6 +253,42 @@ async def gap_command(args: argparse.Namespace, config: Config) -> None:
             await provider.initialize()
             try:
                 batch_size = max(100, int(getattr(config.embedding, "batch_size", 100)))
+
+                # Advisory move/update suggestions (do not mutate gap.json).
+                # Only used under --out-dir, and written only after themes succeed.
+                if out_dir_path is not None and not move_suggestions_disabled:
+                    llm_provider = None
+                    if not move_suggestions_llm_disabled and config.llm is not None:
+                        try:
+                            utility_config, synthesis_config = (
+                                config.llm.get_provider_configs()
+                            )
+                            llm_manager = LLMManager(utility_config, synthesis_config)
+                            llm_provider = llm_manager.get_synthesis_provider()
+                        except Exception as e:
+                            logger.warning(
+                                "Move suggestions LLM setup failed; continuing without LLM: "
+                                f"{e}"
+                            )
+
+                    move_suggestions_payload = await build_move_suggestions_payload(
+                        report=report,
+                        include_blocks=True,
+                        texts_a_by_path_ordinal=texts_a_by_path_ordinal,
+                        texts_b_by_path_ordinal=texts_b_by_path_ordinal,
+                        embedding_provider=provider,
+                        embed_min_score=move_suggestions_embed_min_score,
+                        embed_min_margin=move_suggestions_embed_min_margin,
+                        embed_min_score_block=move_suggestions_embed_min_score_block,
+                        embed_min_margin_block=move_suggestions_embed_min_margin_block,
+                        embed_batch_size=batch_size,
+                        llm_provider=llm_provider,
+                        llm_enabled=not move_suggestions_llm_disabled,
+                    )
+                    isotope_pairs = _build_isotope_pairs_from_suggestions_payload(
+                        move_suggestions_payload
+                    )
+
                 embeddings = await embed_in_batches(
                     provider=provider,
                     texts=docs,
@@ -274,6 +316,31 @@ async def gap_command(args: argparse.Namespace, config: Config) -> None:
             finally:
                 await provider.shutdown()
 
+        # If we don't have an embedding provider, still emit heuristic-only move
+        # suggestions for isotope labeling under --out-dir (default-on).
+        if (
+            out_dir_path is not None
+            and not move_suggestions_disabled
+            and move_suggestions_payload is None
+        ):
+            move_suggestions_payload = await build_move_suggestions_payload(
+                report=report,
+                include_blocks=True,
+                texts_a_by_path_ordinal=texts_a_by_path_ordinal,
+                texts_b_by_path_ordinal=texts_b_by_path_ordinal,
+                embedding_provider=None,
+                embed_min_score=move_suggestions_embed_min_score,
+                embed_min_margin=move_suggestions_embed_min_margin,
+                embed_min_score_block=move_suggestions_embed_min_score_block,
+                embed_min_margin_block=move_suggestions_embed_min_margin_block,
+                embed_batch_size=100,
+                llm_provider=None,
+                llm_enabled=not move_suggestions_llm_disabled,
+            )
+            isotope_pairs = _build_isotope_pairs_from_suggestions_payload(
+                move_suggestions_payload
+            )
+
         if out_dir_path is not None:
             write_theme_artifacts(
                 out_dir=out_dir_path,
@@ -282,7 +349,11 @@ async def gap_command(args: argparse.Namespace, config: Config) -> None:
                 isotope_pairs=isotope_pairs,
             )
 
-        if out_dir_path is not None and move_suggestions_payload is not None:
+        if (
+            out_dir_path is not None
+            and not move_suggestions_disabled
+            and move_suggestions_payload is not None
+        ):
             write_move_suggestions(out_dir=out_dir_path, payload=move_suggestions_payload)
 
         if out_dir_path is None and not want_json_only:

@@ -60,6 +60,41 @@ def add_gap_subparser(subparsers: Any) -> argparse.ArgumentParser:
         help="Recovery mode for pairing leftover symbols (default: off)",
     )
 
+    gap_parser.add_argument(
+        "--no-move-suggestions",
+        action="store_true",
+        help="Disable advisory move_suggestions.json and isotope annotations under --out-dir",
+    )
+    gap_parser.add_argument(
+        "--no-move-suggestions-llm",
+        action="store_true",
+        help="Disable the LLM tiebreak stage for move_suggestions (heuristics/embeddings only)",
+    )
+    gap_parser.add_argument(
+        "--move-suggestions-embed-min-score",
+        type=float,
+        default=0.82,
+        help="Embedding auto-accept minimum similarity for non-block symbols (default: 0.82)",
+    )
+    gap_parser.add_argument(
+        "--move-suggestions-embed-min-margin",
+        type=float,
+        default=0.06,
+        help="Embedding auto-accept minimum best-vs-runner-up margin for non-block symbols (default: 0.06)",
+    )
+    gap_parser.add_argument(
+        "--move-suggestions-embed-min-score-block",
+        type=float,
+        default=0.88,
+        help="Embedding auto-accept minimum similarity for block symbols (default: 0.88)",
+    )
+    gap_parser.add_argument(
+        "--move-suggestions-embed-min-margin-block",
+        type=float,
+        default=0.10,
+        help="Embedding auto-accept minimum best-vs-runner-up margin for block symbols (default: 0.10)",
+    )
+
     return cast(argparse.ArgumentParser, gap_parser)
 
 
