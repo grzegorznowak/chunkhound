@@ -107,6 +107,15 @@ def add_gap_subparser(subparsers: Any) -> argparse.ArgumentParser:
         ),
     )
     gap_parser.add_argument(
+        "--move-suggestions-llm-concurrency",
+        type=int,
+        default=5,
+        help=(
+            "Maximum number of concurrent LLM tiebreak calls (default: 5; only runs calls in "
+            "parallel when candidate sets are disjoint)"
+        ),
+    )
+    gap_parser.add_argument(
         "--move-suggestions-embed-min-score",
         type=float,
         default=0.82,

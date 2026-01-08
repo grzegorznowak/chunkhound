@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import re
 import pytest
 
 import math
@@ -233,6 +235,35 @@ class _StubLLMProvider:
         _ = (prompt, json_schema, system, max_completion_tokens, timeout)
         return {
             "add_change_index": self._chosen_add_change_index,
+            "confidence": 0.77,
+            "rationale": "stub choice for unit test",
+        }
+
+
+class _ConcurrentTrackingLLMProvider:
+    def __init__(self, *, delay_s: float = 0.05) -> None:
+        self.max_in_flight = 0
+        self._in_flight = 0
+        self._delay_s = float(delay_s)
+
+    async def complete_structured(  # type: ignore[override]
+        self,
+        prompt: str,
+        json_schema: dict[str, object],
+        system: str | None = None,
+        max_completion_tokens: int = 4096,
+        timeout: int | None = None,
+    ) -> dict[str, object]:
+        _ = (json_schema, system, max_completion_tokens, timeout)
+        self._in_flight += 1
+        self.max_in_flight = max(self.max_in_flight, self._in_flight)
+        await asyncio.sleep(self._delay_s)
+        self._in_flight -= 1
+
+        m = re.search(r"add_change_index=(\d+)", prompt)
+        assert m is not None
+        return {
+            "add_change_index": int(m.group(1)),
             "confidence": 0.77,
             "rationale": "stub choice for unit test",
         }
@@ -707,6 +738,196 @@ async def test_build_move_suggestions_payload_llm_tiebreak_runs_when_requested_a
     assert isinstance(llm_meta, dict)
     assert llm_meta.get("status") == "complete"
     assert llm_meta.get("incomplete") is False
+
+
+@pytest.mark.asyncio
+async def test_build_move_suggestions_payload_llm_tiebreak_runs_concurrently_when_candidate_sets_disjoint() -> None:
+    embedding_provider = _TagEmbeddingProvider()
+    llm_provider = _ConcurrentTrackingLLMProvider(delay_s=0.05)
+
+    old1 = _handle(path="a1.py", chunk_type="function", symbol="old_1", text_hash="x")
+    old2 = _handle(path="a2.py", chunk_type="function", symbol="old_2", text_hash="y")
+    new1 = _handle(path="b1.py", chunk_type="function", symbol="new_1", text_hash="u")
+    new2 = _handle(path="b2.py", chunk_type="function", symbol="new_2", text_hash="v")
+    report = _make_report(
+        changes=[
+            GapChangeItem(
+                entity_kind="symbol",
+                op="remove",
+                moved=False,
+                renamed=False,
+                content_changed=True,
+                reason="symbol_anchor",
+                confidence=1.0,
+                primary_key_kind="stable_key",
+                key_strength=1,
+                had_collision=False,
+                collision_group_size=1,
+                old=old1,
+                new=None,
+            ),
+            GapChangeItem(
+                entity_kind="symbol",
+                op="remove",
+                moved=False,
+                renamed=False,
+                content_changed=True,
+                reason="symbol_anchor",
+                confidence=1.0,
+                primary_key_kind="stable_key",
+                key_strength=1,
+                had_collision=False,
+                collision_group_size=1,
+                old=old2,
+                new=None,
+            ),
+            GapChangeItem(
+                entity_kind="symbol",
+                op="add",
+                moved=False,
+                renamed=False,
+                content_changed=True,
+                reason="symbol_anchor",
+                confidence=1.0,
+                primary_key_kind="stable_key",
+                key_strength=1,
+                had_collision=False,
+                collision_group_size=1,
+                old=None,
+                new=new1,
+            ),
+            GapChangeItem(
+                entity_kind="symbol",
+                op="add",
+                moved=False,
+                renamed=False,
+                content_changed=True,
+                reason="symbol_anchor",
+                confidence=1.0,
+                primary_key_kind="stable_key",
+                key_strength=1,
+                had_collision=False,
+                collision_group_size=1,
+                old=None,
+                new=new2,
+            ),
+        ]
+    )
+
+    payload = await build_move_suggestions_payload(
+        report=report,
+        include_blocks=True,
+        embedding_provider=embedding_provider,  # type: ignore[arg-type]
+        texts_a_by_path_ordinal={("a1.py", 1): "PAIR1", ("a2.py", 1): "PAIR2"},
+        texts_b_by_path_ordinal={("b1.py", 1): "PAIR1", ("b2.py", 1): "PAIR2"},
+        embed_min_score=1.1,
+        embed_min_margin=1.1,
+        llm_provider=llm_provider,  # type: ignore[arg-type]
+        llm_enabled=True,
+        llm_top_k=1,
+        llm_concurrency=5,
+    )
+
+    suggestions = payload.get("suggestions")
+    assert isinstance(suggestions, list)
+    assert len([s for s in suggestions if s["method"] == "llm_tiebreak"]) == 2
+    assert llm_provider.max_in_flight >= 2
+
+
+@pytest.mark.asyncio
+async def test_build_move_suggestions_payload_llm_tiebreak_is_sequential_when_candidate_sets_overlap() -> None:
+    embedding_provider = _TagEmbeddingProvider()
+    llm_provider = _ConcurrentTrackingLLMProvider(delay_s=0.05)
+
+    old1 = _handle(path="a1.py", chunk_type="function", symbol="old_1", text_hash="x")
+    old2 = _handle(path="a2.py", chunk_type="function", symbol="old_2", text_hash="y")
+    new1 = _handle(path="b1.py", chunk_type="function", symbol="new_1", text_hash="u")
+    new2 = _handle(path="b2.py", chunk_type="function", symbol="new_2", text_hash="v")
+    report = _make_report(
+        changes=[
+            GapChangeItem(
+                entity_kind="symbol",
+                op="remove",
+                moved=False,
+                renamed=False,
+                content_changed=True,
+                reason="symbol_anchor",
+                confidence=1.0,
+                primary_key_kind="stable_key",
+                key_strength=1,
+                had_collision=False,
+                collision_group_size=1,
+                old=old1,
+                new=None,
+            ),
+            GapChangeItem(
+                entity_kind="symbol",
+                op="remove",
+                moved=False,
+                renamed=False,
+                content_changed=True,
+                reason="symbol_anchor",
+                confidence=1.0,
+                primary_key_kind="stable_key",
+                key_strength=1,
+                had_collision=False,
+                collision_group_size=1,
+                old=old2,
+                new=None,
+            ),
+            GapChangeItem(
+                entity_kind="symbol",
+                op="add",
+                moved=False,
+                renamed=False,
+                content_changed=True,
+                reason="symbol_anchor",
+                confidence=1.0,
+                primary_key_kind="stable_key",
+                key_strength=1,
+                had_collision=False,
+                collision_group_size=1,
+                old=None,
+                new=new1,
+            ),
+            GapChangeItem(
+                entity_kind="symbol",
+                op="add",
+                moved=False,
+                renamed=False,
+                content_changed=True,
+                reason="symbol_anchor",
+                confidence=1.0,
+                primary_key_kind="stable_key",
+                key_strength=1,
+                had_collision=False,
+                collision_group_size=1,
+                old=None,
+                new=new2,
+            ),
+        ]
+    )
+
+    payload = await build_move_suggestions_payload(
+        report=report,
+        include_blocks=True,
+        embedding_provider=embedding_provider,  # type: ignore[arg-type]
+        texts_a_by_path_ordinal={("a1.py", 1): "PAIR1", ("a2.py", 1): "PAIR2"},
+        texts_b_by_path_ordinal={("b1.py", 1): "PAIR1", ("b2.py", 1): "PAIR2"},
+        embed_min_score=1.1,
+        embed_min_margin=1.1,
+        llm_provider=llm_provider,  # type: ignore[arg-type]
+        llm_enabled=True,
+        llm_top_k=2,
+        llm_concurrency=5,
+    )
+
+    suggestions = payload.get("suggestions")
+    assert isinstance(suggestions, list)
+    llm_suggestions = [s for s in suggestions if s["method"] == "llm_tiebreak"]
+    assert len(llm_suggestions) == 2
+    assert llm_provider.max_in_flight == 1
+    assert llm_suggestions[0]["add_change_index"] != llm_suggestions[1]["add_change_index"]
 
 
 @pytest.mark.asyncio

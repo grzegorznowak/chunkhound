@@ -3,6 +3,7 @@
 from collections import Counter, defaultdict
 from dataclasses import replace
 from pathlib import Path
+from typing import Any
 
 from chunkhound.core.config.indexing_config import IndexingConfig
 from chunkhound.gap.diff import (
@@ -45,6 +46,7 @@ class GapEngine:
         deterministic: bool,
         warnings: list[GapWarning] | None,
         capture_symbol_texts: bool,
+        progress: Any | None = None,
     ) -> tuple[
         GapReport,
         GapStatsDetails,
@@ -104,7 +106,25 @@ class GapEngine:
         a_paths = set(a_source.files.keys())
         b_paths = set(b_source.files.keys())
         all_paths = sorted(a_paths | b_paths)
+
+        scan_task_id = None
+        if progress is not None:
+            try:
+                scan_task_id = progress.add_task(
+                    "Gap: scanning files",
+                    total=len(all_paths),
+                    info="",
+                    speed="",
+                )
+            except Exception:
+                scan_task_id = None
+
         for rel_path in all_paths:
+            if scan_task_id is not None:
+                try:
+                    progress.update(scan_task_id, advance=1, info=str(rel_path))
+                except Exception:
+                    pass
             a_file = a_source.files.get(rel_path)
             b_file = b_source.files.get(rel_path)
 
@@ -440,6 +460,7 @@ class GapEngine:
         recovery_mode: str,
         deterministic: bool,
         warnings: list[GapWarning] | None = None,
+        progress: Any | None = None,
     ) -> GapReport:
         report, _, _, _ = self._run_pipeline(
             a_root=a_root,
@@ -449,6 +470,7 @@ class GapEngine:
             deterministic=deterministic,
             warnings=warnings,
             capture_symbol_texts=False,
+            progress=progress,
         )
         return report
 
@@ -461,6 +483,7 @@ class GapEngine:
         recovery_mode: str,
         deterministic: bool,
         warnings: list[GapWarning] | None = None,
+        progress: Any | None = None,
     ) -> tuple[GapReport, GapStatsDetails]:
         report, details, _, _ = self._run_pipeline(
             a_root=a_root,
@@ -469,6 +492,8 @@ class GapEngine:
             recovery_mode=recovery_mode,
             deterministic=deterministic,
             warnings=warnings,
+            capture_symbol_texts=False,
+            progress=progress,
         )
         return report, details
 
@@ -481,6 +506,7 @@ class GapEngine:
         recovery_mode: str,
         deterministic: bool,
         warnings: list[GapWarning] | None = None,
+        progress: Any | None = None,
     ) -> tuple[
         GapReport,
         GapStatsDetails,
@@ -495,4 +521,5 @@ class GapEngine:
             deterministic=deterministic,
             warnings=warnings,
             capture_symbol_texts=True,
+            progress=progress,
         )

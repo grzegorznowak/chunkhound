@@ -1,6 +1,7 @@
 """Gap command module - stateless semantic gap analysis between two folders."""
 
 import argparse
+from contextlib import nullcontext
 import json
 import sys
 from pathlib import Path
@@ -28,6 +29,8 @@ from chunkhound.gap.move_suggestions import (
     build_move_suggestions_payload,
     write_move_suggestions,
 )
+
+from ..utils.rich_output import RichOutputFormatter
 
 
 def _write_json(text: str, out: str) -> None:
@@ -151,31 +154,48 @@ async def gap_command(args: argparse.Namespace, config: Config) -> None:
         # Defensive (should not happen after downgrade); keep behavior stable.
         effective_recovery = "safe"
 
+    out_dir_path = Path(out_dir).resolve() if out_dir is not None else None
+    formatter = (
+        RichOutputFormatter(verbose=bool(getattr(args, "verbose", False)))
+        if out != "-"
+        else None
+    )
+
+    progress_ctx = (
+        formatter.create_progress_display() if formatter is not None else nullcontext()
+    )
+    progress_instance = None
+
     engine = GapEngine()
     capture_texts = (out_dir is not None) or (not want_json_only and out != "-")
-    if want_stats or out_dir is not None or capture_texts:
-        report, details, texts_a_by_path_ordinal, texts_b_by_path_ordinal = (
-            engine.run_with_details_and_symbol_texts(
+    with progress_ctx as progress_manager:
+        if formatter is not None:
+            progress_instance = progress_manager.get_progress_instance()
+        if want_stats or out_dir is not None or capture_texts:
+            report, details, texts_a_by_path_ordinal, texts_b_by_path_ordinal = (
+                engine.run_with_details_and_symbol_texts(
+                    a_root=a_root,
+                    b_root=b_root,
+                    indexing=config.indexing,
+                    recovery_mode=effective_recovery,
+                    deterministic=deterministic,
+                    warnings=warnings,
+                    progress=progress_instance,
+                )
+            )
+        else:
+            report = engine.run(
                 a_root=a_root,
                 b_root=b_root,
                 indexing=config.indexing,
                 recovery_mode=effective_recovery,
                 deterministic=deterministic,
                 warnings=warnings,
+                progress=progress_instance,
             )
-        )
-    else:
-        report = engine.run(
-            a_root=a_root,
-            b_root=b_root,
-            indexing=config.indexing,
-            recovery_mode=effective_recovery,
-            deterministic=deterministic,
-            warnings=warnings,
-        )
-        details = None
-        texts_a_by_path_ordinal = {}
-        texts_b_by_path_ordinal = {}
+            details = None
+            texts_a_by_path_ordinal = {}
+            texts_b_by_path_ordinal = {}
 
     json_text = None
     if out is not None or want_json_only:
@@ -185,7 +205,6 @@ async def gap_command(args: argparse.Namespace, config: Config) -> None:
         if out is not None:
             _write_json(json_text, str(out))
 
-    out_dir_path = Path(out_dir).resolve() if out_dir is not None else None
     if out_dir_path is not None:
         out_dir_path.mkdir(parents=True, exist_ok=True)
         if json_text is None:
@@ -212,6 +231,9 @@ async def gap_command(args: argparse.Namespace, config: Config) -> None:
     move_suggestions_llm_top_k = int(getattr(args, "move_suggestions_llm_top_k", 8))
     move_suggestions_llm_max_prompt_tokens = int(
         getattr(args, "move_suggestions_llm_max_prompt_tokens", 8000)
+    )
+    move_suggestions_llm_concurrency = int(
+        getattr(args, "move_suggestions_llm_concurrency", 5)
     )
     move_suggestions_embed_min_score = float(
         getattr(args, "move_suggestions_embed_min_score", 0.82)
@@ -310,30 +332,43 @@ async def gap_command(args: argparse.Namespace, config: Config) -> None:
                         llm_min_score=move_suggestions_llm_min_score,
                         llm_top_k=move_suggestions_llm_top_k,
                         llm_max_prompt_tokens=move_suggestions_llm_max_prompt_tokens,
+                        llm_concurrency=move_suggestions_llm_concurrency,
                     )
                     isotope_pairs = _build_isotope_pairs_from_suggestions_payload(
                         move_suggestions_payload
                     )
 
-                embeddings = await embed_in_batches(
-                    provider=provider,
-                    texts=docs,
-                    batch_size=batch_size,
+                theme_progress_ctx = (
+                    formatter.create_progress_display()
+                    if formatter is not None
+                    else nullcontext()
                 )
-                labels = cluster_embeddings_hdbscan(
-                    embeddings,
-                    min_cluster_size=3,
-                    min_samples=1,
-                    allow_single_cluster=True,
-                )
-                theme_output = build_theme_output(
-                    provider=provider,
-                    items=theme_items,
-                    labels=labels,
-                    min_cluster_size=3,
-                    min_samples=1,
-                    allow_single_cluster=True,
-                )
+                with theme_progress_ctx as theme_progress_manager:
+                    theme_progress_instance = (
+                        theme_progress_manager.get_progress_instance()
+                        if formatter is not None
+                        else None
+                    )
+                    embeddings = await embed_in_batches(
+                        provider=provider,
+                        texts=docs,
+                        batch_size=batch_size,
+                        progress=theme_progress_instance,
+                    )
+                    labels = cluster_embeddings_hdbscan(
+                        embeddings,
+                        min_cluster_size=3,
+                        min_samples=1,
+                        allow_single_cluster=True,
+                    )
+                    theme_output = build_theme_output(
+                        provider=provider,
+                        items=theme_items,
+                        labels=labels,
+                        min_cluster_size=3,
+                        min_samples=1,
+                        allow_single_cluster=True,
+                    )
             except Exception as e:
                 if out_dir_path is not None:
                     _cleanup_theme_artifacts(out_dir_path)
@@ -371,6 +406,7 @@ async def gap_command(args: argparse.Namespace, config: Config) -> None:
                 llm_min_score=move_suggestions_llm_min_score,
                 llm_top_k=move_suggestions_llm_top_k,
                 llm_max_prompt_tokens=move_suggestions_llm_max_prompt_tokens,
+                llm_concurrency=move_suggestions_llm_concurrency,
             )
             isotope_pairs = _build_isotope_pairs_from_suggestions_payload(
                 move_suggestions_payload
@@ -402,12 +438,6 @@ async def gap_command(args: argparse.Namespace, config: Config) -> None:
             and move_suggestions_payload is not None
         ):
             write_move_suggestions(out_dir=out_dir_path, payload=move_suggestions_payload)
-
-        if out_dir_path is None and not want_json_only:
-            if want_stats and details is not None:
-                sys.stdout.write(render_gap_stats_report(report=report, details=details))
-            sys.stdout.write(render_themes_markdown(output=theme_output, report=report))
-            return
 
     if want_stats and not want_json_only:
         assert details is not None

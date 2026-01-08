@@ -150,16 +150,41 @@ def build_theme_documents(
 
 
 async def embed_in_batches(
-    *, provider: EmbeddingProvider, texts: list[str], batch_size: int
+    *,
+    provider: EmbeddingProvider,
+    texts: list[str],
+    batch_size: int,
+    progress: Any | None = None,
+    progress_task_id: Any | None = None,
 ) -> list[list[float]]:
     if not texts:
         return []
     if batch_size <= 0:
         raise ValueError("batch_size must be positive")
+    task_id = progress_task_id
+    if task_id is None and progress is not None:
+        try:
+            task_id = progress.add_task(
+                "Gap: embedding themes",
+                total=len(texts),
+                info="",
+                speed="",
+            )
+        except Exception:
+            task_id = None
     out: list[list[float]] = []
     for i in range(0, len(texts), batch_size):
         batch = texts[i : i + batch_size]
         out.extend(await provider.embed(batch))
+        if task_id is not None and progress is not None:
+            try:
+                progress.update(
+                    task_id,
+                    advance=len(batch),
+                    info=f"{min(i + len(batch), len(texts))}/{len(texts)}",
+                )
+            except Exception:
+                pass
     if len(out) != len(texts):
         raise ValueError(
             f"Embedding provider returned {len(out)} vectors for {len(texts)} texts"

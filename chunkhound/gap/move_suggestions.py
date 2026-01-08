@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass
+import asyncio
 import json
 from pathlib import Path
 from pathlib import PurePosixPath
@@ -36,6 +37,15 @@ class MoveSuggestion:
 class _Candidate:
     change_index: int
     handle: GapSymbolHandle
+
+
+@dataclass(frozen=True)
+class _LLMTiebreakJob:
+    remove: _Candidate
+    candidates: list[tuple[_Candidate, float]]
+    candidates_available: int
+    prompt: str
+    candidate_add_ids: frozenset[int]
 
 
 def _handle_sort_key(cand: _Candidate) -> tuple[str, int, int, int, int]:
@@ -574,19 +584,26 @@ async def _suggest_llm_tiebreak_pairs(
     min_score: float,
     top_k: int,
     max_prompt_tokens: int,
+    concurrency: int,
 ) -> tuple[list[MoveSuggestion], Counter[str], str, bool]:
     suggestions: list[MoveSuggestion] = []
     skipped: Counter[str] = Counter()
     had_error = False
     schema = _llm_tiebreak_schema()
 
-    for rem in sorted(removes, key=_handle_sort_key):
+    effective_concurrency = max(1, int(concurrency))
+
+    def _try_build_job(
+        rem: _Candidate, *, reserved_candidate_add_ids: set[int]
+    ) -> tuple[_LLMTiebreakJob | None, bool]:
+        """Return (job_or_none, deferred_due_to_candidate_overlap)."""
         if rem.change_index in used_removes:
-            continue
+            return None, False
+
         raw = candidates_by_remove.get(int(rem.change_index))
         if not raw:
             skipped["llm_no_embedding_candidates"] += 1
-            continue
+            return None, False
 
         candidates: list[tuple[_Candidate, float]] = []
         for add_idx, score in raw:
@@ -599,7 +616,7 @@ async def _suggest_llm_tiebreak_pairs(
 
         if not candidates:
             skipped["llm_no_remaining_candidates"] += 1
-            continue
+            return None, False
 
         candidates_available = len(candidates)
         candidates.sort(key=lambda kv: (-float(kv[1]), int(kv[0].change_index)))
@@ -607,7 +624,7 @@ async def _suggest_llm_tiebreak_pairs(
         top_score = float(candidates[0][1])
         if top_score < float(min_score):
             skipped["llm_top_score_below_min_score"] += 1
-            continue
+            return None, False
 
         effective_top_k = max(1, int(top_k))
         candidates = candidates[:effective_top_k]
@@ -635,85 +652,142 @@ async def _suggest_llm_tiebreak_pairs(
             )
         if candidates and _estimate_tokens_for_prompt(prompt) > int(max_prompt_tokens):
             skipped["llm_prompt_over_token_limit"] += 1
-            continue
+            return None, False
+
+        candidate_add_ids = frozenset(int(c.change_index) for c, _ in candidates)
+        if candidate_add_ids & reserved_candidate_add_ids:
+            return None, True
+
+        return (
+            _LLMTiebreakJob(
+                remove=rem,
+                candidates=candidates,
+                candidates_available=candidates_available,
+                prompt=prompt,
+                candidate_add_ids=candidate_add_ids,
+            ),
+            False,
+        )
+
+    remaining = sorted(removes, key=_handle_sort_key)
+    while remaining:
+        batch: list[_LLMTiebreakJob] = []
+        reserved_candidate_add_ids: set[int] = set()
+        deferred: list[_Candidate] = []
+
+        for rem in remaining:
+            if len(batch) >= effective_concurrency:
+                deferred.append(rem)
+                continue
+
+            job, deferred_due_to_overlap = _try_build_job(
+                rem, reserved_candidate_add_ids=reserved_candidate_add_ids
+            )
+            if job is None:
+                if deferred_due_to_overlap:
+                    deferred.append(rem)
+                continue
+
+            batch.append(job)
+            reserved_candidate_add_ids.update(job.candidate_add_ids)
+
+        if not batch:
+            break
 
         if dry_run:
-            if dry_run_collector is not None:
-                filename = f"llm_call_{len(dry_run_collector)+1:04d}.md"
-                dry_run_collector.append(
-                    (
-                        filename,
-                        _render_llm_call_markdown(
-                            call_index=len(dry_run_collector) + 1,
-                            remove=rem,
-                            candidates=candidates,
-                            candidates_available=candidates_available,
-                            prompt=prompt,
-                            schema=schema,
-                        ),
+            for job in batch:
+                if dry_run_collector is not None:
+                    filename = f"llm_call_{len(dry_run_collector)+1:04d}.md"
+                    dry_run_collector.append(
+                        (
+                            filename,
+                            _render_llm_call_markdown(
+                                call_index=len(dry_run_collector) + 1,
+                                remove=job.remove,
+                                candidates=job.candidates,
+                                candidates_available=job.candidates_available,
+                                prompt=job.prompt,
+                                schema=schema,
+                            ),
+                        )
                     )
-                )
-            skipped["llm_dry_run_no_call"] += 1
+                skipped["llm_dry_run_no_call"] += 1
+            remaining = deferred
             continue
 
         if llm_provider is None:
-            skipped["llm_provider_missing"] += 1
+            skipped["llm_provider_missing"] += len(batch)
             had_error = True
+            remaining = deferred
             continue
 
-        try:
-            result = await llm_provider.complete_structured(
-                prompt=prompt, json_schema=schema
+        async def _call(
+            job: _LLMTiebreakJob,
+        ) -> tuple[_LLMTiebreakJob, dict[str, Any] | None, str | None]:
+            try:
+                result = await llm_provider.complete_structured(
+                    prompt=job.prompt, json_schema=schema
+                )
+            except Exception:
+                return job, None, "exception"
+            if not isinstance(result, dict):
+                return job, None, "invalid_type"
+            return job, result, None
+
+        results = await asyncio.gather(*[_call(job) for job in batch])
+        results.sort(key=lambda jr: _handle_sort_key(jr[0].remove))
+
+        for job, result, err in results:
+            if result is None:
+                if err == "invalid_type":
+                    skipped["llm_invalid_response_type"] += 1
+                else:
+                    skipped["llm_call_failed"] += 1
+                    had_error = True
+                continue
+
+            add_choice = result.get("add_change_index")
+            confidence = result.get("confidence")
+            rationale = result.get("rationale")
+
+            if add_choice is not None and not isinstance(add_choice, int):
+                skipped["llm_invalid_add_change_index_type"] += 1
+                continue
+            if isinstance(confidence, int):
+                confidence = float(confidence)
+            if not isinstance(confidence, float):
+                skipped["llm_invalid_confidence_type"] += 1
+                continue
+            if not isinstance(rationale, str):
+                skipped["llm_invalid_rationale_type"] += 1
+                continue
+
+            if add_choice is None:
+                skipped["llm_selected_null"] += 1
+                continue
+
+            if int(add_choice) not in job.candidate_add_ids:
+                skipped["llm_selected_non_candidate"] += 1
+                continue
+
+            if int(add_choice) in used_adds:
+                skipped["llm_selected_already_used_add"] += 1
+                continue
+
+            suggestions.append(
+                MoveSuggestion(
+                    pair_id=0,
+                    remove_change_index=int(job.remove.change_index),
+                    add_change_index=int(add_choice),
+                    method="llm_tiebreak",
+                    confidence=float(confidence),
+                    rationale=str(rationale).strip() or "llm tiebreak",
+                )
             )
-        except Exception:
-            skipped["llm_call_failed"] += 1
-            had_error = True
-            continue
+            used_adds.add(int(add_choice))
+            used_removes.add(int(job.remove.change_index))
 
-        if not isinstance(result, dict):
-            skipped["llm_invalid_response_type"] += 1
-            continue
-
-        add_choice = result.get("add_change_index")
-        confidence = result.get("confidence")
-        rationale = result.get("rationale")
-
-        if add_choice is not None and not isinstance(add_choice, int):
-            skipped["llm_invalid_add_change_index_type"] += 1
-            continue
-        if isinstance(confidence, int):
-            confidence = float(confidence)
-        if not isinstance(confidence, float):
-            skipped["llm_invalid_confidence_type"] += 1
-            continue
-        if not isinstance(rationale, str):
-            skipped["llm_invalid_rationale_type"] += 1
-            continue
-
-        if add_choice is None:
-            skipped["llm_selected_null"] += 1
-            continue
-
-        if int(add_choice) not in {int(c.change_index) for c, _ in candidates}:
-            skipped["llm_selected_non_candidate"] += 1
-            continue
-
-        if int(add_choice) in used_adds:
-            skipped["llm_selected_already_used_add"] += 1
-            continue
-
-        suggestions.append(
-            MoveSuggestion(
-                pair_id=0,
-                remove_change_index=int(rem.change_index),
-                add_change_index=int(add_choice),
-                method="llm_tiebreak",
-                confidence=float(confidence),
-                rationale=str(rationale).strip() or "llm tiebreak",
-            )
-        )
-        used_adds.add(int(add_choice))
-        used_removes.add(int(rem.change_index))
+        remaining = deferred
 
     if had_error and not suggestions:
         status = "failed"
@@ -747,6 +821,7 @@ async def build_move_suggestions_payload(
     llm_min_score: float = 0.90,
     llm_top_k: int = 8,
     llm_max_prompt_tokens: int = 8000,
+    llm_concurrency: int = 5,
 ) -> dict[str, Any]:
     adds_raw, removes_raw = collect_unresolved(report, include_blocks=include_blocks)
     adds: list[_Candidate] = []
@@ -836,6 +911,7 @@ async def build_move_suggestions_payload(
             min_score=float(llm_min_score),
             top_k=int(llm_top_k),
             max_prompt_tokens=int(llm_max_prompt_tokens),
+            concurrency=int(llm_concurrency),
         )
 
     all_suggestions = (
@@ -887,6 +963,7 @@ async def build_move_suggestions_payload(
                 "min_score": float(llm_min_score),
                 "top_k": int(llm_top_k),
                 "max_prompt_tokens": int(llm_max_prompt_tokens),
+                "concurrency": int(llm_concurrency),
             },
         },
         "counts_by_method": dict(counts_by_method),
