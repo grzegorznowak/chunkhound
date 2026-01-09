@@ -293,6 +293,9 @@ async def gap_command(args: argparse.Namespace, config: Config) -> None:
                     llm_provider = None
                     llm_dry_run_calls: list[tuple[str, str]] = []
                     move_suggestions_llm_dry_run_calls = llm_dry_run_calls
+                    llm_enabled_for_suggestions = bool(
+                        (not move_suggestions_llm_disabled) or move_suggestions_llm_dry_run
+                    )
 
                     if (
                         not move_suggestions_llm_disabled
@@ -311,29 +314,49 @@ async def gap_command(args: argparse.Namespace, config: Config) -> None:
                                 f"{e}"
                             )
 
-                    move_suggestions_payload = await build_move_suggestions_payload(
-                        report=report,
-                        include_blocks=True,
-                        texts_a_by_path_ordinal=texts_a_by_path_ordinal,
-                        texts_b_by_path_ordinal=texts_b_by_path_ordinal,
-                        embedding_provider=provider,
-                        embed_min_score=move_suggestions_embed_min_score,
-                        embed_min_margin=move_suggestions_embed_min_margin,
-                        embed_min_score_block=move_suggestions_embed_min_score_block,
-                        embed_min_margin_block=move_suggestions_embed_min_margin_block,
-                        embed_batch_size=batch_size,
-                        llm_provider=llm_provider,
-                        llm_enabled=bool(
-                            (not move_suggestions_llm_disabled)
-                            or move_suggestions_llm_dry_run
-                        ),
-                        llm_dry_run=bool(move_suggestions_llm_dry_run),
-                        llm_dry_run_collector=llm_dry_run_calls,
-                        llm_min_score=move_suggestions_llm_min_score,
-                        llm_top_k=move_suggestions_llm_top_k,
-                        llm_max_prompt_tokens=move_suggestions_llm_max_prompt_tokens,
-                        llm_concurrency=move_suggestions_llm_concurrency,
+                    suggestions_progress_ctx = (
+                        formatter.create_progress_display()
+                        if (
+                            formatter is not None
+                            and llm_enabled_for_suggestions
+                            and (move_suggestions_llm_dry_run or llm_provider is not None)
+                        )
+                        else nullcontext()
                     )
+                    with suggestions_progress_ctx as suggestions_progress_manager:
+                        suggestions_progress_instance = (
+                            suggestions_progress_manager.get_progress_instance()
+                            if (
+                                formatter is not None
+                                and llm_enabled_for_suggestions
+                                and (
+                                    move_suggestions_llm_dry_run
+                                    or llm_provider is not None
+                                )
+                            )
+                            else None
+                        )
+                        move_suggestions_payload = await build_move_suggestions_payload(
+                            report=report,
+                            include_blocks=True,
+                            texts_a_by_path_ordinal=texts_a_by_path_ordinal,
+                            texts_b_by_path_ordinal=texts_b_by_path_ordinal,
+                            embedding_provider=provider,
+                            embed_min_score=move_suggestions_embed_min_score,
+                            embed_min_margin=move_suggestions_embed_min_margin,
+                            embed_min_score_block=move_suggestions_embed_min_score_block,
+                            embed_min_margin_block=move_suggestions_embed_min_margin_block,
+                            embed_batch_size=batch_size,
+                            llm_provider=llm_provider,
+                            llm_enabled=llm_enabled_for_suggestions,
+                            llm_dry_run=bool(move_suggestions_llm_dry_run),
+                            llm_dry_run_collector=llm_dry_run_calls,
+                            llm_min_score=move_suggestions_llm_min_score,
+                            llm_top_k=move_suggestions_llm_top_k,
+                            llm_max_prompt_tokens=move_suggestions_llm_max_prompt_tokens,
+                            llm_concurrency=move_suggestions_llm_concurrency,
+                            progress=suggestions_progress_instance,
+                        )
                     isotope_pairs = _build_isotope_pairs_from_suggestions_payload(
                         move_suggestions_payload
                     )

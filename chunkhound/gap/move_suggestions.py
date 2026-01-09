@@ -585,11 +585,35 @@ async def _suggest_llm_tiebreak_pairs(
     top_k: int,
     max_prompt_tokens: int,
     concurrency: int,
+    progress: Any | None = None,
 ) -> tuple[list[MoveSuggestion], Counter[str], str, bool]:
     suggestions: list[MoveSuggestion] = []
     skipped: Counter[str] = Counter()
     had_error = False
     schema = _llm_tiebreak_schema()
+    total_removes = len(removes)
+
+    progress_task_id = None
+    if progress is not None and total_removes:
+        try:
+            progress_task_id = progress.add_task(
+                "Gap: LLM tiebreak (dry-run)" if dry_run else "Gap: LLM tiebreak",
+                total=total_removes,
+                info="",
+                speed="",
+            )
+        except Exception:
+            progress_task_id = None
+
+    llm_calls_attempted = 0
+
+    def _advance_progress() -> None:
+        if progress is None or progress_task_id is None:
+            return
+        try:
+            progress.update(progress_task_id, advance=1, info=f"calls={llm_calls_attempted}")
+        except Exception:
+            pass
 
     effective_concurrency = max(1, int(concurrency))
 
@@ -686,6 +710,8 @@ async def _suggest_llm_tiebreak_pairs(
             if job is None:
                 if deferred_due_to_overlap:
                     deferred.append(rem)
+                else:
+                    _advance_progress()
                 continue
 
             batch.append(job)
@@ -712,12 +738,15 @@ async def _suggest_llm_tiebreak_pairs(
                         )
                     )
                 skipped["llm_dry_run_no_call"] += 1
+                _advance_progress()
             remaining = deferred
             continue
 
         if llm_provider is None:
             skipped["llm_provider_missing"] += len(batch)
             had_error = True
+            for _ in batch:
+                _advance_progress()
             remaining = deferred
             continue
 
@@ -734,6 +763,7 @@ async def _suggest_llm_tiebreak_pairs(
                 return job, None, "invalid_type"
             return job, result, None
 
+        llm_calls_attempted += len(batch)
         results = await asyncio.gather(*[_call(job) for job in batch])
         results.sort(key=lambda jr: _handle_sort_key(jr[0].remove))
 
@@ -744,6 +774,7 @@ async def _suggest_llm_tiebreak_pairs(
                 else:
                     skipped["llm_call_failed"] += 1
                     had_error = True
+                _advance_progress()
                 continue
 
             add_choice = result.get("add_change_index")
@@ -752,26 +783,32 @@ async def _suggest_llm_tiebreak_pairs(
 
             if add_choice is not None and not isinstance(add_choice, int):
                 skipped["llm_invalid_add_change_index_type"] += 1
+                _advance_progress()
                 continue
             if isinstance(confidence, int):
                 confidence = float(confidence)
             if not isinstance(confidence, float):
                 skipped["llm_invalid_confidence_type"] += 1
+                _advance_progress()
                 continue
             if not isinstance(rationale, str):
                 skipped["llm_invalid_rationale_type"] += 1
+                _advance_progress()
                 continue
 
             if add_choice is None:
                 skipped["llm_selected_null"] += 1
+                _advance_progress()
                 continue
 
             if int(add_choice) not in job.candidate_add_ids:
                 skipped["llm_selected_non_candidate"] += 1
+                _advance_progress()
                 continue
 
             if int(add_choice) in used_adds:
                 skipped["llm_selected_already_used_add"] += 1
+                _advance_progress()
                 continue
 
             suggestions.append(
@@ -786,6 +823,7 @@ async def _suggest_llm_tiebreak_pairs(
             )
             used_adds.add(int(add_choice))
             used_removes.add(int(job.remove.change_index))
+            _advance_progress()
 
         remaining = deferred
 
@@ -822,6 +860,7 @@ async def build_move_suggestions_payload(
     llm_top_k: int = 8,
     llm_max_prompt_tokens: int = 8000,
     llm_concurrency: int = 5,
+    progress: Any | None = None,
 ) -> dict[str, Any]:
     adds_raw, removes_raw = collect_unresolved(report, include_blocks=include_blocks)
     adds: list[_Candidate] = []
@@ -912,6 +951,7 @@ async def build_move_suggestions_payload(
             top_k=int(llm_top_k),
             max_prompt_tokens=int(llm_max_prompt_tokens),
             concurrency=int(llm_concurrency),
+            progress=progress,
         )
 
     all_suggestions = (
