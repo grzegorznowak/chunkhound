@@ -8,9 +8,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import Coroutine
 from typing import TYPE_CHECKING, Any, TypeVar
-
-from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:  # type-checkers only; avoid runtime hard dep
     import mcp.types as types  # noqa: F401
@@ -23,6 +22,24 @@ if TYPE_CHECKING:
     from chunkhound.llm_manager import LLMManager
 
 T = TypeVar("T")
+
+
+def has_reranker_support(embedding_manager: EmbeddingManager | None) -> bool:
+    """Check if embedding manager has reranker support available.
+
+    Args:
+        embedding_manager: Embedding manager to check
+
+    Returns:
+        True if reranker support is available, False otherwise
+    """
+    if not embedding_manager:
+        return False
+    try:
+        provider = embedding_manager.get_provider()
+        return hasattr(provider, "supports_reranking") and provider.supports_reranking()
+    except Exception:
+        return False
 
 
 class MCPError(Exception):
@@ -135,6 +152,7 @@ async def handle_tool_call(
     debug_mode: bool = False,
     scan_progress: dict | None = None,
     llm_manager: LLMManager | None = None,
+    config: Any = None,
 ) -> list[types.TextContent]:
     """Unified tool call handler for all MCP servers.
 
@@ -150,6 +168,7 @@ async def handle_tool_call(
         debug_mode: Whether to include stack traces in error responses
         scan_progress: Optional scan progress from MCPServerBase
         llm_manager: Optional LLM manager for code_research
+        config: Optional Config instance for research service factory
 
     Returns:
         List containing a single TextContent with JSON-formatted response
@@ -161,17 +180,23 @@ async def handle_tool_call(
         # Lazy import at runtime to construct MCP content objects without
         # forcing hard dependency during module import/collection.
         import mcp.types as types  # noqa: WPS433
-        # Wait for initialization (reduced timeout since server is immediately available)
+        # Wait for initialization (reduced timeout, server is ready)
         await asyncio.wait_for(initialization_complete.wait(), timeout=5.0)
 
         # Validate tool exists
         if tool_name not in TOOL_REGISTRY:
             raise ValueError(f"Unknown tool: {tool_name}")
 
-        # Check embedding requirements
+        # Check capability requirements
         tool = TOOL_REGISTRY[tool_name]
-        if tool.requires_embeddings and not embedding_manager:
+        if tool.requires_embeddings and (
+            not embedding_manager or not embedding_manager.list_providers()
+        ):
             raise ValueError(f"Tool {tool_name} requires embedding provider")
+        if tool.requires_llm and not llm_manager:
+            raise ValueError(f"Tool {tool_name} requires LLM provider")
+        if tool.requires_reranker and not has_reranker_support(embedding_manager):
+            raise ValueError(f"Tool {tool_name} requires reranker support")
 
         # Parse arguments (handles both string and typed values)
         parsed_args = parse_mcp_arguments(arguments)
@@ -184,6 +209,7 @@ async def handle_tool_call(
             arguments=parsed_args,
             scan_progress=scan_progress,
             llm_manager=llm_manager,
+            config=config,
         )
 
         # Format response based on result type

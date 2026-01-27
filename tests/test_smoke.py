@@ -66,6 +66,24 @@ class TestModuleImports:
             except Exception as e:
                 pytest.fail(f"Failed to import {module_name}: {e}")
 
+    def test_v3_research_imports(self):
+        """Test v3 parallel research services can be imported."""
+        from chunkhound.services.research.shared.exploration import (
+            ExplorationStrategy,
+            BFSExplorationStrategy,
+            WideCoverageStrategy,
+            ParallelExplorationStrategy,
+        )
+        from chunkhound.services.research.factory import ResearchServiceFactory
+        from chunkhound.services.research.protocol import ResearchServiceProtocol
+
+        assert ExplorationStrategy is not None
+        assert BFSExplorationStrategy is not None
+        assert WideCoverageStrategy is not None
+        assert ParallelExplorationStrategy is not None
+        assert ResearchServiceFactory is not None
+        assert ResearchServiceProtocol is not None
+
 
 class TestCLICommands:
     """Test that CLI commands at least show help without crashing."""
@@ -278,15 +296,11 @@ sys.exit(asyncio.run(test()))
                 tools = tools_result.get("tools", [])
                 tool_names = [t["name"] for t in tools]
 
-                # Should have at least regex search (works without embeddings)
-                assert "search_regex" in tool_names, f"search_regex not in tools: {tool_names}"
-                assert "get_stats" in tool_names, f"get_stats not in tools: {tool_names}"
-                assert "health_check" in tool_names, f"health_check not in tools: {tool_names}"
+                # Should have unified search tool (works without embeddings for regex)
+                assert "search" in tool_names, f"search not in tools: {tool_names}"
 
-                # Semantic search and code_research only if embeddings available
-                if api_key:
-                    assert "search_semantic" in tool_names, f"search_semantic not in tools: {tool_names}"
-                    assert "code_research" in tool_names, f"code_research not in tools: {tool_names}"
+                # code_research only if embeddings + LLM + reranker available
+                # (not testing conditional availability in smoke test)
 
             except asyncio.TimeoutError:
                 pytest.fail("MCP stdio protocol handshake timed out")

@@ -35,6 +35,7 @@ from chunkhound.parsers.mappings import (
     JsonMapping,
     JSXMapping,
     KotlinMapping,
+    LuaMapping,
     MakefileMapping,
     MarkdownMapping,
     MatlabMapping,
@@ -53,6 +54,7 @@ from chunkhound.parsers.mappings import (
     YamlMapping,
     ZigMapping,
 )
+from chunkhound.parsers.concept_extractor import LanguageMapping
 from chunkhound.parsers.mappings.base import BaseMapping
 from chunkhound.parsers.universal_engine import SetupError, TreeSitterEngine
 from chunkhound.parsers.universal_parser import CASTConfig, UniversalParser
@@ -159,6 +161,14 @@ try:
 except ImportError:
     ts_kotlin = None
     KOTLIN_AVAILABLE = False
+
+try:
+    import tree_sitter_lua as ts_lua
+
+    LUA_AVAILABLE = True
+except ImportError:
+    ts_lua = None
+    LUA_AVAILABLE = False
 
 try:
     import tree_sitter_groovy as ts_groovy
@@ -482,6 +492,7 @@ LANGUAGE_CONFIGS: dict[Language, LanguageConfig] = {
     Language.KOTLIN: LanguageConfig(
         ts_kotlin, KotlinMapping, KOTLIN_AVAILABLE, "kotlin"
     ),
+    Language.LUA: LanguageConfig(ts_lua, LuaMapping, LUA_AVAILABLE, "lua"),
     Language.GROOVY: LanguageConfig(
         ts_groovy, GroovyMapping, GROOVY_AVAILABLE, "groovy"
     ),
@@ -586,6 +597,7 @@ EXTENSION_TO_LANGUAGE: dict[str, Language] = {
     # Swift
     ".swift": Language.SWIFT,
     ".swiftinterface": Language.SWIFT,
+    ".lua": Language.LUA,
     ".vue": Language.VUE,
     ".svelte": Language.SVELTE,
     # Config & Data
@@ -873,6 +885,26 @@ class ParserFactory:
             if total_count > 0
             else 0.0,
         }
+
+    def get_mapping_for_file(self, file_path: Path) -> LanguageMapping | None:
+        """Get the language mapping for a file to access resolve_import_path().
+
+        Returns None if no mapping exists for the file type.
+
+        Args:
+            file_path: Path to the file
+
+        Returns:
+            LanguageMapping instance for the file's language, or None if unsupported
+        """
+        try:
+            language = self.detect_language(file_path)
+            if language not in LANGUAGE_CONFIGS:
+                return None
+            config = LANGUAGE_CONFIGS[language]
+            return config.mapping_class()
+        except Exception:
+            return None
 
 
 # Global factory instance for convenience
