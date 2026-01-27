@@ -5,6 +5,8 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
+import xxhash
+
 from chunkhound.core.config.indexing_config import IndexingConfig
 from chunkhound.gap.diff import (
     diff_symbol_entries_anchor,
@@ -25,6 +27,7 @@ from chunkhound.gap.models import (
     GapStats,
     GapTimings,
     GapWarning,
+    GAP_SCHEMA_REVISION,
 )
 from chunkhound.gap.recovery import recover_safe_text_hash
 from chunkhound.gap.stats_report import GapStatsDetails
@@ -41,6 +44,8 @@ class GapEngine:
         *,
         a_root: Path,
         b_root: Path,
+        a_ref_user: str | None = None,
+        b_ref_user: str | None = None,
         indexing: IndexingConfig,
         recovery_mode: str,
         deterministic: bool,
@@ -55,11 +60,26 @@ class GapEngine:
     ]:
         a_root = a_root.resolve()
         b_root = b_root.resolve()
+        a_ref_resolved = str(a_root)
+        b_ref_resolved = str(b_root)
+
+        def _path_primary_key_hash(path: str) -> str:
+            return xxhash.xxh3_64(path.encode("utf-8")).hexdigest()
 
         warnings_out: list[GapWarning] = list(warnings or [])
 
-        a_source, a_warnings = discover_source(root=a_root, indexing=indexing)
-        b_source, b_warnings = discover_source(root=b_root, indexing=indexing)
+        a_source, a_warnings = discover_source(
+            root=a_root,
+            indexing=indexing,
+            source_ref_user=a_ref_user,
+            source_ref_resolved=a_ref_resolved,
+        )
+        b_source, b_warnings = discover_source(
+            root=b_root,
+            indexing=indexing,
+            source_ref_user=b_ref_user,
+            source_ref_resolved=b_ref_resolved,
+        )
         warnings_out.extend(a_warnings)
         warnings_out.extend(b_warnings)
 
@@ -142,6 +162,7 @@ class GapEngine:
                             reason="file_anchor",
                             confidence=1.0,
                             primary_key_kind="path_key",
+                            primary_key_hash=_path_primary_key_hash(rel_path),
                             key_strength=0,
                             had_collision=False,
                             collision_group_size=1,
@@ -197,6 +218,7 @@ class GapEngine:
                             reason="file_anchor",
                             confidence=1.0,
                             primary_key_kind="path_key",
+                            primary_key_hash=_path_primary_key_hash(rel_path),
                             key_strength=0,
                             had_collision=False,
                             collision_group_size=1,
@@ -253,6 +275,7 @@ class GapEngine:
                             reason="file_anchor",
                             confidence=1.0,
                             primary_key_kind="path_key",
+                            primary_key_hash=_path_primary_key_hash(rel_path),
                             key_strength=0,
                             had_collision=False,
                             collision_group_size=1,
@@ -363,11 +386,7 @@ class GapEngine:
             1 for w in warnings_recovery if w.code == "RECOVERY_SAFE_BUCKET_SKIPPED"
         )
         recovery_cap_warning = next(
-            (
-                w
-                for w in warnings_recovery
-                if w.code == "RECOVERY_SAFE_CAPPED_TOTAL"
-            ),
+            (w for w in warnings_recovery if w.code == "RECOVERY_SAFE_CAPPED_TOTAL"),
             None,
         )
         recovery_total_cap = None
@@ -404,6 +423,7 @@ class GapEngine:
 
         report = GapReport(
             schema_version="gap.v1",
+            schema_revision=GAP_SCHEMA_REVISION,
             direction="A->B",
             invariants=invariants,
             inputs=inputs,
@@ -456,6 +476,8 @@ class GapEngine:
         *,
         a_root: Path,
         b_root: Path,
+        a_ref_user: str | None = None,
+        b_ref_user: str | None = None,
         indexing: IndexingConfig,
         recovery_mode: str,
         deterministic: bool,
@@ -465,6 +487,8 @@ class GapEngine:
         report, _, _, _ = self._run_pipeline(
             a_root=a_root,
             b_root=b_root,
+            a_ref_user=a_ref_user,
+            b_ref_user=b_ref_user,
             indexing=indexing,
             recovery_mode=recovery_mode,
             deterministic=deterministic,
@@ -479,6 +503,8 @@ class GapEngine:
         *,
         a_root: Path,
         b_root: Path,
+        a_ref_user: str | None = None,
+        b_ref_user: str | None = None,
         indexing: IndexingConfig,
         recovery_mode: str,
         deterministic: bool,
@@ -488,6 +514,8 @@ class GapEngine:
         report, details, _, _ = self._run_pipeline(
             a_root=a_root,
             b_root=b_root,
+            a_ref_user=a_ref_user,
+            b_ref_user=b_ref_user,
             indexing=indexing,
             recovery_mode=recovery_mode,
             deterministic=deterministic,
@@ -502,6 +530,8 @@ class GapEngine:
         *,
         a_root: Path,
         b_root: Path,
+        a_ref_user: str | None = None,
+        b_ref_user: str | None = None,
         indexing: IndexingConfig,
         recovery_mode: str,
         deterministic: bool,
@@ -516,6 +546,8 @@ class GapEngine:
         return self._run_pipeline(
             a_root=a_root,
             b_root=b_root,
+            a_ref_user=a_ref_user,
+            b_ref_user=b_ref_user,
             indexing=indexing,
             recovery_mode=recovery_mode,
             deterministic=deterministic,

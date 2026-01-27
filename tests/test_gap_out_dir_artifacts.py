@@ -50,3 +50,4 @@ def test_gap_out_dir_writes_artifacts_without_embeddings() -> None:
 
         payload = json.loads((out_dir / "gap.json").read_text(encoding="utf-8"))
         assert payload["schema_version"] == "gap.v1"
+        assert payload["schema_revision"] == "2026-01-09"

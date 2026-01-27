@@ -4,6 +4,9 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Literal
 
 
+GAP_SCHEMA_REVISION = "2026-01-09"
+
+
 @dataclass(frozen=True)
 class GapNormalizationInvariants:
     id: str
@@ -27,6 +30,8 @@ class GapInputRef:
     source_kind: Literal["path"]
     source_ref: str
     source_hash: str
+    source_ref_user: str | None = None
+    source_ref_resolved: str | None = None
 
 
 @dataclass(frozen=True)
@@ -111,6 +116,7 @@ class GapChangeItem:
     reason: str
     confidence: float
     primary_key_kind: Literal["symbol_key", "stable_key", "path_key"]
+    primary_key_hash: str
     key_strength: int
     had_collision: bool
     collision_group_size: int
@@ -121,6 +127,7 @@ class GapChangeItem:
 @dataclass(frozen=True)
 class GapReport:
     schema_version: Literal["gap.v1"]
+    schema_revision: str
     direction: Literal["A->B"]
     invariants: GapInvariants
     inputs: GapInputs
@@ -132,4 +139,3 @@ class GapReport:
     def to_dict(self) -> dict[str, Any]:
         """Convert report to a plain JSON-serializable dict."""
         return asdict(self)
-

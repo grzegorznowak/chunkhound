@@ -38,6 +38,7 @@ def render_gap_stats_report(*, report: GapReport, details: GapStatsDetails) -> s
     file_diff = details.file_diff_counts
 
     lines: list[str] = []
+    lines.append(f"schema_revision: {report.schema_revision}")
     lines.append(f"{report.schema_version} {report.direction}")
     lines.append(
         f"scope: {report.scope.scope_mode} changed_files={report.scope.changed_files_count} scope_hash={report.scope.scope_hash}"
@@ -102,4 +103,3 @@ def render_gap_stats_report(*, report: GapReport, details: GapStatsDetails) -> s
 
 
 __all__ = ["GapStatsDetails", "render_gap_stats_report"]
-

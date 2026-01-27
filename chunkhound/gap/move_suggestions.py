@@ -64,14 +64,18 @@ def _dir_of(path: str) -> str:
 
 
 def _is_symbol_add(change: GapChangeItem) -> bool:
-    return change.entity_kind == "symbol" and change.op == "add" and isinstance(
-        change.new, GapSymbolHandle
+    return (
+        change.entity_kind == "symbol"
+        and change.op == "add"
+        and isinstance(change.new, GapSymbolHandle)
     )
 
 
 def _is_symbol_remove(change: GapChangeItem) -> bool:
-    return change.entity_kind == "symbol" and change.op == "remove" and isinstance(
-        change.old, GapSymbolHandle
+    return (
+        change.entity_kind == "symbol"
+        and change.op == "remove"
+        and isinstance(change.old, GapSymbolHandle)
     )
 
 
@@ -175,10 +179,18 @@ def _suggest_heuristic_pairs(
     adds_by_key = defaultdict(list)
     removes_by_key = defaultdict(list)
     for c in _unpaired_adds():
-        k = (_dir_of(str(c.handle.path)), str(c.handle.chunk_type), str(c.handle.symbol))
+        k = (
+            _dir_of(str(c.handle.path)),
+            str(c.handle.chunk_type),
+            str(c.handle.symbol),
+        )
         adds_by_key[k].append(c)
     for c in _unpaired_removes():
-        k = (_dir_of(str(c.handle.path)), str(c.handle.chunk_type), str(c.handle.symbol))
+        k = (
+            _dir_of(str(c.handle.path)),
+            str(c.handle.chunk_type),
+            str(c.handle.symbol),
+        )
         removes_by_key[k].append(c)
 
     for k in sorted(set(adds_by_key.keys()) | set(removes_by_key.keys())):
@@ -611,7 +623,9 @@ async def _suggest_llm_tiebreak_pairs(
         if progress is None or progress_task_id is None:
             return
         try:
-            progress.update(progress_task_id, advance=1, info=f"calls={llm_calls_attempted}")
+            progress.update(
+                progress_task_id, advance=1, info=f"calls={llm_calls_attempted}"
+            )
         except Exception:
             pass
 
@@ -723,7 +737,7 @@ async def _suggest_llm_tiebreak_pairs(
         if dry_run:
             for job in batch:
                 if dry_run_collector is not None:
-                    filename = f"llm_call_{len(dry_run_collector)+1:04d}.md"
+                    filename = f"llm_call_{len(dry_run_collector) + 1:04d}.md"
                     dry_run_collector.append(
                         (
                             filename,
@@ -874,7 +888,9 @@ async def build_move_suggestions_payload(
         if isinstance(handle, GapSymbolHandle):
             removes.append(_Candidate(change_index=int(idx), handle=handle))
 
-    heuristic_suggestions, skipped = _suggest_heuristic_pairs(adds=adds, removes=removes)
+    heuristic_suggestions, skipped = _suggest_heuristic_pairs(
+        adds=adds, removes=removes
+    )
 
     used_adds = {int(s.add_change_index) for s in heuristic_suggestions}
     used_removes = {int(s.remove_change_index) for s in heuristic_suggestions}
@@ -900,10 +916,14 @@ async def build_move_suggestions_payload(
             min_score_block=float(embed_min_score_block),
             min_margin_block=float(embed_min_margin_block),
             batch_size=max(100, int(embed_batch_size)),
-            want_candidates=bool(llm_dry_run or (llm_enabled and llm_provider is not None)),
+            want_candidates=bool(
+                llm_dry_run or (llm_enabled and llm_provider is not None)
+            ),
         )
 
-    used_adds = {int(s.add_change_index) for s in heuristic_suggestions + embed_suggestions}
+    used_adds = {
+        int(s.add_change_index) for s in heuristic_suggestions + embed_suggestions
+    }
     used_removes = {
         int(s.remove_change_index) for s in heuristic_suggestions + embed_suggestions
     }
@@ -984,7 +1004,9 @@ async def build_move_suggestions_payload(
 
     payload: dict[str, Any] = {
         "schema_version": "gap.suggestions.v1",
+        "schema_revision": report.schema_revision,
         "source_schema_version": report.schema_version,
+        "source_schema_revision": report.schema_revision,
         "direction": report.direction,
         "source_scope_hash": report.scope.scope_hash,
         "config_snapshot": {

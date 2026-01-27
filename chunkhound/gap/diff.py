@@ -43,22 +43,7 @@ def _path_for_change(change: GapChangeItem) -> str:
 
 
 def _primary_key_hash_for_change(change: GapChangeItem) -> str:
-    path = _path_for_change(change)
-
-    if change.primary_key_kind == "path_key":
-        return xxhash.xxh3_64(path.encode("utf-8")).hexdigest()
-
-    handle = change.new if change.new is not None else change.old
-    if not isinstance(handle, GapSymbolHandle):
-        return xxhash.xxh3_64(path.encode("utf-8")).hexdigest()
-
-    if change.primary_key_kind == "symbol_key" and handle.symbol_key_hash:
-        return handle.symbol_key_hash
-    if handle.stable_key_hash:
-        return handle.stable_key_hash
-    if handle.symbol_key_hash:
-        return handle.symbol_key_hash
-    return xxhash.xxh3_64(path.encode("utf-8")).hexdigest()
+    return change.primary_key_hash
 
 
 def sort_gap_changes(changes: list[GapChangeItem]) -> None:
@@ -137,6 +122,7 @@ def diff_symbol_entries_anchor(
                     reason="symbol_anchor",
                     confidence=1.0,
                     primary_key_kind=key_kind,  # type: ignore[arg-type]
+                    primary_key_hash=key_hash,
                     key_strength=max(old_entry.key_strength, new_entry.key_strength),
                     had_collision=had_collision,
                     collision_group_size=collision_group_size,
@@ -156,6 +142,7 @@ def diff_symbol_entries_anchor(
                     reason="symbol_anchor",
                     confidence=1.0,
                     primary_key_kind=key_kind,  # type: ignore[arg-type]
+                    primary_key_hash=key_hash,
                     key_strength=entry.key_strength,
                     had_collision=had_collision,
                     collision_group_size=collision_group_size,
@@ -175,6 +162,7 @@ def diff_symbol_entries_anchor(
                     reason="symbol_anchor",
                     confidence=1.0,
                     primary_key_kind=key_kind,  # type: ignore[arg-type]
+                    primary_key_hash=key_hash,
                     key_strength=entry.key_strength,
                     had_collision=had_collision,
                     collision_group_size=collision_group_size,
@@ -205,6 +193,7 @@ def make_parse_fallback_file_change(
         reason="parse_fallback",
         confidence=1.0,
         primary_key_kind="path_key",
+        primary_key_hash=xxhash.xxh3_64(rel_path.encode("utf-8")).hexdigest(),
         key_strength=0,
         had_collision=False,
         collision_group_size=1,

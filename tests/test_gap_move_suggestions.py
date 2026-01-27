@@ -31,6 +31,7 @@ pytestmark = pytest.mark.asyncio
 def _make_report(*, changes: list[GapChangeItem]) -> GapReport:
     return GapReport(
         schema_version="gap.v1",
+        schema_revision="2026-01-09",
         direction="A->B",
         invariants=GapInvariants(
             hash_alg="xxh3_64",
@@ -59,7 +60,9 @@ def _make_report(*, changes: list[GapChangeItem]) -> GapReport:
     )
 
 
-def _handle(*, path: str, chunk_type: str, symbol: str, text_hash: str) -> GapSymbolHandle:
+def _handle(
+    *, path: str, chunk_type: str, symbol: str, text_hash: str
+) -> GapSymbolHandle:
     return GapSymbolHandle(
         path=path,
         start_line=1,
@@ -86,6 +89,7 @@ async def test_build_move_suggestions_payload_pairs_unique_same_path() -> None:
                 reason="symbol_anchor",
                 confidence=1.0,
                 primary_key_kind="stable_key",
+                primary_key_hash="0000000000000000",
                 key_strength=1,
                 had_collision=False,
                 collision_group_size=1,
@@ -101,6 +105,7 @@ async def test_build_move_suggestions_payload_pairs_unique_same_path() -> None:
                 reason="symbol_anchor",
                 confidence=1.0,
                 primary_key_kind="stable_key",
+                primary_key_hash="0000000000000000",
                 key_strength=1,
                 had_collision=False,
                 collision_group_size=1,
@@ -142,6 +147,7 @@ async def test_build_move_suggestions_payload_skips_ambiguous_same_path() -> Non
                 reason="symbol_anchor",
                 confidence=1.0,
                 primary_key_kind="stable_key",
+                primary_key_hash="0000000000000000",
                 key_strength=1,
                 had_collision=False,
                 collision_group_size=1,
@@ -157,6 +163,7 @@ async def test_build_move_suggestions_payload_skips_ambiguous_same_path() -> Non
                 reason="symbol_anchor",
                 confidence=1.0,
                 primary_key_kind="stable_key",
+                primary_key_hash="0000000000000000",
                 key_strength=1,
                 had_collision=False,
                 collision_group_size=1,
@@ -172,6 +179,7 @@ async def test_build_move_suggestions_payload_skips_ambiguous_same_path() -> Non
                 reason="symbol_anchor",
                 confidence=1.0,
                 primary_key_kind="stable_key",
+                primary_key_hash="0000000000000000",
                 key_strength=1,
                 had_collision=False,
                 collision_group_size=1,
@@ -270,12 +278,18 @@ class _ConcurrentTrackingLLMProvider:
 
 
 @pytest.mark.asyncio
-async def test_build_move_suggestions_payload_embedding_crosscheck_accepts_clear_match() -> None:
+async def test_build_move_suggestions_payload_embedding_crosscheck_accepts_clear_match() -> (
+    None
+):
     provider = _TagEmbeddingProvider()
 
     old = _handle(path="a.py", chunk_type="function", symbol="old_sym", text_hash="x")
-    new1 = _handle(path="b.py", chunk_type="function", symbol="new_sym_1", text_hash="y")
-    new2 = _handle(path="c.py", chunk_type="function", symbol="new_sym_2", text_hash="z")
+    new1 = _handle(
+        path="b.py", chunk_type="function", symbol="new_sym_1", text_hash="y"
+    )
+    new2 = _handle(
+        path="c.py", chunk_type="function", symbol="new_sym_2", text_hash="z"
+    )
     report = _make_report(
         changes=[
             GapChangeItem(
@@ -287,6 +301,7 @@ async def test_build_move_suggestions_payload_embedding_crosscheck_accepts_clear
                 reason="symbol_anchor",
                 confidence=1.0,
                 primary_key_kind="stable_key",
+                primary_key_hash="0000000000000000",
                 key_strength=1,
                 had_collision=False,
                 collision_group_size=1,
@@ -302,6 +317,7 @@ async def test_build_move_suggestions_payload_embedding_crosscheck_accepts_clear
                 reason="symbol_anchor",
                 confidence=1.0,
                 primary_key_kind="stable_key",
+                primary_key_hash="0000000000000000",
                 key_strength=1,
                 had_collision=False,
                 collision_group_size=1,
@@ -317,6 +333,7 @@ async def test_build_move_suggestions_payload_embedding_crosscheck_accepts_clear
                 reason="symbol_anchor",
                 confidence=1.0,
                 primary_key_kind="stable_key",
+                primary_key_hash="0000000000000000",
                 key_strength=1,
                 had_collision=False,
                 collision_group_size=1,
@@ -344,7 +361,9 @@ async def test_build_move_suggestions_payload_embedding_crosscheck_accepts_clear
 
 
 @pytest.mark.asyncio
-async def test_build_move_suggestions_payload_embedding_crosscheck_uses_block_thresholds() -> None:
+async def test_build_move_suggestions_payload_embedding_crosscheck_uses_block_thresholds() -> (
+    None
+):
     provider = _TagEmbeddingProvider()
 
     old = _handle(path="a.py", chunk_type="block", symbol="old_sym", text_hash="x")
@@ -361,6 +380,7 @@ async def test_build_move_suggestions_payload_embedding_crosscheck_uses_block_th
                 reason="symbol_anchor",
                 confidence=1.0,
                 primary_key_kind="stable_key",
+                primary_key_hash="0000000000000000",
                 key_strength=1,
                 had_collision=False,
                 collision_group_size=1,
@@ -376,6 +396,7 @@ async def test_build_move_suggestions_payload_embedding_crosscheck_uses_block_th
                 reason="symbol_anchor",
                 confidence=1.0,
                 primary_key_kind="stable_key",
+                primary_key_hash="0000000000000000",
                 key_strength=1,
                 had_collision=False,
                 collision_group_size=1,
@@ -391,6 +412,7 @@ async def test_build_move_suggestions_payload_embedding_crosscheck_uses_block_th
                 reason="symbol_anchor",
                 confidence=1.0,
                 primary_key_kind="stable_key",
+                primary_key_hash="0000000000000000",
                 key_strength=1,
                 had_collision=False,
                 collision_group_size=1,
@@ -417,12 +439,18 @@ async def test_build_move_suggestions_payload_embedding_crosscheck_uses_block_th
 
 
 @pytest.mark.asyncio
-async def test_build_move_suggestions_payload_embedding_crosscheck_rejects_ambiguous_margin() -> None:
+async def test_build_move_suggestions_payload_embedding_crosscheck_rejects_ambiguous_margin() -> (
+    None
+):
     provider = _TagEmbeddingProvider()
 
     old = _handle(path="a.py", chunk_type="function", symbol="old_sym", text_hash="x")
-    new1 = _handle(path="b.py", chunk_type="function", symbol="new_sym_1", text_hash="y")
-    new2 = _handle(path="c.py", chunk_type="function", symbol="new_sym_2", text_hash="z")
+    new1 = _handle(
+        path="b.py", chunk_type="function", symbol="new_sym_1", text_hash="y"
+    )
+    new2 = _handle(
+        path="c.py", chunk_type="function", symbol="new_sym_2", text_hash="z"
+    )
     report = _make_report(
         changes=[
             GapChangeItem(
@@ -434,6 +462,7 @@ async def test_build_move_suggestions_payload_embedding_crosscheck_rejects_ambig
                 reason="symbol_anchor",
                 confidence=1.0,
                 primary_key_kind="stable_key",
+                primary_key_hash="0000000000000000",
                 key_strength=1,
                 had_collision=False,
                 collision_group_size=1,
@@ -449,6 +478,7 @@ async def test_build_move_suggestions_payload_embedding_crosscheck_rejects_ambig
                 reason="symbol_anchor",
                 confidence=1.0,
                 primary_key_kind="stable_key",
+                primary_key_hash="0000000000000000",
                 key_strength=1,
                 had_collision=False,
                 collision_group_size=1,
@@ -464,6 +494,7 @@ async def test_build_move_suggestions_payload_embedding_crosscheck_rejects_ambig
                 reason="symbol_anchor",
                 confidence=1.0,
                 primary_key_kind="stable_key",
+                primary_key_hash="0000000000000000",
                 key_strength=1,
                 had_collision=False,
                 collision_group_size=1,
@@ -490,11 +521,17 @@ async def test_build_move_suggestions_payload_embedding_crosscheck_rejects_ambig
 
 
 @pytest.mark.asyncio
-async def test_build_move_suggestions_payload_embedding_crosscheck_requires_mutual_best() -> None:
+async def test_build_move_suggestions_payload_embedding_crosscheck_requires_mutual_best() -> (
+    None
+):
     provider = _TagEmbeddingProvider()
 
-    old1 = _handle(path="a.py", chunk_type="function", symbol="old_sym_1", text_hash="x")
-    old2 = _handle(path="b.py", chunk_type="function", symbol="old_sym_2", text_hash="y")
+    old1 = _handle(
+        path="a.py", chunk_type="function", symbol="old_sym_1", text_hash="x"
+    )
+    old2 = _handle(
+        path="b.py", chunk_type="function", symbol="old_sym_2", text_hash="y"
+    )
     new = _handle(path="c.py", chunk_type="function", symbol="new_sym", text_hash="z")
     report = _make_report(
         changes=[
@@ -507,6 +544,7 @@ async def test_build_move_suggestions_payload_embedding_crosscheck_requires_mutu
                 reason="symbol_anchor",
                 confidence=1.0,
                 primary_key_kind="stable_key",
+                primary_key_hash="0000000000000000",
                 key_strength=1,
                 had_collision=False,
                 collision_group_size=1,
@@ -522,6 +560,7 @@ async def test_build_move_suggestions_payload_embedding_crosscheck_requires_mutu
                 reason="symbol_anchor",
                 confidence=1.0,
                 primary_key_kind="stable_key",
+                primary_key_hash="0000000000000000",
                 key_strength=1,
                 had_collision=False,
                 collision_group_size=1,
@@ -537,6 +576,7 @@ async def test_build_move_suggestions_payload_embedding_crosscheck_requires_mutu
                 reason="symbol_anchor",
                 confidence=1.0,
                 primary_key_kind="stable_key",
+                primary_key_hash="0000000000000000",
                 key_strength=1,
                 had_collision=False,
                 collision_group_size=1,
@@ -579,6 +619,7 @@ async def test_build_move_suggestions_payload_pairs_unique_same_dir() -> None:
                 reason="symbol_anchor",
                 confidence=1.0,
                 primary_key_kind="stable_key",
+                primary_key_hash="0000000000000000",
                 key_strength=1,
                 had_collision=False,
                 collision_group_size=1,
@@ -594,6 +635,7 @@ async def test_build_move_suggestions_payload_pairs_unique_same_dir() -> None:
                 reason="symbol_anchor",
                 confidence=1.0,
                 primary_key_kind="stable_key",
+                primary_key_hash="0000000000000000",
                 key_strength=1,
                 had_collision=False,
                 collision_group_size=1,
@@ -626,6 +668,7 @@ async def test_build_move_suggestions_payload_excludes_blocks_when_disabled() ->
                 reason="symbol_anchor",
                 confidence=1.0,
                 primary_key_kind="stable_key",
+                primary_key_hash="0000000000000000",
                 key_strength=1,
                 had_collision=False,
                 collision_group_size=1,
@@ -641,6 +684,7 @@ async def test_build_move_suggestions_payload_excludes_blocks_when_disabled() ->
                 reason="symbol_anchor",
                 confidence=1.0,
                 primary_key_kind="stable_key",
+                primary_key_hash="0000000000000000",
                 key_strength=1,
                 had_collision=False,
                 collision_group_size=1,
@@ -657,13 +701,19 @@ async def test_build_move_suggestions_payload_excludes_blocks_when_disabled() ->
 
 
 @pytest.mark.asyncio
-async def test_build_move_suggestions_payload_llm_tiebreak_runs_when_requested_and_embedding_candidates_exist() -> None:
+async def test_build_move_suggestions_payload_llm_tiebreak_runs_when_requested_and_embedding_candidates_exist() -> (
+    None
+):
     embedding_provider = _TagEmbeddingProvider()
     llm_provider = _StubLLMProvider(chosen_add_change_index=1)
 
     old = _handle(path="a.py", chunk_type="function", symbol="old_sym", text_hash="x")
-    new1 = _handle(path="b.py", chunk_type="function", symbol="new_sym_1", text_hash="y")
-    new2 = _handle(path="c.py", chunk_type="function", symbol="new_sym_2", text_hash="z")
+    new1 = _handle(
+        path="b.py", chunk_type="function", symbol="new_sym_1", text_hash="y"
+    )
+    new2 = _handle(
+        path="c.py", chunk_type="function", symbol="new_sym_2", text_hash="z"
+    )
     report = _make_report(
         changes=[
             GapChangeItem(
@@ -675,6 +725,7 @@ async def test_build_move_suggestions_payload_llm_tiebreak_runs_when_requested_a
                 reason="symbol_anchor",
                 confidence=1.0,
                 primary_key_kind="stable_key",
+                primary_key_hash="0000000000000000",
                 key_strength=1,
                 had_collision=False,
                 collision_group_size=1,
@@ -690,6 +741,7 @@ async def test_build_move_suggestions_payload_llm_tiebreak_runs_when_requested_a
                 reason="symbol_anchor",
                 confidence=1.0,
                 primary_key_kind="stable_key",
+                primary_key_hash="0000000000000000",
                 key_strength=1,
                 had_collision=False,
                 collision_group_size=1,
@@ -705,6 +757,7 @@ async def test_build_move_suggestions_payload_llm_tiebreak_runs_when_requested_a
                 reason="symbol_anchor",
                 confidence=1.0,
                 primary_key_kind="stable_key",
+                primary_key_hash="0000000000000000",
                 key_strength=1,
                 had_collision=False,
                 collision_group_size=1,
@@ -741,7 +794,9 @@ async def test_build_move_suggestions_payload_llm_tiebreak_runs_when_requested_a
 
 
 @pytest.mark.asyncio
-async def test_build_move_suggestions_payload_llm_tiebreak_runs_concurrently_when_candidate_sets_disjoint() -> None:
+async def test_build_move_suggestions_payload_llm_tiebreak_runs_concurrently_when_candidate_sets_disjoint() -> (
+    None
+):
     embedding_provider = _TagEmbeddingProvider()
     llm_provider = _ConcurrentTrackingLLMProvider(delay_s=0.05)
 
@@ -760,6 +815,7 @@ async def test_build_move_suggestions_payload_llm_tiebreak_runs_concurrently_whe
                 reason="symbol_anchor",
                 confidence=1.0,
                 primary_key_kind="stable_key",
+                primary_key_hash="0000000000000000",
                 key_strength=1,
                 had_collision=False,
                 collision_group_size=1,
@@ -775,6 +831,7 @@ async def test_build_move_suggestions_payload_llm_tiebreak_runs_concurrently_whe
                 reason="symbol_anchor",
                 confidence=1.0,
                 primary_key_kind="stable_key",
+                primary_key_hash="0000000000000000",
                 key_strength=1,
                 had_collision=False,
                 collision_group_size=1,
@@ -790,6 +847,7 @@ async def test_build_move_suggestions_payload_llm_tiebreak_runs_concurrently_whe
                 reason="symbol_anchor",
                 confidence=1.0,
                 primary_key_kind="stable_key",
+                primary_key_hash="0000000000000000",
                 key_strength=1,
                 had_collision=False,
                 collision_group_size=1,
@@ -805,6 +863,7 @@ async def test_build_move_suggestions_payload_llm_tiebreak_runs_concurrently_whe
                 reason="symbol_anchor",
                 confidence=1.0,
                 primary_key_kind="stable_key",
+                primary_key_hash="0000000000000000",
                 key_strength=1,
                 had_collision=False,
                 collision_group_size=1,
@@ -835,7 +894,9 @@ async def test_build_move_suggestions_payload_llm_tiebreak_runs_concurrently_whe
 
 
 @pytest.mark.asyncio
-async def test_build_move_suggestions_payload_llm_tiebreak_is_sequential_when_candidate_sets_overlap() -> None:
+async def test_build_move_suggestions_payload_llm_tiebreak_is_sequential_when_candidate_sets_overlap() -> (
+    None
+):
     embedding_provider = _TagEmbeddingProvider()
     llm_provider = _ConcurrentTrackingLLMProvider(delay_s=0.05)
 
@@ -854,6 +915,7 @@ async def test_build_move_suggestions_payload_llm_tiebreak_is_sequential_when_ca
                 reason="symbol_anchor",
                 confidence=1.0,
                 primary_key_kind="stable_key",
+                primary_key_hash="0000000000000000",
                 key_strength=1,
                 had_collision=False,
                 collision_group_size=1,
@@ -869,6 +931,7 @@ async def test_build_move_suggestions_payload_llm_tiebreak_is_sequential_when_ca
                 reason="symbol_anchor",
                 confidence=1.0,
                 primary_key_kind="stable_key",
+                primary_key_hash="0000000000000000",
                 key_strength=1,
                 had_collision=False,
                 collision_group_size=1,
@@ -884,6 +947,7 @@ async def test_build_move_suggestions_payload_llm_tiebreak_is_sequential_when_ca
                 reason="symbol_anchor",
                 confidence=1.0,
                 primary_key_kind="stable_key",
+                primary_key_hash="0000000000000000",
                 key_strength=1,
                 had_collision=False,
                 collision_group_size=1,
@@ -899,6 +963,7 @@ async def test_build_move_suggestions_payload_llm_tiebreak_is_sequential_when_ca
                 reason="symbol_anchor",
                 confidence=1.0,
                 primary_key_kind="stable_key",
+                primary_key_hash="0000000000000000",
                 key_strength=1,
                 had_collision=False,
                 collision_group_size=1,
@@ -927,11 +992,15 @@ async def test_build_move_suggestions_payload_llm_tiebreak_is_sequential_when_ca
     llm_suggestions = [s for s in suggestions if s["method"] == "llm_tiebreak"]
     assert len(llm_suggestions) == 2
     assert llm_provider.max_in_flight == 1
-    assert llm_suggestions[0]["add_change_index"] != llm_suggestions[1]["add_change_index"]
+    assert (
+        llm_suggestions[0]["add_change_index"] != llm_suggestions[1]["add_change_index"]
+    )
 
 
 @pytest.mark.asyncio
-async def test_build_move_suggestions_payload_llm_tiebreak_skips_when_disabled() -> None:
+async def test_build_move_suggestions_payload_llm_tiebreak_skips_when_disabled() -> (
+    None
+):
     embedding_provider = _TagEmbeddingProvider()
     llm_provider = _StubLLMProvider(chosen_add_change_index=1)
 
@@ -948,6 +1017,7 @@ async def test_build_move_suggestions_payload_llm_tiebreak_skips_when_disabled()
                 reason="symbol_anchor",
                 confidence=1.0,
                 primary_key_kind="stable_key",
+                primary_key_hash="0000000000000000",
                 key_strength=1,
                 had_collision=False,
                 collision_group_size=1,
@@ -963,6 +1033,7 @@ async def test_build_move_suggestions_payload_llm_tiebreak_skips_when_disabled()
                 reason="symbol_anchor",
                 confidence=1.0,
                 primary_key_kind="stable_key",
+                primary_key_hash="0000000000000000",
                 key_strength=1,
                 had_collision=False,
                 collision_group_size=1,
@@ -995,13 +1066,19 @@ async def test_build_move_suggestions_payload_llm_tiebreak_skips_when_disabled()
 
 
 @pytest.mark.asyncio
-async def test_build_move_suggestions_payload_llm_dry_run_collects_prompts_without_calling_llm() -> None:
+async def test_build_move_suggestions_payload_llm_dry_run_collects_prompts_without_calling_llm() -> (
+    None
+):
     embedding_provider = _TagEmbeddingProvider()
     dry_run_calls: list[tuple[str, str]] = []
 
     old = _handle(path="a.py", chunk_type="function", symbol="old_sym", text_hash="x")
-    new1 = _handle(path="b.py", chunk_type="function", symbol="new_sym_1", text_hash="y")
-    new2 = _handle(path="c.py", chunk_type="function", symbol="new_sym_2", text_hash="z")
+    new1 = _handle(
+        path="b.py", chunk_type="function", symbol="new_sym_1", text_hash="y"
+    )
+    new2 = _handle(
+        path="c.py", chunk_type="function", symbol="new_sym_2", text_hash="z"
+    )
     report = _make_report(
         changes=[
             GapChangeItem(
@@ -1013,6 +1090,7 @@ async def test_build_move_suggestions_payload_llm_dry_run_collects_prompts_witho
                 reason="symbol_anchor",
                 confidence=1.0,
                 primary_key_kind="stable_key",
+                primary_key_hash="0000000000000000",
                 key_strength=1,
                 had_collision=False,
                 collision_group_size=1,
@@ -1028,6 +1106,7 @@ async def test_build_move_suggestions_payload_llm_dry_run_collects_prompts_witho
                 reason="symbol_anchor",
                 confidence=1.0,
                 primary_key_kind="stable_key",
+                primary_key_hash="0000000000000000",
                 key_strength=1,
                 had_collision=False,
                 collision_group_size=1,
@@ -1043,6 +1122,7 @@ async def test_build_move_suggestions_payload_llm_dry_run_collects_prompts_witho
                 reason="symbol_anchor",
                 confidence=1.0,
                 primary_key_kind="stable_key",
+                primary_key_hash="0000000000000000",
                 key_strength=1,
                 had_collision=False,
                 collision_group_size=1,
@@ -1082,12 +1162,16 @@ async def test_build_move_suggestions_payload_llm_dry_run_collects_prompts_witho
 
 
 @pytest.mark.asyncio
-async def test_build_move_suggestions_payload_llm_dry_run_skips_when_top_score_below_min_score() -> None:
+async def test_build_move_suggestions_payload_llm_dry_run_skips_when_top_score_below_min_score() -> (
+    None
+):
     embedding_provider = _TagEmbeddingProvider()
     dry_run_calls: list[tuple[str, str]] = []
 
     old = _handle(path="a.py", chunk_type="function", symbol="old_sym", text_hash="x")
-    new1 = _handle(path="b.py", chunk_type="function", symbol="new_sym_1", text_hash="y")
+    new1 = _handle(
+        path="b.py", chunk_type="function", symbol="new_sym_1", text_hash="y"
+    )
     report = _make_report(
         changes=[
             GapChangeItem(
@@ -1099,6 +1183,7 @@ async def test_build_move_suggestions_payload_llm_dry_run_skips_when_top_score_b
                 reason="symbol_anchor",
                 confidence=1.0,
                 primary_key_kind="stable_key",
+                primary_key_hash="0000000000000000",
                 key_strength=1,
                 had_collision=False,
                 collision_group_size=1,
@@ -1114,6 +1199,7 @@ async def test_build_move_suggestions_payload_llm_dry_run_skips_when_top_score_b
                 reason="symbol_anchor",
                 confidence=1.0,
                 primary_key_kind="stable_key",
+                primary_key_hash="0000000000000000",
                 key_strength=1,
                 had_collision=False,
                 collision_group_size=1,
@@ -1149,13 +1235,19 @@ async def test_build_move_suggestions_payload_llm_dry_run_skips_when_top_score_b
 
 
 @pytest.mark.asyncio
-async def test_build_move_suggestions_payload_llm_dry_run_trims_to_fit_token_budget() -> None:
+async def test_build_move_suggestions_payload_llm_dry_run_trims_to_fit_token_budget() -> (
+    None
+):
     embedding_provider = _TagEmbeddingProvider()
     dry_run_calls: list[tuple[str, str]] = []
 
     old = _handle(path="a.py", chunk_type="function", symbol="old_sym", text_hash="x")
-    new1 = _handle(path="b.py", chunk_type="function", symbol="new_sym_1", text_hash="y")
-    new2 = _handle(path="c.py", chunk_type="function", symbol="new_sym_2", text_hash="z")
+    new1 = _handle(
+        path="b.py", chunk_type="function", symbol="new_sym_1", text_hash="y"
+    )
+    new2 = _handle(
+        path="c.py", chunk_type="function", symbol="new_sym_2", text_hash="z"
+    )
     report = _make_report(
         changes=[
             GapChangeItem(
@@ -1167,6 +1259,7 @@ async def test_build_move_suggestions_payload_llm_dry_run_trims_to_fit_token_bud
                 reason="symbol_anchor",
                 confidence=1.0,
                 primary_key_kind="stable_key",
+                primary_key_hash="0000000000000000",
                 key_strength=1,
                 had_collision=False,
                 collision_group_size=1,
@@ -1182,6 +1275,7 @@ async def test_build_move_suggestions_payload_llm_dry_run_trims_to_fit_token_bud
                 reason="symbol_anchor",
                 confidence=1.0,
                 primary_key_kind="stable_key",
+                primary_key_hash="0000000000000000",
                 key_strength=1,
                 had_collision=False,
                 collision_group_size=1,
@@ -1197,6 +1291,7 @@ async def test_build_move_suggestions_payload_llm_dry_run_trims_to_fit_token_bud
                 reason="symbol_anchor",
                 confidence=1.0,
                 primary_key_kind="stable_key",
+                primary_key_hash="0000000000000000",
                 key_strength=1,
                 had_collision=False,
                 collision_group_size=1,

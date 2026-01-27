@@ -112,8 +112,10 @@ def _build_isotope_pairs_from_suggestions_payload(
 
 async def gap_command(args: argparse.Namespace, config: Config) -> None:
     """Execute the gap command (v1)."""
-    a_root = Path(args.a).resolve()
-    b_root = Path(args.b).resolve()
+    a_ref_user = str(args.a)
+    b_ref_user = str(args.b)
+    a_root = Path(a_ref_user).resolve()
+    b_root = Path(b_ref_user).resolve()
 
     if not a_root.exists() or not a_root.is_dir():
         logger.error(f"Path A must be an existing directory: {a_root}")
@@ -143,8 +145,7 @@ async def gap_command(args: argparse.Namespace, config: Config) -> None:
             GapWarning(
                 code="RECOVERY_DOWNGRADED_AGGRESSIVE_TO_SAFE",
                 message=(
-                    "recovery=aggressive is not available in v1; "
-                    "downgraded to safe"
+                    "recovery=aggressive is not available in v1; downgraded to safe"
                 ),
                 meta={"requested": requested_recovery, "effective": effective_recovery},
             )
@@ -176,6 +177,8 @@ async def gap_command(args: argparse.Namespace, config: Config) -> None:
                 engine.run_with_details_and_symbol_texts(
                     a_root=a_root,
                     b_root=b_root,
+                    a_ref_user=a_ref_user,
+                    b_ref_user=b_ref_user,
                     indexing=config.indexing,
                     recovery_mode=effective_recovery,
                     deterministic=deterministic,
@@ -187,6 +190,8 @@ async def gap_command(args: argparse.Namespace, config: Config) -> None:
             report = engine.run(
                 a_root=a_root,
                 b_root=b_root,
+                a_ref_user=a_ref_user,
+                b_ref_user=b_ref_user,
                 indexing=config.indexing,
                 recovery_mode=effective_recovery,
                 deterministic=deterministic,
@@ -262,7 +267,9 @@ async def gap_command(args: argparse.Namespace, config: Config) -> None:
             texts_b_by_path_ordinal=texts_b_by_path_ordinal,
         )
 
-        embedding_configured = config.embedding is not None and not config.embeddings_disabled
+        embedding_configured = (
+            config.embedding is not None and not config.embeddings_disabled
+        )
 
         provider = None
         if theme_items and embedding_configured:
@@ -294,7 +301,8 @@ async def gap_command(args: argparse.Namespace, config: Config) -> None:
                     llm_dry_run_calls: list[tuple[str, str]] = []
                     move_suggestions_llm_dry_run_calls = llm_dry_run_calls
                     llm_enabled_for_suggestions = bool(
-                        (not move_suggestions_llm_disabled) or move_suggestions_llm_dry_run
+                        (not move_suggestions_llm_disabled)
+                        or move_suggestions_llm_dry_run
                     )
 
                     if (
@@ -319,7 +327,9 @@ async def gap_command(args: argparse.Namespace, config: Config) -> None:
                         if (
                             formatter is not None
                             and llm_enabled_for_suggestions
-                            and (move_suggestions_llm_dry_run or llm_provider is not None)
+                            and (
+                                move_suggestions_llm_dry_run or llm_provider is not None
+                            )
                         )
                         else nullcontext()
                     )
@@ -460,7 +470,9 @@ async def gap_command(args: argparse.Namespace, config: Config) -> None:
             and not move_suggestions_disabled
             and move_suggestions_payload is not None
         ):
-            write_move_suggestions(out_dir=out_dir_path, payload=move_suggestions_payload)
+            write_move_suggestions(
+                out_dir=out_dir_path, payload=move_suggestions_payload
+            )
 
     if want_stats and not want_json_only:
         assert details is not None

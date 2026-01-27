@@ -5,6 +5,8 @@ from __future__ import annotations
 from collections import defaultdict
 import re
 
+import xxhash
+
 from chunkhound.gap.models import GapChangeItem, GapSymbolHandle, GapWarning
 
 
@@ -35,6 +37,20 @@ def recover_safe_text_hash(
 ) -> tuple[list[GapChangeItem], list[GapWarning]]:
     """Collapse leftover symbol add/remove pairs via exact `(chunk_type, text_hash)`."""
     warnings: list[GapWarning] = []
+
+    def _primary_key_hash_for_symbol_update(
+        *, old: GapSymbolHandle, new: GapSymbolHandle
+    ) -> str:
+        if new.stable_key_hash:
+            return new.stable_key_hash
+        if old.stable_key_hash:
+            return old.stable_key_hash
+        if new.symbol_key_hash:
+            return new.symbol_key_hash
+        if old.symbol_key_hash:
+            return old.symbol_key_hash
+        path = new.path or old.path
+        return xxhash.xxh3_64(path.encode("utf-8")).hexdigest()
 
     kept: list[GapChangeItem] = []
     adds: dict[tuple[str, str], list[GapChangeItem]] = defaultdict(list)
@@ -140,6 +156,9 @@ def recover_safe_text_hash(
                     reason="recovery_safe_text_hash",
                     confidence=confidence,
                     primary_key_kind="stable_key",
+                    primary_key_hash=_primary_key_hash_for_symbol_update(
+                        old=old, new=new
+                    ),
                     key_strength=0,
                     had_collision=had_collision,
                     collision_group_size=collision_group_size,

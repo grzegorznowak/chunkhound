@@ -12,7 +12,6 @@ from typing import Any, Literal
 import numpy as np
 import hdbscan  # type: ignore[import-untyped]
 
-from chunkhound.core.utils import estimate_tokens
 from chunkhound.interfaces.embedding_provider import EmbeddingProvider
 from chunkhound.gap.models import GapChangeItem, GapReport, GapSymbolHandle
 
@@ -69,6 +68,146 @@ _STOP = {
     "def",
 }
 
+ELLIPSIS_MARKER = "…"
+MAX_DISPLAY_CHARS = 200
+
+_WS_RE = re.compile(r"\s+")
+_BACKTICK_RUN_RE = re.compile(r"`+")
+
+
+def _normalize_display_text(text: str) -> str:
+    text = text.replace("\r", " ").replace("\n", " ").replace("\t", " ")
+    return _WS_RE.sub(" ", text).strip()
+
+
+def _truncate_display_text(text: str, *, max_chars: int = MAX_DISPLAY_CHARS) -> str:
+    if len(text) <= max_chars:
+        return text
+    if max_chars <= 1:
+        return ELLIPSIS_MARKER
+    return text[: max_chars - 1].rstrip() + ELLIPSIS_MARKER
+
+
+def _markdown_code_span(text: str) -> str:
+    text = _normalize_display_text(text)
+    runs = _BACKTICK_RUN_RE.findall(text)
+    fence_len = max((len(r) for r in runs), default=0) + 1
+    fence = "`" * fence_len
+    return f"{fence}{text}{fence}"
+
+
+def _format_confidence_2dp(confidence: float) -> str:
+    s = f"{float(confidence):.2f}"
+    return "0.00" if s == "-0.00" else s
+
+
+def _symbol_handle_for_theme_item(
+    *, report: GapReport, change_index: int, prefer_new: bool
+) -> GapSymbolHandle | None:
+    if change_index < 0 or change_index >= len(report.changes):
+        return None
+    ch = report.changes[int(change_index)]
+    if not isinstance(ch, GapChangeItem) or ch.entity_kind != "symbol":
+        return None
+    if prefer_new and isinstance(ch.new, GapSymbolHandle):
+        return ch.new
+    if isinstance(ch.old, GapSymbolHandle):
+        return ch.old
+    if isinstance(ch.new, GapSymbolHandle):
+        return ch.new
+    return None
+
+
+def _locator_display(handle: GapSymbolHandle | None) -> tuple[str, str]:
+    if handle is None:
+        return ("(unknown)#L?", "ord=?")
+    path = _normalize_display_text(handle.path or "(unknown)")
+    start_line = int(handle.start_line)
+    end_line = int(handle.end_line)
+    if start_line <= 0 or end_line <= 0 or end_line < start_line:
+        loc = f"{path}#L?"
+    else:
+        loc = f"{path}#L{start_line}-L{end_line}"
+
+    ordinal = int(handle.ordinal_in_file)
+    ord_part = f"ord={ordinal}" if ordinal > 0 else "ord=?"
+    return (loc, ord_part)
+
+
+def _themes_compare_object(*, report: GapReport) -> dict[str, Any]:
+    counts = report.stats.counts
+    return {
+        "schema_version": report.schema_version,
+        "schema_revision": report.schema_revision,
+        "direction": report.direction,
+        "a": {
+            "source_hash": report.inputs.a.source_hash,
+            "source_ref": report.inputs.a.source_ref,
+        },
+        "b": {
+            "source_hash": report.inputs.b.source_hash,
+            "source_ref": report.inputs.b.source_ref,
+        },
+        "scope": {
+            "scope_hash": report.scope.scope_hash,
+            "changed_files_count": int(report.scope.changed_files_count),
+        },
+        "invariants": {
+            "deterministic": bool(report.invariants.deterministic),
+            "recovery_mode": report.invariants.recovery_mode,
+        },
+        "stats": {
+            "counts": {
+                "files_a_total": int(counts.files_a_total),
+                "files_b_total": int(counts.files_b_total),
+                "changes_total": int(counts.changes_total),
+                "file_changes_total": int(counts.file_changes_total),
+                "symbol_changes_total": int(counts.symbol_changes_total),
+            }
+        },
+        "warnings": {"total": int(len(report.warnings))},
+    }
+
+
+def _themes_markdown_compare_lines(*, report: GapReport) -> list[str]:
+    compare = _themes_compare_object(report=report)
+    counts = compare["stats"]["counts"]
+    lines: list[str] = []
+    lines.append("## Compare")
+    lines.append("")
+    lines.append(
+        f"- schema_version: {_markdown_code_span(str(compare['schema_version']))} "
+        f"schema_revision: {_markdown_code_span(str(compare['schema_revision']))} "
+        f"direction: {_markdown_code_span(str(compare['direction']))}"
+    )
+    lines.append(
+        f"- A: source_hash={_markdown_code_span(str(compare['a']['source_hash']))} "
+        f"source_ref={_markdown_code_span(str(compare['a']['source_ref']))}"
+    )
+    lines.append(
+        f"- B: source_hash={_markdown_code_span(str(compare['b']['source_hash']))} "
+        f"source_ref={_markdown_code_span(str(compare['b']['source_ref']))}"
+    )
+    lines.append(
+        f"- scope: scope_hash={_markdown_code_span(str(compare['scope']['scope_hash']))} "
+        f"changed_files_count={int(compare['scope']['changed_files_count'])}"
+    )
+    lines.append(
+        f"- invariants: deterministic={bool(compare['invariants']['deterministic'])} "
+        f"recovery_mode={_markdown_code_span(str(compare['invariants']['recovery_mode']))}"
+    )
+    lines.append(
+        "- stats.counts: "
+        f"files_a_total={int(counts['files_a_total'])} "
+        f"files_b_total={int(counts['files_b_total'])} "
+        f"changes_total={int(counts['changes_total'])} "
+        f"file_changes_total={int(counts['file_changes_total'])} "
+        f"symbol_changes_total={int(counts['symbol_changes_total'])}"
+    )
+    lines.append(f"- warnings: total={int(compare['warnings']['total'])}")
+    lines.append("")
+    return lines
+
 
 def _safe_handle_text(
     handle: GapSymbolHandle, texts_by_path_ordinal: dict[tuple[str, int], str]
@@ -87,6 +226,8 @@ def build_theme_documents(
     docs: list[str] = []
     items: list[ThemeItem] = []
 
+    max_chars = max(1, (int(max_tokens_per_doc) * 35) // 10)
+
     for idx, change in enumerate(report.changes):
         if change.entity_kind != "symbol":
             continue
@@ -94,43 +235,71 @@ def build_theme_documents(
         old = change.old if isinstance(change.old, GapSymbolHandle) else None
         new = change.new if isinstance(change.new, GapSymbolHandle) else None
 
-        parts: list[str] = []
-        parts.append(
-            f"op={change.op} reason={change.reason} moved={change.moved} renamed={change.renamed} content_changed={change.content_changed}"
+        header_line = (
+            f"op={change.op} reason={change.reason} moved={change.moved} "
+            f"renamed={change.renamed} content_changed={change.content_changed}"
         )
 
         chunk_type = None
         path = None
         symbol = None
 
+        old_header = None
+        old_lines: list[str] = []
         if old is not None:
             chunk_type = old.chunk_type
             path = old.path
             symbol = old.symbol
-            parts.append(f"OLD {old.chunk_type} {old.symbol} path={old.path}")
+            old_header = f"OLD {old.chunk_type} {old.symbol} path={old.path}"
             t = _safe_handle_text(old, texts_a_by_path_ordinal)
             if t:
-                parts.append(t)
+                old_lines = t.splitlines()
 
+        new_header = None
+        new_lines: list[str] = []
         if new is not None:
             chunk_type = new.chunk_type
             path = new.path
             symbol = new.symbol
-            parts.append(f"NEW {new.chunk_type} {new.symbol} path={new.path}")
+            new_header = f"NEW {new.chunk_type} {new.symbol} path={new.path}"
             t = _safe_handle_text(new, texts_b_by_path_ordinal)
             if t:
-                parts.append(t)
+                new_lines = t.splitlines()
 
-        doc = "\n".join(parts).strip()
-        if not doc:
+        def _assemble(*, old_keep: int, new_keep: int) -> str:
+            out_parts: list[str] = [header_line]
+            if old_header is not None:
+                out_parts.append(old_header)
+                out_parts.extend(old_lines[:old_keep])
+            if new_header is not None:
+                out_parts.append(new_header)
+                out_parts.extend(new_lines[:new_keep])
+            return "\n".join(out_parts).strip()
+
+        full_doc = _assemble(old_keep=len(old_lines), new_keep=len(new_lines))
+        if not full_doc:
             continue
 
-        # Ensure 1:1 mapping: truncate documents proactively to avoid provider-side splitting.
-        if estimate_tokens(doc) > max_tokens_per_doc:
-            words = doc.split()
-            while words and estimate_tokens(" ".join(words)) > max_tokens_per_doc:
-                words = words[: int(len(words) * 0.9)]
-            doc = " ".join(words)
+        if len(full_doc) <= max_chars:
+            doc = full_doc
+        else:
+            min_per_side = 1
+            old_min = min_per_side if old_lines else 0
+            new_min = min_per_side if new_lines else 0
+            old_keep = len(old_lines)
+            new_keep = len(new_lines)
+
+            doc = full_doc
+            while len(doc) > max_chars and (old_keep > old_min or new_keep > new_min):
+                if old_keep > old_min and (old_keep >= new_keep or new_keep <= new_min):
+                    old_keep = max(old_min, old_keep // 2)
+                elif new_keep > new_min:
+                    new_keep = max(new_min, new_keep // 2)
+                doc = _assemble(old_keep=old_keep, new_keep=new_keep)
+
+            if len(doc) > max_chars - 1:
+                doc = doc[: max_chars - 1].rstrip()
+            doc = doc + ELLIPSIS_MARKER
 
         docs.append(doc)
         items.append(
@@ -201,14 +370,19 @@ def cluster_embeddings_hdbscan(
 ) -> list[int]:
     if not embeddings:
         return []
+    if len(embeddings) == 1:
+        return [0]
     arr = np.asarray(embeddings, dtype=float)
     norms = np.linalg.norm(arr, axis=1, keepdims=True)
     norms[norms == 0.0] = 1.0
     arr = arr / norms
 
+    effective_min_cluster_size = min(max(2, int(min_cluster_size)), len(embeddings))
+    effective_min_samples = min(max(1, int(min_samples)), len(embeddings) - 1)
+
     clusterer = hdbscan.HDBSCAN(
-        min_cluster_size=max(2, min_cluster_size),
-        min_samples=min_samples,
+        min_cluster_size=effective_min_cluster_size,
+        min_samples=effective_min_samples,
         metric="euclidean",
         cluster_selection_method="leaf",
         allow_single_cluster=allow_single_cluster,
@@ -310,6 +484,8 @@ def render_themes_markdown(
     lines: list[str] = []
     lines.append("# Gap themes")
     lines.append("")
+    if report is not None:
+        lines.extend(_themes_markdown_compare_lines(report=report))
     lines.append(
         f"- provider: `{output.provider}` model: `{output.model}` dims: `{output.dims}`"
     )
@@ -327,29 +503,117 @@ def render_themes_markdown(
 
         by_path: dict[str, list[ThemeItem]] = defaultdict(list)
         for it in items:
-            by_path[it.path or "(unknown)"].append(it)
+            if report is None:
+                by_path[it.path or "(unknown)"].append(it)
+                continue
+            h = _symbol_handle_for_theme_item(
+                report=report, change_index=int(it.change_index), prefer_new=True
+            )
+            by_path[(h.path if h is not None else (it.path or "(unknown)"))].append(it)
         for path in sorted(by_path.keys()):
             lines.append(f"- `{path}`")
-            for it in sorted(by_path[path], key=_theme_item_sort_key):
-                sym = it.symbol or "(unknown)"
-                ct = it.chunk_type or "symbol"
+
+            def _sort_key(it: ThemeItem) -> tuple[int, int, int, int]:
+                if report is None:
+                    return (0, 0, 0, int(it.change_index))
+                h = _symbol_handle_for_theme_item(
+                    report=report, change_index=int(it.change_index), prefer_new=True
+                )
+                if h is None:
+                    return (10**9, 10**9, 10**9, int(it.change_index))
+                sl = int(h.start_line) if int(h.start_line) > 0 else 10**9
+                el = int(h.end_line) if int(h.end_line) > 0 else 10**9
+                ord_ = int(h.ordinal_in_file) if int(h.ordinal_in_file) > 0 else 10**9
+                return (sl, el, ord_, int(it.change_index))
+
+            for it in sorted(by_path[path], key=_sort_key):
                 pairing = (
                     isotope_pairs.get(int(it.change_index))
                     if isotope_pairs is not None
                     else None
                 )
-                if pairing is None:
-                    lines.append(
-                        f"  - {it.op} {ct} `{sym}` (reason={it.reason}, confidence={it.confidence:.2f}, change_index={it.change_index})"
+                if report is None:
+                    sym = _markdown_code_span(
+                        _truncate_display_text(it.symbol or "(unknown)")
                     )
-                    continue
+                    ct = _normalize_display_text(it.chunk_type or "symbol")
+                    conf = _format_confidence_2dp(float(it.confidence))
+                    base = (
+                        f"{it.op} {ct} {sym} "
+                        f"(reason={_normalize_display_text(it.reason)}, confidence={conf}, change_index={int(it.change_index)})"
+                    )
+                    if pairing is not None:
+                        base = (
+                            base[:-1]
+                            + f", paired_by={_normalize_display_text(pairing.method)}, pair_id={int(pairing.pair_id)}, pair_role={pairing.role}, paired_with={int(pairing.counterpart_change_index)})"
+                        )
+                    lines.append(f"  - {base}")
+                else:
+                    idx = int(it.change_index)
+                    ch = report.changes[idx] if 0 <= idx < len(report.changes) else None
+                    old = (
+                        ch.old
+                        if isinstance(ch, GapChangeItem)
+                        and isinstance(ch.old, GapSymbolHandle)
+                        else None
+                    )
+                    new = (
+                        ch.new
+                        if isinstance(ch, GapChangeItem)
+                        and isinstance(ch.new, GapSymbolHandle)
+                        else None
+                    )
+                    ct = _normalize_display_text(
+                        (
+                            new.chunk_type
+                            if new is not None
+                            else (
+                                old.chunk_type
+                                if old is not None
+                                else (it.chunk_type or "symbol")
+                            )
+                        )
+                    )
+                    sym_raw = (
+                        new.symbol
+                        if new is not None
+                        else (
+                            old.symbol
+                            if old is not None
+                            else (it.symbol or "(unknown)")
+                        )
+                    )
+                    sym = _markdown_code_span(
+                        _truncate_display_text(_normalize_display_text(sym_raw))
+                    )
+                    reason = _normalize_display_text(it.reason)
+                    conf = _format_confidence_2dp(float(it.confidence))
 
-                lines.append(
-                    f"  - {it.op} {ct} `{sym}` (reason={it.reason}, confidence={it.confidence:.2f}, change_index={it.change_index}, paired_by={pairing.method}, pair_id={pairing.pair_id}, pair_role={pairing.role}, paired_with={pairing.counterpart_change_index})"
-                )
+                    if isinstance(ch, GapChangeItem) and ch.op == "update":
+                        old_loc, old_ord = _locator_display(old)
+                        new_loc, new_ord = _locator_display(new)
+                        line = (
+                            f"update {ct} {sym} OLD {_markdown_code_span(old_loc)} {old_ord} -> "
+                            f"NEW {_markdown_code_span(new_loc)} {new_ord} "
+                            f"(reason={reason}, confidence={conf}, change_index={idx})"
+                        )
+                    else:
+                        h = new if new is not None else old
+                        loc, ord_part = _locator_display(h)
+                        line = (
+                            f"{it.op} {ct} {sym} @ {_markdown_code_span(loc)} {ord_part} "
+                            f"(reason={reason}, confidence={conf}, change_index={idx})"
+                        )
+                        if pairing is not None:
+                            line = (
+                                line[:-1]
+                                + f", paired_by={_normalize_display_text(pairing.method)}, pair_id={int(pairing.pair_id)}, pair_role={pairing.role}, paired_with={int(pairing.counterpart_change_index)}, pair_confidence={_format_confidence_2dp(pairing.confidence)})"
+                            )
+                    lines.append(f"  - {line}")
 
                 if (
                     report is None
+                    or pairing is None
                     or pairing.role != "remove"
                     or pairing.pair_id in emitted_pairs
                 ):
@@ -386,20 +650,21 @@ def render_themes_markdown(
                 old_desc = "(unknown old)"
                 new_desc = "(unknown new)"
                 if old is not None:
-                    old_desc = (
-                        f"{old.chunk_type} `{old.symbol}` {old.path}:{old.start_line}-{old.end_line} ord={old.ordinal_in_file}"
-                    )
+                    loc, ord_part = _locator_display(old)
+                    old_desc = f"{_normalize_display_text(old.chunk_type)} {_markdown_code_span(_truncate_display_text(_normalize_display_text(old.symbol)))} {_markdown_code_span(loc)} {ord_part}"
                 if new is not None:
-                    new_desc = (
-                        f"{new.chunk_type} `{new.symbol}` {new.path}:{new.start_line}-{new.end_line} ord={new.ordinal_in_file}"
-                    )
+                    loc, ord_part = _locator_display(new)
+                    new_desc = f"{_normalize_display_text(new.chunk_type)} {_markdown_code_span(_truncate_display_text(_normalize_display_text(new.symbol)))} {_markdown_code_span(loc)} {ord_part}"
 
                 rationale = ""
                 if pairing.rationale:
-                    rationale = f" rationale={pairing.rationale!r}"
+                    rationale = f" rationale={_markdown_code_span(_truncate_display_text(_normalize_display_text(pairing.rationale)))}"
 
                 lines.append(
-                    f"  - [ISO:{pairing.method}] suggest_update {old_desc} -> {new_desc} (remove_change_index={rem_idx}, add_change_index={add_idx}, confidence={pairing.confidence:.2f}, pair_id={pairing.pair_id}){rationale}"
+                    "  - "
+                    f"[ISO:{_normalize_display_text(pairing.method)}] suggest_update "
+                    f"{old_desc} -> {new_desc} "
+                    f"(remove_change_index={rem_idx}, add_change_index={add_idx}, confidence={_format_confidence_2dp(pairing.confidence)}, pair_id={pairing.pair_id}){rationale}"
                 )
             lines.append("")
 
@@ -430,9 +695,17 @@ def render_themes_markdown(
                     path = ch.new.path
                 elif ch.old is not None:
                     path = ch.old.path
-                old_class = getattr(ch.old, "file_class", None) if ch.old is not None else None
-                new_class = getattr(ch.new, "file_class", None) if ch.new is not None else None
-                if old_class is not None and new_class is not None and old_class != new_class:
+                old_class = (
+                    getattr(ch.old, "file_class", None) if ch.old is not None else None
+                )
+                new_class = (
+                    getattr(ch.new, "file_class", None) if ch.new is not None else None
+                )
+                if (
+                    old_class is not None
+                    and new_class is not None
+                    and old_class != new_class
+                ):
                     file_class = f"{old_class}->{new_class}"
                 else:
                     file_class = str(new_class or old_class or "unknown")
@@ -460,7 +733,23 @@ def write_theme_artifacts(
     ]
     file_change_indexes.sort()
 
+    def _locator_fields(
+        *, handle: GapSymbolHandle | None, prefix: str = ""
+    ) -> dict[str, Any]:
+        if handle is None:
+            return {}
+        return {
+            f"{prefix}path": str(handle.path),
+            f"{prefix}start_line": int(handle.start_line),
+            f"{prefix}end_line": int(handle.end_line),
+            f"{prefix}ordinal_in_file": int(handle.ordinal_in_file),
+        }
+
     themes_payload: dict[str, Any] = {
+        "schema_version": report.schema_version,
+        "schema_revision": report.schema_revision,
+        "direction": report.direction,
+        "compare": _themes_compare_object(report=report),
         "provider": output.provider,
         "model": output.model,
         "dims": int(output.dims),
@@ -482,18 +771,47 @@ def write_theme_artifacts(
             "items": [],
         }
         for it in sorted(items, key=_theme_item_sort_key):
-            theme_dict["items"].append(
-                {
-                    "change_index": int(it.change_index),
-                    "entity_kind": it.entity_kind,
-                    "op": it.op,
-                    "reason": it.reason,
-                    "confidence": float(it.confidence),
-                    "chunk_type": it.chunk_type,
-                    "path": it.path,
-                    "symbol": it.symbol,
-                }
-            )
+            idx = int(it.change_index)
+            item_dict: dict[str, Any] = {
+                "change_index": idx,
+                "entity_kind": it.entity_kind,
+                "op": it.op,
+                "reason": it.reason,
+                "confidence": float(it.confidence),
+                "chunk_type": it.chunk_type,
+                "path": it.path,
+                "symbol": it.symbol,
+            }
+
+            ch = report.changes[idx] if 0 <= idx < len(report.changes) else None
+            if isinstance(ch, GapChangeItem) and ch.entity_kind == "symbol":
+                old = ch.old if isinstance(ch.old, GapSymbolHandle) else None
+                new = ch.new if isinstance(ch.new, GapSymbolHandle) else None
+
+                if ch.op == "update":
+                    item_dict.update(_locator_fields(handle=old, prefix="old_"))
+                    item_dict.update(_locator_fields(handle=new, prefix="new_"))
+                    preferred = new if new is not None else old
+                else:
+                    preferred = new if new is not None else old
+
+                item_dict.update(_locator_fields(handle=preferred))
+
+                if isotope_pairs is not None:
+                    pairing = isotope_pairs.get(idx)
+                    if pairing is not None:
+                        item_dict.update(
+                            {
+                                "paired_by": pairing.method,
+                                "pair_id": int(pairing.pair_id),
+                                "pair_role": pairing.role,
+                                "paired_with": int(pairing.counterpart_change_index),
+                                "pair_confidence": float(pairing.confidence),
+                                "pair_rationale": pairing.rationale,
+                            }
+                        )
+
+            theme_dict["items"].append(item_dict)
         themes_payload["themes"].append(theme_dict)
 
     (out_dir / "themes.json").write_text(
@@ -509,6 +827,7 @@ def write_theme_artifacts(
 
     run_info: dict[str, Any] = {
         "schema_version": report.schema_version,
+        "schema_revision": report.schema_revision,
         "direction": report.direction,
         "scope_hash": report.scope.scope_hash,
         "embedding_provider": output.provider,

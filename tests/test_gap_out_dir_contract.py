@@ -43,9 +43,22 @@ def test_gap_out_dir_emits_themes_json_contract() -> None:
         )
         assert res.returncode == 0, res.stderr
 
+        gap_payload = json.loads((out_dir / "gap.json").read_text(encoding="utf-8"))
+        assert gap_payload["schema_version"] == "gap.v1"
+        assert gap_payload["schema_revision"] == "2026-01-09"
+        assert isinstance(gap_payload.get("changes"), list)
+        for change in gap_payload["changes"]:
+            assert isinstance(change, dict)
+            assert isinstance(change.get("primary_key_hash"), str)
+
         themes_payload = json.loads(
             (out_dir / "themes.json").read_text(encoding="utf-8")
         )
+        assert themes_payload["schema_revision"] == gap_payload["schema_revision"]
+        compare = themes_payload.get("compare")
+        assert isinstance(compare, dict)
+        assert compare.get("schema_revision") == gap_payload["schema_revision"]
+        assert compare.get("schema_version") == gap_payload["schema_version"]
         for k in (
             "provider",
             "model",
@@ -75,10 +88,15 @@ def test_gap_out_dir_emits_themes_json_contract() -> None:
             for item in items:
                 assert isinstance(item, dict)
                 assert isinstance(item.get("change_index"), int)
+                assert isinstance(item.get("path"), str)
+                assert isinstance(item.get("start_line"), int)
+                assert isinstance(item.get("end_line"), int)
+                assert isinstance(item.get("ordinal_in_file"), int)
 
         run_payload = json.loads((out_dir / "run.json").read_text(encoding="utf-8"))
         for k in (
             "schema_version",
+            "schema_revision",
             "direction",
             "scope_hash",
             "embedding_provider",
@@ -88,11 +106,17 @@ def test_gap_out_dir_emits_themes_json_contract() -> None:
             "warnings_total",
         ):
             assert k in run_payload
+        assert run_payload["schema_revision"] == gap_payload["schema_revision"]
 
         suggestions_payload = json.loads(
             (out_dir / "move_suggestions.json").read_text(encoding="utf-8")
         )
         assert suggestions_payload["schema_version"] == "gap.suggestions.v1"
+        assert suggestions_payload["schema_revision"] == gap_payload["schema_revision"]
         assert suggestions_payload["source_schema_version"] == "gap.v1"
+        assert (
+            suggestions_payload["source_schema_revision"]
+            == gap_payload["schema_revision"]
+        )
         assert suggestions_payload["source_scope_hash"] == run_payload["scope_hash"]
         assert isinstance(suggestions_payload.get("suggestions"), list)

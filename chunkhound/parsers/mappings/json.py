@@ -169,7 +169,23 @@ class JsonMapping(BaseMapping):
         """Extract JSON-specific metadata."""
 
         source = content.decode("utf-8")
-        metadata = {}
+        metadata: dict[str, Any] = {}
+
+        # Ensure JSON chunks don't default to FUNCTION: provide a mapping-level type hint
+        # so UniversalParser can map DEFINITION nodes appropriately.
+        node = (
+            captures.get("definition")
+            or captures.get("block")
+            or captures.get("node")
+            or (next(iter(captures.values())) if captures else None)
+        )
+        if isinstance(node, Node):
+            if node.type == "pair":
+                metadata["chunk_type_hint"] = "key_value"
+            elif node.type == "object":
+                metadata["chunk_type_hint"] = "object"
+            elif node.type == "array":
+                metadata["chunk_type_hint"] = "array"
 
         try:
             data = json.loads(source)
@@ -285,10 +301,7 @@ class JsonMapping(BaseMapping):
             return 1
 
     def resolve_import_path(
-        self,
-        import_text: str,
-        base_dir: Path,
-        source_file: Path
+        self, import_text: str, base_dir: Path, source_file: Path
     ) -> Path | None:
         """Data formats don't have imports."""
         return None
@@ -334,10 +347,7 @@ class JsonMapping(BaseMapping):
                     if len(value_str) > MAX_CONSTANT_VALUE_LENGTH:
                         value_str = value_str[:MAX_CONSTANT_VALUE_LENGTH]
 
-                    constants.append({
-                        "name": key,
-                        "value": value_str
-                    })
+                    constants.append({"name": key, "value": value_str})
 
             return constants if constants else None
 

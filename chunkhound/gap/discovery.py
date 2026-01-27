@@ -140,11 +140,17 @@ def _classify_and_hash_file(
 
 
 def discover_source(
-    *, root: Path, indexing: IndexingConfig
+    *,
+    root: Path,
+    indexing: IndexingConfig,
+    source_ref_user: str | None = None,
+    source_ref_resolved: str | None = None,
 ) -> tuple[SourceSnapshot, list[GapWarning]]:
     """Discover files under root using the current indexing scope rules."""
     warnings: list[GapWarning] = []
     root = root.resolve()
+    resolved_ref = source_ref_resolved or str(root)
+    user_ref = source_ref_user or resolved_ref
 
     include_patterns = normalize_include_patterns(list(indexing.include))
     ignore_sources = list(indexing.resolve_ignore_sources())
@@ -221,7 +227,9 @@ def discover_source(
         files=discovered,
         input_ref=GapInputRef(
             source_kind="path",
-            source_ref=str(root),
+            source_ref=user_ref,
+            source_ref_user=user_ref,
+            source_ref_resolved=resolved_ref,
             source_hash=source_hash,
         ),
     )
