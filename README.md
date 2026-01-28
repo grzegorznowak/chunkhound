@@ -1,4 +1,5 @@
-codex resume 019b9ddc-a85a-78f0-87ce-9a394d476e9b
+continue from
+.tmp-docs/20260128-111601-gap-outliers-nearest-themes-handover.md
 
 <p align="center">
   <a href="https://chunkhound.github.io">
