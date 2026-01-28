@@ -74,6 +74,9 @@ MAX_DISPLAY_CHARS = 200
 _WS_RE = re.compile(r"\s+")
 _BACKTICK_RUN_RE = re.compile(r"`+")
 
+OUTLIERS_NEAREST_TOP_K = 3
+OUTLIERS_NEAREST_THRESHOLD = 0.80
+
 
 def _normalize_display_text(text: str) -> str:
     text = text.replace("\r", " ").replace("\n", " ").replace("\t", " ")
@@ -99,6 +102,15 @@ def _markdown_code_span(text: str) -> str:
 def _format_confidence_2dp(confidence: float) -> str:
     s = f"{float(confidence):.2f}"
     return "0.00" if s == "-0.00" else s
+
+
+def _format_similarity_2dp(similarity: float) -> str:
+    s = f"{float(similarity):.2f}"
+    return "0.00" if s == "-0.00" else s
+
+
+def _round_similarity_6dp(similarity: float) -> float:
+    return round(float(similarity), 6)
 
 
 def _symbol_handle_for_theme_item(
@@ -471,11 +483,103 @@ def build_fallback_theme_output(*, items: list[ThemeItem], label: str) -> ThemeO
     )
 
 
+def compute_outliers_nearest(
+    *,
+    embeddings: list[list[float]],
+    labels: list[int],
+    items: list[ThemeItem],
+    output: ThemeOutput,
+) -> list[dict[str, Any]]:
+    if not embeddings:
+        return []
+    if len(embeddings) != len(labels) or len(embeddings) != len(items):
+        raise ValueError(
+            "embeddings, labels, and items must have identical length "
+            f"(got {len(embeddings)}, {len(labels)}, {len(items)})"
+        )
+
+    outlier_indices = [i for i, lab in enumerate(labels) if int(lab) == -1]
+    if not outlier_indices:
+        return []
+
+    theme_to_indices: dict[int, list[int]] = defaultdict(list)
+    for i, lab in enumerate(labels):
+        theme_id = int(lab)
+        if theme_id == -1:
+            continue
+        theme_to_indices[theme_id].append(i)
+    if not theme_to_indices:
+        return []
+
+    arr = np.asarray(embeddings, dtype=float)
+    norms = np.linalg.norm(arr, axis=1, keepdims=True)
+    norms[norms == 0.0] = 1.0
+    arr = arr / norms
+
+    theme_ids = sorted(theme_to_indices.keys())
+    centroids: list[np.ndarray] = []
+    for tid in theme_ids:
+        idxs = theme_to_indices[tid]
+        cluster_arr = arr[idxs]
+        centroid = cluster_arr.mean(axis=0)
+        centroid_norm = float(np.linalg.norm(centroid))
+        if centroid_norm == 0.0:
+            centroid_norm = 1.0
+        centroids.append(centroid / centroid_norm)
+    centroids_arr = np.stack(centroids, axis=0)
+
+    outlier_indices.sort(key=lambda i: _theme_item_sort_key(items[i]))
+
+    out: list[dict[str, Any]] = []
+    for i in outlier_indices:
+        out_vec = arr[i]
+        sims = centroids_arr @ out_vec
+
+        candidates: list[dict[str, Any]] = []
+        for tid, sim in zip(theme_ids, sims.tolist()):
+            sim6 = _round_similarity_6dp(float(sim))
+            candidates.append(
+                {
+                    "theme_id": int(tid),
+                    "label": _theme_label(output=output, theme_id=int(tid)),
+                    "similarity": sim6,
+                }
+            )
+
+        candidates.sort(
+            key=lambda c: (
+                -float(_format_similarity_2dp(float(c["similarity"]))),
+                int(c["theme_id"]),
+            )
+        )
+        candidates = candidates[: min(OUTLIERS_NEAREST_TOP_K, len(candidates))]
+
+        assigned_theme_id: int | None = None
+        assigned_similarity: float | None = None
+        if candidates:
+            best_sim = _round_similarity_6dp(float(candidates[0]["similarity"]))
+            if best_sim >= OUTLIERS_NEAREST_THRESHOLD:
+                assigned_theme_id = int(candidates[0]["theme_id"])
+                assigned_similarity = best_sim
+
+        out.append(
+            {
+                "change_index": int(items[i].change_index),
+                "assigned_theme_id": assigned_theme_id,
+                "assigned_similarity": assigned_similarity,
+                "candidates": candidates,
+            }
+        )
+
+    return out
+
+
 def render_themes_markdown(
     *,
     output: ThemeOutput,
     report: GapReport | None = None,
     isotope_pairs: dict[int, IsotopePairing] | None = None,
+    outliers_nearest: list[dict[str, Any]] | None = None,
 ) -> str:
     theme_items = sorted(
         output.themes.items(),
@@ -668,6 +772,115 @@ def render_themes_markdown(
                 )
             lines.append("")
 
+    if outliers_nearest is not None and int(output.dims) > 0:
+        by_change_index: dict[int, ThemeItem] = {}
+        for theme_id, theme_items in output.themes.items():
+            _ = theme_id
+            for it in theme_items:
+                by_change_index.setdefault(int(it.change_index), it)
+
+        assigned: dict[int, list[dict[str, Any]]] = defaultdict(list)
+        unassigned: list[dict[str, Any]] = []
+        for entry in outliers_nearest:
+            if not isinstance(entry, dict):
+                continue
+            assigned_theme_id = entry.get("assigned_theme_id")
+            if isinstance(assigned_theme_id, int):
+                assigned[int(assigned_theme_id)].append(entry)
+            else:
+                unassigned.append(entry)
+
+        lines.append("## Outliers: Nearest Themes (advisory)")
+        lines.append("")
+        lines.append(
+            f"- params: top_k={OUTLIERS_NEAREST_TOP_K} threshold={OUTLIERS_NEAREST_THRESHOLD:.2f}"
+        )
+        lines.append("")
+
+        def _brief_for_change_index(change_index: int) -> str:
+            it = by_change_index.get(int(change_index))
+            if it is None:
+                return f"change_index={int(change_index)}"
+
+            if report is not None:
+                h = _symbol_handle_for_theme_item(
+                    report=report, change_index=int(it.change_index), prefer_new=True
+                )
+                ct = _normalize_display_text(
+                    (h.chunk_type if h is not None else (it.chunk_type or "symbol"))
+                )
+                sym_raw = h.symbol if h is not None else (it.symbol or "(unknown)")
+                sym = _markdown_code_span(
+                    _truncate_display_text(_normalize_display_text(sym_raw))
+                )
+                loc, ord_part = _locator_display(h)
+                return (
+                    f"{it.op} {ct} {sym} @ {_markdown_code_span(loc)} {ord_part} "
+                    f"(change_index={int(it.change_index)})"
+                )
+
+            path = _normalize_display_text(it.path or "(unknown)")
+            ct = _normalize_display_text(it.chunk_type or "symbol")
+            sym = _markdown_code_span(
+                _truncate_display_text(_normalize_display_text(it.symbol or "(unknown)"))
+            )
+            return (
+                f"{it.op} {ct} {sym} (path={_markdown_code_span(path)}, "
+                f"change_index={int(it.change_index)})"
+            )
+
+        lines.append(f"### Assigned (similarity >= {OUTLIERS_NEAREST_THRESHOLD:.2f})")
+        lines.append("")
+        if not assigned:
+            lines.append("- (none)")
+        else:
+            for theme_id in sorted(assigned.keys()):
+                label = _theme_label(output=output, theme_id=int(theme_id))
+                lines.append(f"- Theme {int(theme_id)}: {label}")
+                for entry in assigned[int(theme_id)]:
+                    change_index = int(entry.get("change_index", -1))
+                    sim = entry.get("assigned_similarity")
+                    sim_part = (
+                        _format_similarity_2dp(float(sim))
+                        if isinstance(sim, (int, float))
+                        else "?"
+                    )
+                    lines.append(
+                        f"  - {_brief_for_change_index(change_index)} "
+                        f"(similarity={sim_part})"
+                    )
+        lines.append("")
+
+        lines.append(f"### Unassigned (similarity < {OUTLIERS_NEAREST_THRESHOLD:.2f})")
+        lines.append("")
+        if not unassigned:
+            lines.append("- (none)")
+        else:
+            for entry in unassigned:
+                change_index = int(entry.get("change_index", -1))
+                candidates = entry.get("candidates")
+                cand_str = ""
+                if isinstance(candidates, list) and candidates:
+                    parts: list[str] = []
+                    for c in candidates:
+                        if not isinstance(c, dict):
+                            continue
+                        tid = c.get("theme_id")
+                        label = c.get("label")
+                        sim = c.get("similarity")
+                        if not isinstance(tid, int) or not isinstance(label, str):
+                            continue
+                        sim_part = (
+                            _format_similarity_2dp(float(sim))
+                            if isinstance(sim, (int, float))
+                            else "?"
+                        )
+                        parts.append(f"Theme {int(tid)}: {label} ({sim_part})")
+                    if parts:
+                        cand_str = " nearest: " + "; ".join(parts)
+                lines.append(f"- {_brief_for_change_index(change_index)}{cand_str}")
+        lines.append("")
+
     if report is not None:
         file_changes: list[tuple[int, GapChangeItem]] = [
             (int(idx), ch)
@@ -723,6 +936,7 @@ def write_theme_artifacts(
     report: GapReport,
     output: ThemeOutput,
     isotope_pairs: dict[int, IsotopePairing] | None = None,
+    outliers_nearest: list[dict[str, Any]] | None = None,
 ) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -759,6 +973,8 @@ def write_theme_artifacts(
         "file_change_indexes": file_change_indexes,
         "themes": [],
     }
+    if outliers_nearest is not None and int(output.dims) > 0:
+        themes_payload["outliers_nearest"] = outliers_nearest
 
     ordered_themes = sorted(
         output.themes.items(),
@@ -820,7 +1036,10 @@ def write_theme_artifacts(
     )
     (out_dir / "themes.md").write_text(
         render_themes_markdown(
-            output=output, report=report, isotope_pairs=isotope_pairs
+            output=output,
+            report=report,
+            isotope_pairs=isotope_pairs,
+            outliers_nearest=outliers_nearest if int(output.dims) > 0 else None,
         ),
         encoding="utf-8",
     )
@@ -855,6 +1074,7 @@ __all__ = [
     "cluster_embeddings_hdbscan",
     "build_theme_output",
     "build_fallback_theme_output",
+    "compute_outliers_nearest",
     "render_themes_markdown",
     "write_theme_artifacts",
 ]

@@ -20,6 +20,7 @@ from chunkhound.gap.themes import (
     build_theme_documents,
     build_theme_output,
     cluster_embeddings_hdbscan,
+    compute_outliers_nearest,
     embed_in_batches,
     render_themes_markdown,
     write_theme_artifacts,
@@ -260,6 +261,7 @@ async def gap_command(args: argparse.Namespace, config: Config) -> None:
         move_suggestions_payload: dict[str, Any] | None = None
         isotope_pairs: dict[int, IsotopePairing] | None = None
         move_suggestions_llm_dry_run_calls: list[tuple[str, str]] | None = None
+        outliers_nearest: list[dict[str, Any]] | None = None
 
         docs, theme_items = build_theme_documents(
             report=report,
@@ -402,6 +404,12 @@ async def gap_command(args: argparse.Namespace, config: Config) -> None:
                         min_samples=1,
                         allow_single_cluster=True,
                     )
+                    outliers_nearest = compute_outliers_nearest(
+                        embeddings=embeddings,
+                        labels=labels,
+                        items=theme_items,
+                        output=theme_output,
+                    )
             except Exception as e:
                 if out_dir_path is not None:
                     _cleanup_theme_artifacts(out_dir_path)
@@ -451,6 +459,7 @@ async def gap_command(args: argparse.Namespace, config: Config) -> None:
                 report=report,
                 output=theme_output,
                 isotope_pairs=isotope_pairs,
+                outliers_nearest=outliers_nearest,
             )
             if (
                 move_suggestions_llm_dry_run

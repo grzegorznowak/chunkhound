@@ -4,8 +4,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
+from pathlib import Path
 
 import pytest
+
+import chunkhound.gap.themes as gap_themes
 
 from chunkhound.gap.models import (
     GapChangeItem,
@@ -553,3 +557,260 @@ def test_render_themes_markdown_does_not_crash(items: list[ThemeItem]) -> None:
     out = build_fallback_theme_output(items=items, label="x")
     md = render_themes_markdown(output=out)
     assert md.endswith("\n")
+
+
+def test_compute_outliers_nearest_ranks_candidates_and_is_deterministic() -> None:
+    items = [
+        ThemeItem(
+            change_index=0,
+            entity_kind="symbol",
+            op="add",
+            reason="x",
+            confidence=1.0,
+            chunk_type="function",
+            path="theme0.py",
+            symbol="t0",
+        ),
+        ThemeItem(
+            change_index=1,
+            entity_kind="symbol",
+            op="add",
+            reason="x",
+            confidence=1.0,
+            chunk_type="function",
+            path="theme1.py",
+            symbol="t1",
+        ),
+        ThemeItem(
+            change_index=2,
+            entity_kind="symbol",
+            op="add",
+            reason="x",
+            confidence=1.0,
+            chunk_type="function",
+            path="a.py",
+            symbol="near_theme0",
+        ),
+        ThemeItem(
+            change_index=3,
+            entity_kind="symbol",
+            op="add",
+            reason="x",
+            confidence=1.0,
+            chunk_type="function",
+            path="b.py",
+            symbol="between_themes",
+        ),
+    ]
+    labels = [0, 1, -1, -1]
+    embeddings = [
+        [1.0, 0.0, 0.0],  # theme 0 centroid
+        [0.0, 1.0, 0.0],  # theme 1 centroid
+        [0.99, 0.1, 0.0],  # outlier near theme 0
+        [0.6, 0.6, 0.0],  # outlier between themes (tie at 2dp)
+    ]
+    output = gap_themes.ThemeOutput(
+        provider="stub",
+        model="stub-model",
+        dims=3,
+        min_cluster_size=3,
+        min_samples=1,
+        allow_single_cluster=True,
+        theme_labels={0: "alpha", 1: "beta"},
+        themes={
+            0: [items[0]],
+            1: [items[1]],
+            -1: [items[2], items[3]],
+        },
+    )
+
+    out1 = gap_themes.compute_outliers_nearest(
+        embeddings=embeddings,
+        labels=labels,
+        items=items,
+        output=output,
+    )
+    out2 = gap_themes.compute_outliers_nearest(
+        embeddings=embeddings,
+        labels=labels,
+        items=items,
+        output=output,
+    )
+    assert out1 == out2
+
+    assert [it["change_index"] for it in out1] == [2, 3]
+
+    near = out1[0]
+    assert near["assigned_theme_id"] == 0
+    assert near["assigned_similarity"] is not None
+    assert near["candidates"][0]["theme_id"] == 0
+    assert near["candidates"][0]["label"] == "alpha"
+    assert near["candidates"][1]["theme_id"] == 1
+    assert near["candidates"][1]["label"] == "beta"
+
+    between = out1[1]
+    assert between["assigned_theme_id"] is None
+    assert between["assigned_similarity"] is None
+    # Tie at 2dp (0.71 vs 0.71) should break by theme_id.
+    assert between["candidates"][0]["theme_id"] == 0
+    assert between["candidates"][1]["theme_id"] == 1
+
+
+def test_render_themes_markdown_appends_outliers_nearest_section_after_outliers_theme() -> (
+    None
+):
+    items = [
+        ThemeItem(0, "symbol", "add", "x", 1.0, "function", "a.py", "t0"),
+        ThemeItem(1, "symbol", "add", "x", 1.0, "function", "b.py", "t1"),
+        ThemeItem(2, "symbol", "add", "x", 1.0, "function", "c.py", "outlier"),
+    ]
+    output = gap_themes.ThemeOutput(
+        provider="stub",
+        model="stub-model",
+        dims=3,
+        min_cluster_size=3,
+        min_samples=1,
+        allow_single_cluster=True,
+        theme_labels={0: "alpha", 1: "beta"},
+        themes={0: [items[0]], 1: [items[1]], -1: [items[2]]},
+    )
+    outliers_nearest = [
+        {
+            "change_index": 2,
+            "assigned_theme_id": 0,
+            "assigned_similarity": 0.812345,
+            "candidates": [
+                {"theme_id": 0, "label": "alpha", "similarity": 0.812345},
+                {"theme_id": 1, "label": "beta", "similarity": 0.123456},
+            ],
+        }
+    ]
+    md = gap_themes.render_themes_markdown(
+        output=output, outliers_nearest=outliers_nearest
+    )
+    lines = md.splitlines()
+
+    idx_outliers_theme = next(i for i, l in enumerate(lines) if l.startswith("## Theme -1:"))
+    idx_section = next(
+        i for i, l in enumerate(lines) if l.startswith("## Outliers: Nearest Themes")
+    )
+    assert idx_outliers_theme < idx_section
+    assert "### Assigned" in md
+    assert "### Unassigned" in md
+
+
+def test_write_theme_artifacts_includes_outliers_nearest_when_provided(
+    tmp_path: Path,
+) -> None:
+    report = GapReport(
+        schema_version="gap.v1",
+        schema_revision="2026-01-09",
+        direction="A->B",
+        invariants=GapInvariants(
+            hash_alg="xxh3_64",
+            normalization=GapNormalizationInvariants(
+                id="normalize_content.v1", include_comments=False, include_docs=False
+            ),
+            chunker_version="cast@v1",
+            recovery_mode="off",
+            deterministic=True,
+            embed_model_id=None,
+            forced=False,
+        ),
+        inputs=GapInputs(
+            a=GapInputRef(source_kind="path", source_ref="a", source_hash="a"),
+            b=GapInputRef(source_kind="path", source_ref="b", source_hash="b"),
+        ),
+        scope=GapScope(
+            scope_mode="full",
+            scope_hash="x",
+            changed_files_count=1,
+            rename_hints_count=0,
+        ),
+        warnings=[],
+        stats=GapStats(counts=GapCounts(), timings=GapTimings()),
+        changes=[],
+    )
+    output = gap_themes.ThemeOutput(
+        provider="stub",
+        model="stub-model",
+        dims=3,
+        min_cluster_size=3,
+        min_samples=1,
+        allow_single_cluster=True,
+        theme_labels={},
+        themes={},
+    )
+    outliers_nearest = [
+        {
+            "change_index": 123,
+            "assigned_theme_id": 0,
+            "assigned_similarity": 0.812345,
+            "candidates": [
+                {"theme_id": 0, "label": "alpha", "similarity": 0.812345},
+            ],
+        }
+    ]
+    gap_themes.write_theme_artifacts(
+        out_dir=tmp_path,
+        report=report,
+        output=output,
+        isotope_pairs=None,
+        outliers_nearest=outliers_nearest,
+    )
+    payload = json.loads((tmp_path / "themes.json").read_text(encoding="utf-8"))
+    assert payload["outliers_nearest"] == outliers_nearest
+
+
+def test_outliers_nearest_is_omitted_when_embeddings_disabled(tmp_path: Path) -> None:
+    report = GapReport(
+        schema_version="gap.v1",
+        schema_revision="2026-01-09",
+        direction="A->B",
+        invariants=GapInvariants(
+            hash_alg="xxh3_64",
+            normalization=GapNormalizationInvariants(
+                id="normalize_content.v1", include_comments=False, include_docs=False
+            ),
+            chunker_version="cast@v1",
+            recovery_mode="off",
+            deterministic=True,
+            embed_model_id=None,
+            forced=False,
+        ),
+        inputs=GapInputs(
+            a=GapInputRef(source_kind="path", source_ref="a", source_hash="a"),
+            b=GapInputRef(source_kind="path", source_ref="b", source_hash="b"),
+        ),
+        scope=GapScope(
+            scope_mode="full",
+            scope_hash="x",
+            changed_files_count=1,
+            rename_hints_count=0,
+        ),
+        warnings=[],
+        stats=GapStats(counts=GapCounts(), timings=GapTimings()),
+        changes=[],
+    )
+    output = build_fallback_theme_output(items=[], label="no_symbol_changes")
+    outliers_nearest = [
+        {
+            "change_index": 123,
+            "assigned_theme_id": 0,
+            "assigned_similarity": 0.812345,
+            "candidates": [
+                {"theme_id": 0, "label": "alpha", "similarity": 0.812345},
+            ],
+        }
+    ]
+    gap_themes.write_theme_artifacts(
+        out_dir=tmp_path,
+        report=report,
+        output=output,
+        isotope_pairs=None,
+        outliers_nearest=outliers_nearest,
+    )
+    payload = json.loads((tmp_path / "themes.json").read_text(encoding="utf-8"))
+    assert "outliers_nearest" not in payload
+    md = (tmp_path / "themes.md").read_text(encoding="utf-8")
+    assert "## Outliers: Nearest Themes (advisory)" not in md
