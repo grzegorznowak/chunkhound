@@ -6,7 +6,13 @@ from typing import Any
 from loguru import logger
 
 from chunkhound.core.config.llm_config import DEFAULT_LLM_TIMEOUT
-from chunkhound.interfaces.llm_provider import LLMResponse
+from chunkhound.core.utils.openai_utils import is_official_openai_endpoint
+from chunkhound.interfaces.llm_provider import (
+    LLMResponse,
+    OutputLimitCapability,
+    OutputLimitIntent,
+    OutputLimitMetadata,
+)
 from chunkhound.providers.llm.openai_compatible_provider import OpenAICompatibleProvider
 from chunkhound.utils.json_extraction import build_schema_system_instruction
 
@@ -85,6 +91,11 @@ class OpenAILLMProvider(OpenAICompatibleProvider):
             supports_structured_outputs: Override class-level structured
                 output support flag
         """
+        # Preserve the constructor routing fact: SDK client mocks and environment
+        # defaults are not authoritative evidence about the selected endpoint.
+        self._uses_custom_endpoint = base_url is not None and not (
+            is_official_openai_endpoint(base_url)
+        )
         super().__init__(
             api_key=api_key,
             model=model,
@@ -95,6 +106,16 @@ class OpenAILLMProvider(OpenAICompatibleProvider):
             supports_structured_outputs=supports_structured_outputs,
             reasoning_effort=reasoning_effort,
         )
+
+    @property
+    def output_limit_metadata(self) -> OutputLimitMetadata:
+        """Official OpenAI supports omission; custom endpoints remain unknown."""
+        capability = (
+            OutputLimitCapability.UNKNOWN
+            if self._uses_custom_endpoint
+            else OutputLimitCapability.SUPPORTED
+        )
+        return OutputLimitMetadata(omission=capability)
 
     def _get_default_base_url(self) -> str | None:
         """Get the default OpenAI API base URL.
@@ -136,7 +157,7 @@ class OpenAILLMProvider(OpenAICompatibleProvider):
         self,
         prompt: str,
         system: str | None = None,
-        max_completion_tokens: int = 4096,
+        max_completion_tokens: int | OutputLimitIntent = 4096,
         timeout: int | None = None,
     ) -> LLMResponse:
         """Generate a completion using the Responses API for reasoning models.
@@ -150,15 +171,19 @@ class OpenAILLMProvider(OpenAICompatibleProvider):
         Returns:
             LLMResponse with content and metadata
         """
+        resolved_max_tokens = self.resolve_synthesis_output_limit(
+            max_completion_tokens
+        ).max_tokens
         request_timeout = timeout if timeout is not None else self._timeout
 
         # Build request parameters for Responses API
         request_params: dict[str, Any] = {
             "model": self._model,
             "input": prompt,  # Responses API uses 'input' instead of 'messages'
-            "max_output_tokens": max_completion_tokens,  # Different parameter name
             "timeout": request_timeout,
         }
+        if resolved_max_tokens is not None:
+            request_params["max_output_tokens"] = resolved_max_tokens
 
         # Add system instructions if provided
         if system:
@@ -199,23 +224,30 @@ class OpenAILLMProvider(OpenAICompatibleProvider):
                 response.status
             )  # Responses API uses 'status' instead of 'finish_reason'
 
-            # Check for incomplete responses FIRST (fix C2) so token-limit
+            # Check for incomplete responses FIRST (fix C2) so provider
             # diagnostics are not masked by a generic empty-content error.
             if finish_reason == "incomplete":
-                usage_info = ""
-                if response.usage:
-                    usage_info = (
-                        f" (input={response.usage.input_tokens:,}, "
-                        f"output={response.usage.output_tokens:,})"
+                incomplete_details = getattr(response, "incomplete_details", None)
+                incomplete_reason = getattr(incomplete_details, "reason", None)
+                if incomplete_reason == "max_output_tokens":
+                    usage_info = ""
+                    if response.usage:
+                        usage_info = (
+                            f" (input={response.usage.input_tokens:,}, "
+                            f"output={response.usage.output_tokens:,})"
+                        )
+
+                    raise RuntimeError(
+                        "LLM response incomplete - token limit exceeded"
+                        f"{usage_info}. For reasoning models, this indicates the "
+                        "query requires extensive reasoning that exhausted the output "
+                        "budget. Try breaking your query into smaller, more focused "
+                        "questions."
                     )
 
                 raise RuntimeError(
-                    f"LLM response incomplete - token limit exceeded{usage_info}. "
-                    "For reasoning models, this indicates the query requires "
-                    "extensive reasoning "
-                    "that exhausted the output budget. Try breaking your query into "
-                    "smaller, "
-                    "more focused questions."
+                    "LLM response incomplete "
+                    f"(reason={incomplete_reason or 'unknown'})"
                 )
 
             # Validate content is not None or empty (reached only if not incomplete)
@@ -263,7 +295,7 @@ class OpenAILLMProvider(OpenAICompatibleProvider):
         self,
         prompt: str,
         system: str | None = None,
-        max_completion_tokens: int = 4096,
+        max_completion_tokens: int | OutputLimitIntent = 4096,
         timeout: int | None = None,
     ) -> LLMResponse:
         """Generate a completion for the given prompt.
@@ -293,7 +325,7 @@ class OpenAILLMProvider(OpenAICompatibleProvider):
         prompt: str,
         json_schema: dict[str, Any],
         system: str | None = None,
-        max_completion_tokens: int = 4096,
+        max_completion_tokens: int | OutputLimitIntent = 4096,
         timeout: int | None = None,
     ) -> dict[str, Any]:
         """Generate structured JSON using Responses API.
@@ -312,15 +344,19 @@ class OpenAILLMProvider(OpenAICompatibleProvider):
         Returns:
             Parsed JSON object conforming to schema
         """
+        resolved_max_tokens = self.resolve_synthesis_output_limit(
+            max_completion_tokens
+        ).max_tokens
         request_timeout = timeout if timeout is not None else self._timeout
 
         # Build request parameters for Responses API structured output
         request_params: dict[str, Any] = {
             "model": self._model,
             "input": prompt,
-            "max_output_tokens": max_completion_tokens,
             "timeout": request_timeout,
         }
+        if resolved_max_tokens is not None:
+            request_params["max_output_tokens"] = resolved_max_tokens
 
         if self._supports_structured_outputs:
             # Responses API uses text.format for native structured outputs.
@@ -372,17 +408,25 @@ class OpenAILLMProvider(OpenAICompatibleProvider):
             finish_reason = response.status
 
             # Check for incomplete responses before empty-content validation so
-            # token-limit diagnostics are not masked by a generic empty error.
+            # provider diagnostics are not masked by a generic empty error.
             if finish_reason == "incomplete":
-                usage_info = ""
-                if response.usage:
-                    usage_info = (
-                        f" (input={response.usage.input_tokens:,}, "
-                        f"output={response.usage.output_tokens:,})"
+                incomplete_details = getattr(response, "incomplete_details", None)
+                incomplete_reason = getattr(incomplete_details, "reason", None)
+                if incomplete_reason == "max_output_tokens":
+                    usage_info = ""
+                    if response.usage:
+                        usage_info = (
+                            f" (input={response.usage.input_tokens:,}, "
+                            f"output={response.usage.output_tokens:,})"
+                        )
+                    raise RuntimeError(
+                        "LLM structured completion incomplete - token limit "
+                        f"exceeded{usage_info}"
                     )
+
                 raise RuntimeError(
-                    f"LLM structured completion incomplete - token limit "
-                    f"exceeded{usage_info}"
+                    "LLM structured completion incomplete "
+                    f"(reason={incomplete_reason or 'unknown'})"
                 )
 
             # Validate content
@@ -416,7 +460,7 @@ class OpenAILLMProvider(OpenAICompatibleProvider):
         prompt: str,
         json_schema: dict[str, Any],
         system: str | None = None,
-        max_completion_tokens: int = 4096,
+        max_completion_tokens: int | OutputLimitIntent = 4096,
         timeout: int | None = None,
     ) -> dict[str, Any]:
         """Generate a structured JSON completion conforming to the given schema.

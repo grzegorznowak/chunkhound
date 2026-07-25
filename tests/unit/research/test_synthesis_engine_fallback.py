@@ -3,6 +3,7 @@
 import pytest
 
 from chunkhound.interfaces.embedding_provider import RerankResult
+from chunkhound.interfaces.llm_provider import PROVIDER_MANAGED_OUTPUT
 from chunkhound.llm_manager import LLMManager
 from chunkhound.services.clustering_service import ClusterGroup
 from chunkhound.services.research import SynthesisEngine
@@ -155,5 +156,5 @@ async def test_map_synthesis_uses_output_budget_for_cluster_allocation(
 
     assert len(fake_provider.calls) == 1
     call = fake_provider.calls[0]
-    assert call["max_completion_tokens"] == 6000
+    assert call["max_completion_tokens"] is PROVIDER_MANAGED_OUTPUT
     assert "Target output: ~6,000 tokens" in call["system"]

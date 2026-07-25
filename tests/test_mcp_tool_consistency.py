@@ -6,6 +6,7 @@ preventing issues where tools have incorrect or missing descriptions.
 
 import inspect
 import json
+from pathlib import Path
 
 import pytest
 
@@ -1459,6 +1460,331 @@ async def test_daemon_tool_call_marks_generic_tool_failure_as_error() -> None:
     assert response["result"]["isError"] is True
     payload = _tool_error_payload(response["result"]["content"][0]["text"])
     assert payload == {"type": "RuntimeError", "message": "boom"}
+
+
+@pytest.mark.asyncio
+async def test_synthesis_truncation_propagates_through_common_and_daemon(
+    tmp_path: Path,
+) -> None:
+    """Real truncation is an exact tool error on every realizable public route."""
+    import asyncio
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    import httpx
+    from mcp import ClientSession
+    from mcp.client.streamable_http import streamablehttp_client
+    from mcp.types import CallToolRequest
+
+    from chunkhound.daemon import ipc
+    from chunkhound.daemon.client_proxy import ClientProxy
+    from chunkhound.daemon.server import ChunkHoundDaemon
+    from chunkhound.llm_manager import LLMManager
+    from chunkhound.mcp_server.common import handle_tool_call
+    from chunkhound.mcp_server.http_server import HttpMCPServer
+    from chunkhound.mcp_server.stdio import StdioMCPServer
+    from chunkhound.mcp_server.tools import register_tool
+    from chunkhound.providers.llm.openai_compatible_provider import (
+        OpenAICompatibleProvider,
+    )
+    from chunkhound.services.research import SynthesisEngine
+    from chunkhound.services.research.shared.citation_manager import CitationManager
+    from tests.fixtures.openai_compatible_server import (
+        ChatCompletionScript,
+        OpenAICompatibleTestServer,
+    )
+
+    truncation_marker = "mcp-synthesis-truncation-marker"
+    harmless_marker = "mcp-synthesis-harmless-marker"
+    harmless_answer = (
+        "Harmless synthesis completed successfully using the supplied source context. "
+        "This response is deliberately long enough to satisfy production synthesis "
+        "validation."
+    )
+    expected_error = {
+        "type": "RuntimeError",
+        "message": (
+            "LLM response truncated - token limit exceeded "
+            "(prompt=31, completion=47). For reasoning models, this indicates the "
+            "query requires extensive reasoning that exhausted the output budget. "
+            "Try breaking your query into smaller, more focused questions."
+        ),
+    }
+    scripts = [
+        ChatCompletionScript(
+            name="synthesis-truncation",
+            marker=truncation_marker,
+            content="partial synthesis",
+            finish_reason="length",
+            prompt_tokens=31,
+            completion_tokens=47,
+            expected_calls=4,
+        ),
+        ChatCompletionScript(
+            name="harmless-synthesis",
+            marker=harmless_marker,
+            content=harmless_answer,
+        ),
+    ]
+    scan_progress = {
+        "files_processed": 1,
+        "chunks_created": 1,
+        "is_scanning": False,
+        "scan_started_at": "2026-04-01T00:00:00Z",
+        "query_ready_at": "2026-04-01T00:00:01Z",
+        "realtime": {"service_state": "running", "last_error": None},
+    }
+
+    original_tool = TOOL_REGISTRY["code_research"]
+    with OpenAICompatibleTestServer(scripts) as fake_server:
+        fake_server.assert_loopback_url(fake_server.base_url)
+        provider_config = {
+            "provider": "grok",
+            "api_key": "sk-local-fixture-not-a-real-credential",
+            "model": "loopback-test-model",
+            "base_url": fake_server.base_url,
+            "max_retries": 0,
+        }
+        llm_manager = LLMManager(provider_config, provider_config)
+        synthesis_provider = llm_manager.get_synthesis_provider()
+        assert isinstance(synthesis_provider, OpenAICompatibleProvider)
+
+        chunks = [
+            {
+                "file_path": "src/truncation_fixture.py",
+                "content": "def fixture_source():\n    return 'real synthesis input'\n",
+                "start_line": 1,
+                "end_line": 2,
+            }
+        ]
+        files = {"src/truncation_fixture.py": chunks[0]["content"]}
+        parent = SimpleNamespace(_citation_manager=CitationManager())
+
+        @register_tool(
+            name="code_research",
+            description="Test-only code research implementation using real synthesis.",
+            requires_llm=True,
+        )
+        async def test_code_research(
+            query: str, llm_manager: LLMManager
+        ) -> dict[str, str]:
+            engine = SynthesisEngine(
+                llm_manager,
+                database_services=object(),
+                parent_service=parent,
+            )
+            answer = await engine._single_pass_synthesis(
+                root_query=query,
+                chunks=chunks,
+                files=files,
+                context=None,
+                synthesis_budgets={"output_tokens": 30_000},
+            )
+            return {"answer": answer}
+
+        try:
+            # Raw shared boundary used by every in-process transport.
+            initialization_complete = asyncio.Event()
+            initialization_complete.set()
+            common_contents = await handle_tool_call(
+                tool_name="code_research",
+                arguments={"query": truncation_marker},
+                services=None,
+                embedding_manager=None,
+                initialization_complete=initialization_complete,
+                llm_manager=llm_manager,
+            )
+            assert tool_call_failed(common_contents) is True
+            assert _tool_error_payload(common_contents[0].text) == expected_error
+
+            # Direct stdio server through the official SDK request handler.
+            stdio_server = StdioMCPServer(config=MagicMock())
+            stdio_server.llm_manager = llm_manager
+            stdio_server._scan_progress = dict(scan_progress)
+            stdio_server._initialization_complete.set()
+            stdio_handler = stdio_server.server.request_handlers[CallToolRequest]
+
+            stdio_status_before = await stdio_handler(
+                CallToolRequest(
+                    method="tools/call",
+                    params={"name": "daemon_status", "arguments": {}},
+                    id="stdio-status-before",
+                )
+            )
+            stdio_truncated = await stdio_handler(
+                CallToolRequest(
+                    method="tools/call",
+                    params={
+                        "name": "code_research",
+                        "arguments": {"query": truncation_marker},
+                    },
+                    id="stdio-truncated",
+                )
+            )
+            stdio_status_after = await stdio_handler(
+                CallToolRequest(
+                    method="tools/call",
+                    params={"name": "daemon_status", "arguments": {}},
+                    id="stdio-status-after",
+                )
+            )
+            assert stdio_truncated.root.isError is True
+            assert (
+                _tool_error_payload(stdio_truncated.root.content[0].text)
+                == expected_error
+            )
+            assert stdio_status_before.root.isError is False
+            assert stdio_status_after.root.isError is False
+            assert (
+                stdio_status_before.root.content[0].text
+                == stdio_status_after.root.content[0].text
+            )
+
+            # Direct HTTP server via in-process ASGI and the SDK's SSE client.
+            http_config = MagicMock()
+            http_config.mcp.host = "127.0.0.1"
+            http_config.mcp.port = 0
+            http_config.mcp.auth_token = None
+            http_config.mcp.cors = False
+            http_server = HttpMCPServer(config=http_config)
+            http_server.llm_manager = llm_manager
+            http_server._scan_progress = dict(scan_progress)
+            http_server._initialization_complete.set()
+            http_app = http_server._build_app()
+            transport = httpx.ASGITransport(app=http_app)
+            async with http_server._session_manager.run():
+                async with httpx.AsyncClient(
+                    transport=transport, base_url="http://chunkhound.test"
+                ) as http_client:
+                    health_before = (
+                        await http_client.get("/health")
+                    ).json()
+                    async with streamablehttp_client(
+                        "http://chunkhound.test/mcp",
+                        httpx_client_factory=lambda **kwargs: httpx.AsyncClient(
+                            transport=transport,
+                            base_url="http://chunkhound.test",
+                            **kwargs,
+                        ),
+                    ) as (read_stream, write_stream, _):
+                        async with ClientSession(
+                            read_stream, write_stream
+                        ) as http_session:
+                            await http_session.initialize()
+                            http_truncated = await http_session.call_tool(
+                                "code_research", {"query": truncation_marker}
+                            )
+                    health_after = (await http_client.get("/health")).json()
+
+            assert http_truncated.isError is True
+            assert _tool_error_payload(http_truncated.content[0].text) == expected_error
+            assert health_before == health_after
+            assert health_after["status"] == "ready"
+
+            # Daemon stdio proxy → framed IPC → server client loop. There is no
+            # daemon-over-HTTP route. Keep one proxy connection open for the
+            # failure, status comparison, and harmless follow-up.
+            daemon_client_entered = asyncio.Event()
+            daemon = ChunkHoundDaemon(
+                config=MagicMock(),
+                args=MagicMock(),
+                socket_path=str(tmp_path / "daemon-proof.sock"),
+                project_dir=tmp_path,
+            )
+            daemon.llm_manager = llm_manager
+            daemon._scan_progress = dict(scan_progress)
+            daemon._initialization_complete.set()
+            daemon._auth_token = "test-daemon-auth-token"
+
+            async def handle_daemon_client(
+                reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+            ) -> None:
+                daemon_client_entered.set()
+                await daemon._handle_client(reader, writer)
+
+            server, address = await ipc.create_server(
+                daemon._socket_path, handle_daemon_client
+            )
+            proxy = ClientProxy(tmp_path, MagicMock())
+            proxy._discovery.read_lock = MagicMock(
+                return_value={"auth_token": daemon._auth_token}
+            )
+
+            async with server:
+                reader, writer = await proxy._connect_or_startup_failure(address)
+                try:
+                    await proxy._register_with_daemon(reader, writer)
+
+                    async def daemon_stdio_call(
+                        request_id: str, name: str, arguments: dict[str, str]
+                    ) -> dict:
+                        request = {
+                            "jsonrpc": "2.0",
+                            "id": request_id,
+                            "method": "tools/call",
+                            "params": {"name": name, "arguments": arguments},
+                        }
+                        await proxy._write_stdin_line(
+                            writer, (json.dumps(request) + "\n").encode()
+                        )
+                        response = await asyncio.wait_for(
+                            ipc.read_frame(reader), timeout=5.0
+                        )
+                        assert response["id"] == request_id
+                        assert "error" not in response
+                        return response["result"]
+
+                    daemon_status_before = await daemon_stdio_call(
+                        "daemon-status-before", "daemon_status", {}
+                    )
+                    daemon_truncated = await daemon_stdio_call(
+                        "daemon-truncated",
+                        "code_research",
+                        {"query": truncation_marker},
+                    )
+                    daemon_status_after = await daemon_stdio_call(
+                        "daemon-status-after", "daemon_status", {}
+                    )
+
+                    assert daemon_client_entered.is_set()
+                    assert daemon._client_manager.count() == 1
+                    assert daemon_truncated["isError"] is True
+                    assert (
+                        _tool_error_payload(daemon_truncated["content"][0]["text"])
+                        == expected_error
+                    )
+                    assert daemon_status_before["isError"] is False
+                    assert daemon_status_after == daemon_status_before
+
+                    harmless_response = await daemon_stdio_call(
+                        "daemon-harmless",
+                        "code_research",
+                        {"query": harmless_marker},
+                    )
+                    assert daemon._client_manager.count() == 1
+                    assert harmless_response["isError"] is False
+                    harmless_text = harmless_response["content"][0]["text"]
+                    assert harmless_answer in harmless_text
+                    assert "## Sources" in harmless_text
+                    assert "truncation_fixture.py" in harmless_text
+                finally:
+                    writer.close()
+                    await writer.wait_closed()
+
+            assert daemon_client_entered.is_set()
+            assert {
+                request["max_completion_tokens"] for request in fake_server.requests
+            } == {64_000}
+            fake_server.assert_all_scripts_consumed()
+        finally:
+            TOOL_REGISTRY["code_research"] = original_tool
+            providers = {
+                llm_manager.get_utility_provider(),
+                llm_manager.get_synthesis_provider(),
+            }
+            for provider in providers:
+                assert isinstance(provider, OpenAICompatibleProvider)
+                await provider._client.close()  # noqa: SLF001 - test-owned client
 
 
 @pytest.mark.asyncio

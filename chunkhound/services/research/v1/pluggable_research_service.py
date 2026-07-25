@@ -13,7 +13,7 @@ The service coordinates:
 
 import asyncio
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from loguru import logger
 
@@ -335,31 +335,15 @@ class PluggableResearchService(ProgressEmitterMixin):
                 f"(concurrency={max_concurrency})",
             )
 
-            semaphore = asyncio.Semaphore(max_concurrency)
-
-            # Calculate total input tokens across all clusters for proportional budget allocation
-            total_input_tokens = sum(cluster.total_tokens for cluster in cluster_groups)
-
-            async def map_with_semaphore(cluster: ClusterGroup) -> dict[str, Any]:
-                async with semaphore:
-                    # Get cluster-specific facts context
-                    cluster_files = set(cluster.file_paths)
-                    cluster_facts_context = evidence_ledger.get_facts_map_prompt_context(
-                        cluster_files,
-                        cluster_id=cluster.cluster_id,
-                    )
-                    return await self._synthesis_engine._map_synthesis_on_cluster(
-                        cluster,
-                        query,
-                        prioritized_chunks,
-                        synthesis_budgets,
-                        total_input_tokens,
-                        constants_context=constants_context,
-                        facts_context=cluster_facts_context,
-                    )
-
-            map_tasks = [map_with_semaphore(cluster) for cluster in cluster_groups]
-            cluster_results = await asyncio.gather(*map_tasks)
+            cluster_results = await self._run_synthesis_maps(
+                cluster_groups=cluster_groups,
+                query=query,
+                prioritized_chunks=prioritized_chunks,
+                synthesis_budgets=synthesis_budgets,
+                constants_context=constants_context,
+                evidence_ledger=evidence_ledger,
+                max_concurrency=max_concurrency,
+            )
 
             logger.info(
                 f"Map step complete: {len(cluster_results)} cluster summaries generated"
@@ -423,6 +407,116 @@ class PluggableResearchService(ProgressEmitterMixin):
             "answer": answer,
             "metadata": metadata,
         }
+
+    async def _run_synthesis_maps(
+        self,
+        *,
+        cluster_groups: list[ClusterGroup],
+        query: str,
+        prioritized_chunks: list[dict[str, Any]],
+        synthesis_budgets: dict[str, int],
+        constants_context: str,
+        evidence_ledger: EvidenceLedger,
+        max_concurrency: int,
+    ) -> list[dict[str, Any]]:
+        """Run bounded map synthesis and settle every child before returning."""
+        semaphore = asyncio.Semaphore(max_concurrency)
+        abort = asyncio.Event()
+        trigger: Exception | asyncio.CancelledError | None = None
+        total_input_tokens = sum(cluster.total_tokens for cluster in cluster_groups)
+
+        class MapAbortedError(Exception):
+            """Stop a queued map after a sibling has failed."""
+
+        async def run_map(cluster: ClusterGroup) -> dict[str, Any]:
+            nonlocal trigger
+
+            if abort.is_set():
+                raise MapAbortedError()
+
+            await semaphore.acquire()
+            try:
+                # A failure can release the semaphore while this task is queued.
+                if abort.is_set():
+                    raise MapAbortedError()
+
+                cluster_files = set(cluster.file_paths)
+                cluster_facts_context = evidence_ledger.get_facts_map_prompt_context(
+                    cluster_files,
+                    cluster_id=cluster.cluster_id,
+                )
+                try:
+                    return await self._synthesis_engine._map_synthesis_on_cluster(
+                        cluster,
+                        query,
+                        prioritized_chunks,
+                        synthesis_budgets,
+                        total_input_tokens,
+                        constants_context=constants_context,
+                        facts_context=cluster_facts_context,
+                    )
+                except asyncio.CancelledError as error:
+                    if trigger is None:
+                        trigger = error
+                    abort.set()
+                    raise
+                except Exception as error:
+                    if trigger is None:
+                        trigger = error
+                    abort.set()
+                    raise
+            finally:
+                semaphore.release()
+
+        tasks = [
+            asyncio.create_task(run_map(cluster), name=f"synthesis-map-{index}")
+            for index, cluster in enumerate(cluster_groups)
+        ]
+
+        async def cancel_and_settle() -> None:
+            abort.set()
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+        try:
+            pending = set(tasks)
+            while pending:
+                _, pending = await asyncio.wait(
+                    pending,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if abort.is_set():
+                    if trigger is not None:
+                        raise trigger
+                    raise RuntimeError("Map synthesis aborted without a trigger")
+
+            return [task.result() for task in tasks]
+        except asyncio.CancelledError:
+            caller = asyncio.current_task()
+            caller_cancelled = caller is not None and cast(Any, caller).cancelling() > 0
+            try:
+                await cancel_and_settle()
+            except asyncio.CancelledError:
+                # A caller cancellation during cleanup still wins. Settle children
+                # before allowing it to propagate to the caller.
+                await cancel_and_settle()
+                raise
+            if caller_cancelled:
+                raise
+            if trigger is not None:
+                raise trigger from None
+            raise
+        except Exception:
+            try:
+                await cancel_and_settle()
+            except asyncio.CancelledError:
+                await cancel_and_settle()
+                raise
+            if trigger is not None:
+                raise trigger from None
+            raise
 
     def _build_search_query(self, query: str, context: ResearchContext) -> str:
         """Build search query combining input with BFS context.

@@ -269,8 +269,16 @@ class LLMManager:
         )
 
     def _initialize_synthesis_provider(self) -> None:
-        """Initialize the synthesis LLM provider."""
+        """Initialize the synthesis LLM provider and attach its output policy."""
         self._synthesis_provider = self._create_provider(self._synthesis_config)
+        self._synthesis_provider.configure_synthesis_output_limit_policy(
+            output_limits_enabled=self._synthesis_config.get(
+                "output_limits_enabled", False
+            ),
+            fallback_tokens=self._synthesis_config.get(
+                "output_limit_fallback", 64_000
+            ),
+        )
         logger.info(
             f"Initialized synthesis LLM provider: "
             f"{self._synthesis_config.get('provider')} "

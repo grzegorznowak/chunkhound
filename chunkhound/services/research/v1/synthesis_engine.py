@@ -21,6 +21,11 @@ from typing import Any
 from loguru import logger
 
 from chunkhound.database_factory import DatabaseServices
+from chunkhound.interfaces.llm_provider import (
+    PROVIDER_MANAGED_OUTPUT,
+    LLMProvider,
+    OutputLimitIntent,
+)
 from chunkhound.llm_manager import LLMManager
 from chunkhound.services import prompts
 from chunkhound.services.clustering_service import ClusterGroup
@@ -36,6 +41,22 @@ from chunkhound.services.research.shared.models import (
 
 # Minimum characters for a valid synthesis answer (not tokens)
 MIN_SYNTHESIS_LENGTH = 100
+
+
+def _synthesis_output_allowance(
+    llm: LLMProvider, legacy_allowance: int
+) -> int | OutputLimitIntent:
+    """Select legacy numeric or provider-managed output-limit intent."""
+    if llm.synthesis_output_limit_policy.output_limits_enabled:
+        return legacy_allowance
+    return PROVIDER_MANAGED_OUTPUT
+
+
+def _format_output_allowance(allowance: int | OutputLimitIntent) -> str:
+    """Format request allowance without applying numeric formatting to intents."""
+    if isinstance(allowance, int):
+        return f"{allowance:,}"
+    return allowance.value
 
 
 class SynthesisEngine:
@@ -258,16 +279,20 @@ class SynthesisEngine:
             source_context=source_context,
         )
 
+        request_output_allowance = _synthesis_output_allowance(
+            llm, max_output_tokens
+        )
         logger.info(
             f"Calling LLM for single-pass synthesis "
-            f"(max_completion_tokens={max_output_tokens:,}, "
+            f"(max_completion_tokens="
+            f"{_format_output_allowance(request_output_allowance)}, "
             f"timeout={SINGLE_PASS_TIMEOUT_SECONDS}s)"
         )
 
         response = await llm.complete(
             prompt,
             system=system,
-            max_completion_tokens=max_output_tokens,
+            max_completion_tokens=request_output_allowance,
             timeout=SINGLE_PASS_TIMEOUT_SECONDS,
         )
 
@@ -440,16 +465,20 @@ Analyze the following sources and provide insights relevant to the query above:
 
 Provide a comprehensive analysis focusing on the query."""
 
+        request_output_allowance = _synthesis_output_allowance(
+            llm, cluster_output_tokens
+        )
         logger.debug(
             f"Calling LLM for cluster {cluster.cluster_id} synthesis "
-            f"(max_completion_tokens={cluster_output_tokens:,}, "
+            f"(max_completion_tokens="
+            f"{_format_output_allowance(request_output_allowance)}, "
             f"timeout={SINGLE_PASS_TIMEOUT_SECONDS}s)"
         )
 
         response = await llm.complete(
             prompt,
             system=system,
-            max_completion_tokens=cluster_output_tokens,
+            max_completion_tokens=request_output_allowance,
             timeout=SINGLE_PASS_TIMEOUT_SECONDS,
         )
 
@@ -613,15 +642,19 @@ NOTE: All citation numbers [N] in the cluster analyses have been remapped to mat
 
 Provide a complete, integrated analysis that addresses the original query."""
 
+        request_output_allowance = _synthesis_output_allowance(
+            llm, max_output_tokens
+        )
         logger.debug(
             f"Calling LLM for reduce synthesis "
-            f"(input: {total_input_tokens:,} tokens, max_completion_tokens={max_output_tokens:,})"
+            f"(input: {total_input_tokens:,} tokens, max_completion_tokens="
+            f"{_format_output_allowance(request_output_allowance)})"
         )
 
         response = await llm.complete(
             prompt,
             system=system,
-            max_completion_tokens=max_output_tokens,
+            max_completion_tokens=request_output_allowance,
             timeout=SINGLE_PASS_TIMEOUT_SECONDS,
         )
 

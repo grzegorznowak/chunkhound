@@ -18,7 +18,13 @@ from loguru import logger
 from chunkhound.core.config.llm_config import DEFAULT_LLM_TIMEOUT
 from chunkhound.core.utils.openai_utils import is_official_openai_endpoint
 from chunkhound.core.utils.token_utils import estimate_tokens_llm
-from chunkhound.interfaces.llm_provider import LLMProvider, LLMResponse
+from chunkhound.interfaces.llm_provider import (
+    LLMProvider,
+    LLMResponse,
+    OutputLimitCapability,
+    OutputLimitIntent,
+    OutputLimitMetadata,
+)
 from chunkhound.utils.json_extraction import (
     build_schema_system_instruction,
     parse_and_validate_structured_json,
@@ -72,8 +78,8 @@ class OpenAICompatibleProvider(LLMProvider):
             base_url: Base URL (defaults to subclass implementation)
             ssl_verify: Verify TLS certificates for HTTP requests. When False, disables
                 TLS verification for the resolved base URL. Ignored when no base URL is
-                set (explicit or provider-resolved). Only disable for self-signed / local
-                endpoints.
+                set (explicit or provider-resolved). Only disable for self-signed /
+                local endpoints.
             timeout: Request timeout in seconds
             max_retries: Number of retry attempts for failed requests
             supports_structured_outputs: Override class-level flag.
@@ -106,7 +112,9 @@ class OpenAICompatibleProvider(LLMProvider):
         self._synthesis_concurrency = synthesis_concurrency
 
         # Use provided base_url, or default_base_url, or subclass override
-        effective_base_url = base_url or default_base_url or self._get_default_base_url()
+        effective_base_url = (
+            base_url or default_base_url or self._get_default_base_url()
+        )
 
         # Initialize OpenAI-compatible client
         api_key_value = api_key
@@ -133,6 +141,11 @@ class OpenAICompatibleProvider(LLMProvider):
         self._tokens_used = 0
         self._prompt_tokens = 0
         self._completion_tokens = 0
+
+    @property
+    def output_limit_metadata(self) -> OutputLimitMetadata:
+        """Treat generic OpenAI-compatible omission support as unknown."""
+        return OutputLimitMetadata(omission=OutputLimitCapability.UNKNOWN)
 
     @property
     def base_url(self) -> str | None:
@@ -169,7 +182,7 @@ class OpenAICompatibleProvider(LLMProvider):
     def _build_chat_completion_kwargs(
         self,
         messages: list[dict[str, str]],
-        max_completion_tokens: int,
+        max_completion_tokens: int | None,
         timeout: int,
         *,
         response_format: dict[str, Any] | None = None,
@@ -179,9 +192,10 @@ class OpenAICompatibleProvider(LLMProvider):
         kwargs: dict[str, Any] = {
             "model": self._model,
             "messages": messages,
-            max_tokens_param: max_completion_tokens,
             "timeout": timeout,
         }
+        if max_completion_tokens is not None:
+            kwargs[max_tokens_param] = max_completion_tokens
         if response_format is not None:
             kwargs["response_format"] = response_format
         if self._reasoning_effort:
@@ -209,7 +223,7 @@ class OpenAICompatibleProvider(LLMProvider):
         self,
         prompt: str,
         system: str | None = None,
-        max_completion_tokens: int = 4096,
+        max_completion_tokens: int | OutputLimitIntent = 4096,
         timeout: int | None = None,
     ) -> LLMResponse:
         """Generate a completion for the given prompt.
@@ -226,6 +240,11 @@ class OpenAICompatibleProvider(LLMProvider):
             messages.append({"role": "system", "content": system})
         messages.append({"role": "user", "content": prompt})
 
+        # Resolve provider-managed intent before constructing SDK wire kwargs.
+        resolved_max_tokens = self.resolve_synthesis_output_limit(
+            max_completion_tokens
+        ).max_tokens
+
         # Use provided timeout or default
         request_timeout = timeout if timeout is not None else self._timeout
 
@@ -233,7 +252,7 @@ class OpenAICompatibleProvider(LLMProvider):
             response = await self._client.chat.completions.create(
                 **self._build_chat_completion_kwargs(
                     messages,
-                    max_completion_tokens,
+                    resolved_max_tokens,
                     request_timeout,
                 )
             )
@@ -306,7 +325,7 @@ class OpenAICompatibleProvider(LLMProvider):
         prompt: str,
         json_schema: dict[str, Any],
         system: str | None = None,
-        max_completion_tokens: int = 4096,
+        max_completion_tokens: int | OutputLimitIntent = 4096,
         timeout: int | None = None,
     ) -> dict[str, Any]:
         """Generate a structured JSON completion conforming to the given schema.
@@ -327,6 +346,9 @@ class OpenAICompatibleProvider(LLMProvider):
         Returns:
             Parsed JSON object conforming to schema
         """
+        resolved_max_tokens = self.resolve_synthesis_output_limit(
+            max_completion_tokens
+        ).max_tokens
         request_timeout = timeout if timeout is not None else self._timeout
 
         try:
@@ -340,7 +362,7 @@ class OpenAICompatibleProvider(LLMProvider):
                 response = await self._client.chat.completions.create(
                     **self._build_chat_completion_kwargs(
                         messages,
-                        max_completion_tokens,
+                        resolved_max_tokens,
                         request_timeout,
                         response_format={
                             "type": "json_schema",
@@ -372,7 +394,7 @@ class OpenAICompatibleProvider(LLMProvider):
                 response = await self._client.chat.completions.create(
                     **self._build_chat_completion_kwargs(
                         messages,
-                        max_completion_tokens,
+                        resolved_max_tokens,
                         request_timeout,
                         response_format={"type": "json_object"},
                     )
