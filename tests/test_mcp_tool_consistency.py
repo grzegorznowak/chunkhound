@@ -1468,6 +1468,7 @@ async def test_synthesis_truncation_propagates_through_common_and_daemon(
 ) -> None:
     """Real truncation is an exact tool error on every realizable public route."""
     import asyncio
+    import sys
     from types import SimpleNamespace
     from unittest.mock import MagicMock
 
@@ -1478,6 +1479,7 @@ async def test_synthesis_truncation_propagates_through_common_and_daemon(
 
     from chunkhound.daemon import ipc
     from chunkhound.daemon.client_proxy import ClientProxy
+    from chunkhound.daemon.discovery import DaemonDiscovery
     from chunkhound.daemon.server import ChunkHoundDaemon
     from chunkhound.llm_manager import LLMManager
     from chunkhound.mcp_server.common import handle_tool_call
@@ -1581,6 +1583,17 @@ async def test_synthesis_truncation_propagates_through_common_and_daemon(
                 synthesis_budgets={"output_tokens": 30_000},
             )
             return {"answer": answer}
+
+        daemon_socket_path = (
+            "tcp:127.0.0.1:0"
+            if sys.platform == "win32"
+            else DaemonDiscovery(tmp_path).get_ipc_address()
+        )
+        daemon_socket_file = (
+            None if sys.platform == "win32" else Path(daemon_socket_path)
+        )
+        if daemon_socket_file is not None:
+            daemon_socket_file.parent.mkdir(parents=True, exist_ok=True)
 
         try:
             # Raw shared boundary used by every in-process transport.
@@ -1688,7 +1701,7 @@ async def test_synthesis_truncation_propagates_through_common_and_daemon(
             daemon = ChunkHoundDaemon(
                 config=MagicMock(),
                 args=MagicMock(),
-                socket_path=str(tmp_path / "daemon-proof.sock"),
+                socket_path=daemon_socket_path,
                 project_dir=tmp_path,
             )
             daemon.llm_manager = llm_manager
@@ -1703,7 +1716,7 @@ async def test_synthesis_truncation_propagates_through_common_and_daemon(
                 await daemon._handle_client(reader, writer)
 
             server, address = await ipc.create_server(
-                daemon._socket_path, handle_daemon_client
+                daemon_socket_path, handle_daemon_client
             )
             proxy = ClientProxy(tmp_path, MagicMock())
             proxy._discovery.read_lock = MagicMock(
@@ -1777,6 +1790,8 @@ async def test_synthesis_truncation_propagates_through_common_and_daemon(
             } == {64_000}
             fake_server.assert_all_scripts_consumed()
         finally:
+            if daemon_socket_file is not None:
+                daemon_socket_file.unlink(missing_ok=True)
             TOOL_REGISTRY["code_research"] = original_tool
             providers = {
                 llm_manager.get_utility_provider(),
