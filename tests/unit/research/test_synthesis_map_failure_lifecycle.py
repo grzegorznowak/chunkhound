@@ -7,6 +7,7 @@ from typing import Any, cast
 import pytest
 
 from chunkhound.services.clustering_service import ClusterGroup
+from chunkhound.services.research.shared.models import ResearchContext
 from chunkhound.services.research.v1.pluggable_research_service import (
     PluggableResearchService,
 )
@@ -65,7 +66,7 @@ async def _run_maps(
 ) -> list[dict[str, Any]]:
     return await service._run_synthesis_maps(
         cluster_groups=_clusters(count),
-        query="query",
+        context=ResearchContext(root_query="query"),
         prioritized_chunks=[],
         synthesis_budgets={"output_tokens": 30_000},
         constants_context="constants",

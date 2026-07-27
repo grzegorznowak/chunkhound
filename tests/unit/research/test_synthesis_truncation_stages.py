@@ -12,6 +12,7 @@ from chunkhound.llm_manager import LLMManager
 from chunkhound.services.clustering_service import ClusterGroup
 from chunkhound.services.research import SynthesisEngine
 from chunkhound.services.research.shared.citation_manager import CitationManager
+from chunkhound.services.research.shared.models import ResearchContext
 from tests.fixtures.openai_compatible_server import (
     ChatCompletionScript,
     OpenAICompatibleTestServer,
@@ -100,10 +101,9 @@ async def _run_synthesis(
 
     if len(clusters) == 1:
         return await engine._single_pass_synthesis(
-            root_query=query,
             chunks=chunks,
             files=files,
-            context=None,
+            context=ResearchContext(root_query=query),
             synthesis_budgets=budgets,
         )
 
@@ -112,8 +112,8 @@ async def _run_synthesis(
         asyncio.create_task(
             engine._map_synthesis_on_cluster(
                 cluster=cluster,
-                root_query=query,
                 chunks=chunks,
+                context=ResearchContext(root_query=query),
                 synthesis_budgets=budgets,
                 total_input_tokens=total_input_tokens,
             )
@@ -128,10 +128,10 @@ async def _run_synthesis(
         raise
 
     return await engine._reduce_synthesis(
-        root_query=query,
         cluster_results=cluster_results,
         all_chunks=chunks,
         all_files=files,
+        context=ResearchContext(root_query=query),
         synthesis_budgets=budgets,
     )
 
@@ -146,8 +146,8 @@ async def _run_maps(
         *(
             engine._map_synthesis_on_cluster(
                 cluster=cluster,
-                root_query="Characterize floor allocation",
                 chunks=chunks,
+                context=ResearchContext(root_query="Characterize floor allocation"),
                 synthesis_budgets={"output_tokens": OUTPUT_BUDGET},
                 total_input_tokens=total_input_tokens,
             )

@@ -1369,9 +1369,7 @@ async def test_stdio_tool_call_uses_error_content_when_success_precedes_error() 
         TextContent(type="text", text=json.dumps({"status": "ok"})),
         TextContent(
             type="text",
-            text=json.dumps(
-                {"error": {"type": "RuntimeError", "message": "second"}}
-            ),
+            text=json.dumps({"error": {"type": "RuntimeError", "message": "second"}}),
         ),
     ]
 
@@ -1491,6 +1489,7 @@ async def test_synthesis_truncation_propagates_through_common_and_daemon(
     )
     from chunkhound.services.research import SynthesisEngine
     from chunkhound.services.research.shared.citation_manager import CitationManager
+    from chunkhound.services.research.shared.models import ResearchContext
     from tests.fixtures.openai_compatible_server import (
         ChatCompletionScript,
         OpenAICompatibleTestServer,
@@ -1576,10 +1575,9 @@ async def test_synthesis_truncation_propagates_through_common_and_daemon(
                 parent_service=parent,
             )
             answer = await engine._single_pass_synthesis(
-                root_query=query,
                 chunks=chunks,
                 files=files,
-                context=None,
+                context=ResearchContext(root_query=query),
                 synthesis_budgets={"output_tokens": 30_000},
             )
             return {"answer": answer}
@@ -1669,9 +1667,7 @@ async def test_synthesis_truncation_propagates_through_common_and_daemon(
                 async with httpx.AsyncClient(
                     transport=transport, base_url="http://chunkhound.test"
                 ) as http_client:
-                    health_before = (
-                        await http_client.get("/health")
-                    ).json()
+                    health_before = (await http_client.get("/health")).json()
                     async with streamablehttp_client(
                         "http://chunkhound.test/mcp",
                         httpx_client_factory=lambda **kwargs: httpx.AsyncClient(
@@ -1824,9 +1820,7 @@ async def test_daemon_tool_call_propagates_mixed_content_error_flag() -> None:
         TextContent(type="text", text=json.dumps({"status": "ok"})),
         TextContent(
             type="text",
-            text=json.dumps(
-                {"error": {"type": "RuntimeError", "message": "second"}}
-            ),
+            text=json.dumps({"error": {"type": "RuntimeError", "message": "second"}}),
         ),
     ]
 
@@ -1854,9 +1848,7 @@ async def test_daemon_tool_call_propagates_mixed_content_error_flag() -> None:
         for name, tool in TOOL_REGISTRY.items()
     ],
 )
-def test_tool_requires_db_matches_signature(
-    tool_name: str, expected: bool
-) -> None:
+def test_tool_requires_db_matches_signature(tool_name: str, expected: bool) -> None:
     """Every tool's DB-service requirement must match its implementation signature."""
     assert tool_requires_db(tool_name) is expected
 

@@ -124,7 +124,9 @@ class PluggableResearchService(ProgressEmitterMixin):
             return self._config.num_expanded_queries
         return NUM_LLM_EXPANDED_QUERIES
 
-    async def deep_research(self, query: str) -> dict[str, Any]:
+    async def deep_research(
+        self, query: str, previous_query: str | None = None
+    ) -> dict[str, Any]:
         """Perform deep research on a query.
 
         Uses fixed BFS depth (max_depth=1) with dynamic synthesis budgets that scale
@@ -133,6 +135,10 @@ class PluggableResearchService(ProgressEmitterMixin):
 
         Args:
             query: Research question to investigate
+            previous_query: Follow-up chain hook. When set, the synthesis
+                stage frames map/reduce/single-pass outputs in the prior
+                topic's context. Does not affect which code is searched,
+                retrieved, or reranked. Empty / None means un-chained.
 
         Returns:
             Dictionary with answer and metadata
@@ -183,7 +189,7 @@ class PluggableResearchService(ProgressEmitterMixin):
         )
 
         # Phase 1: Initial search
-        context = ResearchContext(root_query=query)
+        context = ResearchContext(root_query=query, previous_query=previous_query)
         await self._emit_event(
             "depth_start",
             "Phase 1: Initial search",
@@ -336,7 +342,6 @@ class PluggableResearchService(ProgressEmitterMixin):
             logger.info("Single cluster detected - using single-pass synthesis")
             facts_context = evidence_ledger.get_facts_reduce_prompt_context()
             answer = await self._synthesis_engine._single_pass_synthesis(
-                root_query=query,
                 chunks=prioritized_chunks,
                 files=budgeted_files,
                 context=context,
@@ -365,7 +370,7 @@ class PluggableResearchService(ProgressEmitterMixin):
 
             cluster_results = await self._run_synthesis_maps(
                 cluster_groups=cluster_groups,
-                query=query,
+                context=context,
                 prioritized_chunks=prioritized_chunks,
                 synthesis_budgets=synthesis_budgets,
                 constants_context=constants_context,
@@ -387,10 +392,10 @@ class PluggableResearchService(ProgressEmitterMixin):
             reduce_facts_context = evidence_ledger.get_facts_reduce_prompt_context()
 
             answer = await self._synthesis_engine._reduce_synthesis(
-                query,
                 cluster_results,
                 prioritized_chunks,
                 budgeted_files,
+                context,
                 synthesis_budgets,
                 constants_context=constants_context,
                 facts_context=reduce_facts_context,
@@ -440,7 +445,7 @@ class PluggableResearchService(ProgressEmitterMixin):
         self,
         *,
         cluster_groups: list[ClusterGroup],
-        query: str,
+        context: ResearchContext,
         prioritized_chunks: list[dict[str, Any]],
         synthesis_budgets: dict[str, int],
         constants_context: str,
@@ -475,11 +480,11 @@ class PluggableResearchService(ProgressEmitterMixin):
                 )
                 try:
                     return await self._synthesis_engine._map_synthesis_on_cluster(
-                        cluster,
-                        query,
-                        prioritized_chunks,
-                        synthesis_budgets,
-                        total_input_tokens,
+                        cluster=cluster,
+                        chunks=prioritized_chunks,
+                        context=context,
+                        synthesis_budgets=synthesis_budgets,
+                        total_input_tokens=total_input_tokens,
                         constants_context=constants_context,
                         facts_context=cluster_facts_context,
                     )
@@ -524,8 +529,7 @@ class PluggableResearchService(ProgressEmitterMixin):
         except asyncio.CancelledError:
             caller = asyncio.current_task()
             caller_cancelled = (
-                caller is not None
-                and getattr(caller, "cancelling", lambda: 1)() > 0
+                caller is not None and getattr(caller, "cancelling", lambda: 1)() > 0
             )
             try:
                 await cancel_and_settle()
@@ -800,10 +804,8 @@ class PluggableResearchService(ProgressEmitterMixin):
                         end_line = chunk.get("end_line", 1)
 
                         # Use smart boundary detection to expand to complete functions/classes
-                        expanded_start, expanded_end = (
-                            expand_to_natural_boundaries(
-                                lines, start_line, end_line, chunk, file_path
-                            )
+                        expanded_start, expanded_end = expand_to_natural_boundaries(
+                            lines, start_line, end_line, chunk, file_path
                         )
 
                         # Skip chunks with invalid boundary expansion

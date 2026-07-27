@@ -13,7 +13,10 @@ from chunkhound.interfaces.llm_provider import (
 from chunkhound.services.clustering_service import ClusterGroup
 from chunkhound.services.research import SynthesisEngine
 from chunkhound.services.research.shared.citation_manager import CitationManager
-from chunkhound.services.research.shared.models import build_output_guidance
+from chunkhound.services.research.shared.models import (
+    ResearchContext,
+    build_output_guidance,
+)
 
 OUTPUT_TOKENS = 30_000
 ANSWER = "Complete synthesis output with sufficient detail. " * 8
@@ -101,17 +104,16 @@ async def test_synthesis_stages_route_allowance_without_changing_prompt_guidance
     budgets = {"output_tokens": OUTPUT_TOKENS}
 
     await engine._single_pass_synthesis(
-        root_query="Explain output-limit routing",
         chunks=chunks,
         files=files,
-        context=None,
+        context=ResearchContext(root_query="Explain output-limit routing"),
         synthesis_budgets=budgets,
     )
     map_results = [
         await engine._map_synthesis_on_cluster(
             cluster=cluster,
-            root_query="Explain output-limit routing",
             chunks=chunks,
+            context=ResearchContext(root_query="Explain output-limit routing"),
             synthesis_budgets=budgets,
             total_input_tokens=100_000,
         )
@@ -119,16 +121,16 @@ async def test_synthesis_stages_route_allowance_without_changing_prompt_guidance
     ]
     await engine._map_synthesis_on_cluster(
         cluster=clusters[0],
-        root_query="Explain zero-total fallback routing",
         chunks=chunks,
+        context=ResearchContext(root_query="Explain zero-total fallback routing"),
         synthesis_budgets=budgets,
         total_input_tokens=0,
     )
     await engine._reduce_synthesis(
-        root_query="Explain output-limit routing",
         cluster_results=map_results,
         all_chunks=chunks,
         all_files=files,
+        context=ResearchContext(root_query="Explain output-limit routing"),
         synthesis_budgets=budgets,
     )
 
