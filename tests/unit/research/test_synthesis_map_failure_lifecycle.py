@@ -162,7 +162,9 @@ async def test_first_failure_aborts_queue_settles_siblings_and_skips_reduce() ->
 
 
 @pytest.mark.asyncio
-async def test_external_caller_cancellation_wins_and_settles_children() -> None:
+async def test_external_caller_cancellation_wins_and_settles_children(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     class CleanupError(RuntimeError):
         pass
 
@@ -187,8 +189,13 @@ async def test_external_caller_cancellation_wins_and_settles_children() -> None:
     await both_started.wait()
     caller.cancel()
 
+    # Python 3.10 tasks do not expose Task.cancelling(). Exercise the real
+    # orchestration cleanup boundary with that supported runtime shape.
+    current_task = asyncio.current_task
+    monkeypatch.setattr(asyncio, "current_task", lambda: object())
     with pytest.raises(asyncio.CancelledError):
         await caller
+    monkeypatch.setattr(asyncio, "current_task", current_task)
 
     assert started == {0, 1}
     assert cancelled == {0, 1}

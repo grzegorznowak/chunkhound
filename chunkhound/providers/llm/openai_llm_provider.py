@@ -1,6 +1,7 @@
 """OpenAI LLM provider implementation for ChunkHound deep research."""
 
 import json
+import os
 from typing import Any
 
 from loguru import logger
@@ -91,15 +92,16 @@ class OpenAILLMProvider(OpenAICompatibleProvider):
             supports_structured_outputs: Override class-level structured
                 output support flag
         """
-        # Preserve the constructor routing fact: SDK client mocks and environment
-        # defaults are not authoritative evidence about the selected endpoint.
-        self._uses_custom_endpoint = base_url is not None and not (
-            is_official_openai_endpoint(base_url)
+        # Resolve the selected route once so capability metadata and SDK
+        # construction cannot disagree about an environment-provided endpoint.
+        resolved_base_url = base_url or os.getenv("OPENAI_BASE_URL")
+        self._uses_custom_endpoint = not is_official_openai_endpoint(
+            resolved_base_url
         )
         super().__init__(
             api_key=api_key,
             model=model,
-            base_url=base_url,
+            base_url=resolved_base_url,
             ssl_verify=ssl_verify,
             timeout=timeout,
             max_retries=max_retries,
@@ -120,8 +122,8 @@ class OpenAILLMProvider(OpenAICompatibleProvider):
     def _get_default_base_url(self) -> str | None:
         """Get the default OpenAI API base URL.
 
-        Returns None so AsyncOpenAI falls back to OPENAI_BASE_URL env var
-        or its own default.
+        Returns None so AsyncOpenAI falls back to its official default when no
+        explicit or OPENAI_BASE_URL route was selected during construction.
         """
         return None
 

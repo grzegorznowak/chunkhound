@@ -1451,21 +1451,14 @@ class LLMConfig(BaseSettings):
 
         output_limits_raw = os.getenv("CHUNKHOUND_LLM_OUTPUT_LIMITS_ENABLED")
         if output_limits_raw is not None:
-            output_limits_enabled = _parse_env_bool(output_limits_raw)
-            if output_limits_enabled is None:
-                raise ValueError(
-                    "CHUNKHOUND_LLM_OUTPUT_LIMITS_ENABLED must be a boolean "
-                    "(1/0, true/false, yes/no, or on/off)"
-                )
-            config["output_limits_enabled"] = output_limits_enabled
+            config["output_limits_enabled"] = _decode_output_limit_source_value(
+                "output_limits_enabled", output_limits_raw
+            )
         fallback_raw = os.getenv("CHUNKHOUND_LLM_OUTPUT_LIMIT_FALLBACK")
         if fallback_raw is not None:
-            try:
-                config["output_limit_fallback"] = int(fallback_raw)
-            except ValueError as exc:
-                raise ValueError(
-                    "CHUNKHOUND_LLM_OUTPUT_LIMIT_FALLBACK must be a decimal integer"
-                ) from exc
+            config["output_limit_fallback"] = _decode_output_limit_source_value(
+                "output_limit_fallback", fallback_raw
+            )
 
         if codex_effort := os.getenv("CHUNKHOUND_LLM_CODEX_REASONING_EFFORT"):
             config["codex_reasoning_effort"] = codex_effort.strip().lower()

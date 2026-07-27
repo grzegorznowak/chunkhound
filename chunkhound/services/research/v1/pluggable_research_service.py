@@ -13,7 +13,7 @@ The service coordinates:
 
 import asyncio
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 
@@ -523,7 +523,10 @@ class PluggableResearchService(ProgressEmitterMixin):
             return [task.result() for task in tasks]
         except asyncio.CancelledError:
             caller = asyncio.current_task()
-            caller_cancelled = caller is not None and cast(Any, caller).cancelling() > 0
+            caller_cancelled = (
+                caller is not None
+                and getattr(caller, "cancelling", lambda: 1)() > 0
+            )
             try:
                 await cancel_and_settle()
             except asyncio.CancelledError:

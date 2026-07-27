@@ -63,21 +63,69 @@ def test_official_openai_endpoint_keeps_real_api_key_contract():
     assert kwargs["base_url"] == "https://api.openai.com/v1"
 
 
-def test_output_limit_capability_uses_constructor_endpoint_fact():
-    """Client mock state must not make a custom endpoint look official."""
+@pytest.mark.parametrize(
+    ("explicit_url", "environment_url", "resolved_url", "expected_capability"),
+    [
+        (None, None, None, OutputLimitCapability.SUPPORTED),
+        (
+            None,
+            "https://api.openai.com/v1",
+            "https://api.openai.com/v1",
+            OutputLimitCapability.SUPPORTED,
+        ),
+        (
+            None,
+            "https://gateway.example/v1",
+            "https://gateway.example/v1",
+            OutputLimitCapability.UNKNOWN,
+        ),
+        (
+            "https://api.openai.com/v1",
+            "https://gateway.example/v1",
+            "https://api.openai.com/v1",
+            OutputLimitCapability.SUPPORTED,
+        ),
+        (
+            "https://gateway.example/v1",
+            "https://api.openai.com/v1",
+            "https://gateway.example/v1",
+            OutputLimitCapability.UNKNOWN,
+        ),
+    ],
+    ids=[
+        "sdk-default",
+        "official-environment",
+        "custom-environment",
+        "explicit-official-precedence",
+        "explicit-custom-precedence",
+    ],
+)
+def test_output_limit_capability_uses_resolved_endpoint_route(
+    explicit_url: str | None,
+    environment_url: str | None,
+    resolved_url: str | None,
+    expected_capability: OutputLimitCapability,
+    monkeypatch: pytest.MonkeyPatch,
+    clean_environment,
+) -> None:
+    """Capability classification and SDK construction use one selected route."""
+    if environment_url is not None:
+        monkeypatch.setenv("OPENAI_BASE_URL", environment_url)
+
     with patch(
         "chunkhound.providers.llm.openai_compatible_provider.AsyncOpenAI"
     ) as mock_client:
-        mock_client.return_value.base_url = "https://api.openai.com/v1"
-        official = OpenAILLMProvider(api_key="sk-test", model="gpt-5")
-        custom = OpenAILLMProvider(
+        provider = OpenAILLMProvider(
             api_key="sk-test",
             model="gpt-5",
-            base_url="https://gateway.example/v1",
+            base_url=explicit_url,
         )
 
-    assert official.output_limit_metadata.omission is OutputLimitCapability.SUPPORTED
-    assert custom.output_limit_metadata.omission is OutputLimitCapability.UNKNOWN
+    assert provider.output_limit_metadata.omission is expected_capability
+    if resolved_url is None:
+        assert "base_url" not in mock_client.call_args.kwargs
+    else:
+        assert mock_client.call_args.kwargs["base_url"] == resolved_url
 
 
 def test_custom_endpoint_ssl_verify_false_creates_insecure_http_client():
@@ -245,24 +293,43 @@ class TestOpenAILLMProvider:
         assert chat_call["response_format"]["json_schema"]["schema"] == schema
 
     @pytest.mark.asyncio
-    async def test_custom_endpoint_provider_managed_uses_fallback(
-        self, mock_openai_client
-    ):
-        """Custom OpenAI-compatible endpoints never inherit omission support."""
-        response = MagicMock()
-        response.output = [
+    @pytest.mark.parametrize(
+        ("model", "cap_field"),
+        [
+            ("gpt-5", "max_output_tokens"),
+            ("gpt-3.5-turbo", "max_completion_tokens"),
+        ],
+        ids=["responses", "chat"],
+    )
+    async def test_custom_environment_provider_managed_uses_fallback(
+        self,
+        model: str,
+        cap_field: str,
+        mock_openai_client,
+        monkeypatch: pytest.MonkeyPatch,
+        clean_environment,
+    ) -> None:
+        """A custom environment route sends fallback caps in both API dialects."""
+        monkeypatch.setenv("OPENAI_BASE_URL", "https://gateway.example/v1")
+
+        responses_result = MagicMock()
+        responses_result.output = [
             MagicMock(
                 type="message", content=[MagicMock(type="output_text", text="ok")]
             )
         ]
-        response.usage = None
-        response.status = "completed"
-        mock_openai_client.responses.create.return_value = response
-        provider = OpenAILLMProvider(
-            api_key="sk-test",
-            model="gpt-5",
-            base_url="https://gateway.example/v1",
-        )
+        responses_result.usage = None
+        responses_result.status = "completed"
+        mock_openai_client.responses.create.return_value = responses_result
+
+        chat_result = MagicMock()
+        chat_result.choices = [
+            MagicMock(message=MagicMock(content="ok"), finish_reason="stop")
+        ]
+        chat_result.usage = None
+        mock_openai_client.chat.completions.create.return_value = chat_result
+
+        provider = OpenAILLMProvider(api_key="sk-test", model=model)
         provider.configure_synthesis_output_limit_policy(
             output_limits_enabled=False,
             fallback_tokens=75_123,
@@ -270,10 +337,13 @@ class TestOpenAILLMProvider:
 
         await provider.complete("hello", max_completion_tokens=PROVIDER_MANAGED_OUTPUT)
 
-        assert (
-            mock_openai_client.responses.create.call_args.kwargs["max_output_tokens"]
-            == 75_123
+        create = (
+            mock_openai_client.responses.create
+            if cap_field == "max_output_tokens"
+            else mock_openai_client.chat.completions.create
         )
+        assert provider.output_limit_metadata.omission is OutputLimitCapability.UNKNOWN
+        assert create.call_args.kwargs[cap_field] == 75_123
 
     @pytest.mark.asyncio
     async def test_configuration_is_respected_in_api_call(self, mock_openai_client):
