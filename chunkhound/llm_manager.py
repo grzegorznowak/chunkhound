@@ -14,7 +14,7 @@ from chunkhound.core.config.llm_config import (
 from chunkhound.core.config.provider_registry import OPENAI_COMPATIBLE_PROVIDERS
 from chunkhound.core.exceptions.core import ConfigurationError
 from chunkhound.core.utils.openai_utils import is_official_openai_endpoint
-from chunkhound.interfaces.llm_provider import LLMProvider
+from chunkhound.interfaces.llm_provider import LLMProvider, OutputLimitCapability
 from chunkhound.providers.llm.anthropic_llm_provider import AnthropicLLMProvider
 from chunkhound.providers.llm.claude_code_cli_provider import ClaudeCodeCLIProvider
 from chunkhound.providers.llm.codex_cli_provider import CodexCLIProvider
@@ -234,6 +234,11 @@ class LLMManager:
             "max_retries": config.get("max_retries", 3),
             "max_tokens_param_name": spec.max_tokens_param_name,
             "synthesis_concurrency": spec.synthesis_concurrency,
+            "output_limit_omission": (
+                spec.output_limit_omission
+                if base_url is None
+                else OutputLimitCapability.UNKNOWN
+            ),
         }
 
         # Structured outputs: config override > spec default > class default

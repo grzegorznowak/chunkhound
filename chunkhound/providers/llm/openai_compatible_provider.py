@@ -69,6 +69,7 @@ class OpenAICompatibleProvider(LLMProvider):
         max_tokens_param_name: str = "max_completion_tokens",
         reasoning_effort: str | None = None,
         synthesis_concurrency: int = 3,
+        output_limit_omission: OutputLimitCapability = OutputLimitCapability.UNKNOWN,
     ):
         """Initialize OpenAI-compatible provider.
 
@@ -94,6 +95,8 @@ class OpenAICompatibleProvider(LLMProvider):
             reasoning_effort: Reasoning effort for compatible providers
                 (e.g. Grok). Omitted from API calls when None.
             synthesis_concurrency: Recommended parallel synthesis operations count.
+            output_limit_omission: Authoritative omission capability for the
+                configured endpoint. Generic and custom endpoints default to unknown.
         """
         if not OPENAI_AVAILABLE:
             raise ImportError(
@@ -110,6 +113,9 @@ class OpenAICompatibleProvider(LLMProvider):
         self._max_tokens_param_name = max_tokens_param_name
         self._reasoning_effort = reasoning_effort
         self._synthesis_concurrency = synthesis_concurrency
+        self._output_limit_metadata = OutputLimitMetadata(
+            omission=output_limit_omission
+        )
 
         # Use provided base_url, or default_base_url, or subclass override
         effective_base_url = (
@@ -144,8 +150,8 @@ class OpenAICompatibleProvider(LLMProvider):
 
     @property
     def output_limit_metadata(self) -> OutputLimitMetadata:
-        """Treat generic OpenAI-compatible omission support as unknown."""
-        return OutputLimitMetadata(omission=OutputLimitCapability.UNKNOWN)
+        """Return omission capability for the configured compatible endpoint."""
+        return self._output_limit_metadata
 
     @property
     def base_url(self) -> str | None:

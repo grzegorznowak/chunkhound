@@ -19,6 +19,10 @@ from loguru import logger
 
 from chunkhound.database_factory import DatabaseServices
 from chunkhound.embeddings import EmbeddingManager
+from chunkhound.interfaces.llm_provider import (
+    PROVIDER_MANAGED_OUTPUT,
+    OutputLimitDecisionKind,
+)
 from chunkhound.llm_manager import LLMManager
 from chunkhound.services import prompts
 from chunkhound.services.clustering_service import ClusterGroup
@@ -148,10 +152,34 @@ class PluggableResearchService(ProgressEmitterMixin):
             f"Synthesis output budget: {synthesis_budgets['output_tokens']:,} tokens"
         )
 
-        # Emit configuration info
+        # Report the selected synthesis provider's resolved request-limit policy.
+        output_policy = (
+            self._llm_manager.get_synthesis_provider().synthesis_output_limit_policy
+        )
+        if output_policy.output_limits_enabled:
+            output_policy_message = (
+                "legacy numeric (30,000-token single/reduce cap; computed per-map caps)"
+            )
+        else:
+            decision = output_policy.resolve(PROVIDER_MANAGED_OUTPUT)
+            if decision.kind is OutputLimitDecisionKind.OMIT:
+                output_policy_message = "provider-managed (cap omitted)"
+            elif decision.kind is OutputLimitDecisionKind.DECLARATION:
+                assert decision.max_tokens is not None
+                output_policy_message = (
+                    "provider-managed (provider-declared cap: "
+                    f"{decision.max_tokens:,} tokens)"
+                )
+            else:
+                assert decision.max_tokens is not None
+                output_policy_message = (
+                    f"provider-managed (fallback cap: {decision.max_tokens:,} tokens)"
+                )
+
         await self._emit_event(
             "main_info",
-            f"Max depth: {max_depth}, output budget: {synthesis_budgets['output_tokens'] // 1000}k tokens",
+            f"Max depth: {max_depth}; synthesis request limits: "
+            f"{output_policy_message}",
         )
 
         # Phase 1: Initial search

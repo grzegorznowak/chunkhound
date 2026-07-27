@@ -200,3 +200,55 @@ def test_synthesis_output_policy_flows_from_config_through_manager(
         managed = policy.resolve(PROVIDER_MANAGED_OUTPUT)
         assert managed.kind is OutputLimitDecisionKind.DECLARATION
         assert managed.max_tokens == 91_337
+
+
+@pytest.mark.parametrize("provider_name", ["deepseek", "grok"])
+@pytest.mark.parametrize(
+    ("base_url", "expected_capability", "expected_kind", "expected_tokens"),
+    [
+        (
+            None,
+            OutputLimitCapability.SUPPORTED,
+            OutputLimitDecisionKind.OMIT,
+            None,
+        ),
+        (
+            "https://compatible.example/v1",
+            OutputLimitCapability.UNKNOWN,
+            OutputLimitDecisionKind.FALLBACK,
+            64_123,
+        ),
+    ],
+    ids=["canonical", "custom"],
+)
+def test_registry_endpoint_capability_flows_through_selected_synthesis_provider(
+    provider_name: str,
+    base_url: str | None,
+    expected_capability: OutputLimitCapability,
+    expected_kind: OutputLimitDecisionKind,
+    expected_tokens: int | None,
+) -> None:
+    """The manager applies canonical metadata only to canonical endpoints."""
+    role_config: dict[str, Any] = {
+        "provider": provider_name,
+        "model": "contract-test-model",
+        "api_key": "sk-test",
+    }
+    if base_url is not None:
+        role_config["base_url"] = base_url
+
+    manager = LLMManager(
+        role_config,
+        {
+            **role_config,
+            "output_limits_enabled": False,
+            "output_limit_fallback": 64_123,
+        },
+    )
+
+    synthesis = manager.get_synthesis_provider()
+    decision = synthesis.resolve_synthesis_output_limit(PROVIDER_MANAGED_OUTPUT)
+
+    assert synthesis.output_limit_metadata.omission is expected_capability
+    assert decision.kind is expected_kind
+    assert decision.max_tokens == expected_tokens
