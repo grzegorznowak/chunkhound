@@ -14,6 +14,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Configurable via `fetchurl.rerank_threshold_tokens` (default 15000), `fetchurl.truncate_tokens` (default 15000), and `fetchurl.max_retries` (default 3), or their `CHUNKHOUND_FETCHURL_*` env-var equivalents.
   - Uses the same zendriver + system Chrome transport as `websearch`, with `urllib` fallback.
 
+### Fixed
+- **PyMuPDF `fitz` import deprecation warning on stdout** — PDF parsing now imports `pymupdf` instead of the legacy `fitz` alias, which since PyMuPDF 1.28.2 prints a deprecation warning to stdout and corrupts MCP stdio clients (e.g. CURe preflight). Adds a regression test asserting parser imports write nothing to stdout.
+
 ## [5.2.0] - 2026-07-12
 
 ### Breaking Changes
