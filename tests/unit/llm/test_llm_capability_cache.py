@@ -131,6 +131,48 @@ def test_capability_cache_default_path_follows_platform_conventions(
     assert expected.is_file()
 
 
+def test_capability_cache_write_failure_is_tolerated(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    blocker = tmp_path / "blocker"
+    blocker.write_text("not a directory", encoding="utf-8")
+    monkeypatch.setenv(ENV_VAR, str(blocker / "cap.json"))
+    store = capability_cache.LLMCapabilityStore()
+
+    store.set("openrouter", "model", "accepted")
+
+    assert store.get("openrouter", "model") == "unknown"
+
+
+def test_capability_cache_cleans_temp_file_when_replace_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    overridden_cache_path: Path,
+) -> None:
+    def failing_replace(source: str | Path, destination: str | Path) -> None:
+        raise OSError("replace failed")
+
+    monkeypatch.setattr(os, "replace", failing_replace)
+
+    capability_cache.LLMCapabilityStore().set("openrouter", "model", "accepted")
+
+    assert list(overridden_cache_path.parent.glob("*.tmp")) == []
+    assert not overridden_cache_path.exists()
+
+
+def test_capability_cache_merges_keys_across_writes(
+    overridden_cache_path: Path,
+) -> None:
+    first_store = capability_cache.LLMCapabilityStore()
+    second_store = capability_cache.LLMCapabilityStore()
+
+    first_store.set("openrouter", "first-model", "accepted")
+    second_store.set("openrouter", "second-model", "rejected")
+
+    payload = json.loads(overridden_cache_path.read_text(encoding="utf-8"))
+    assert set(payload) == {"openrouter:first-model", "openrouter:second-model"}
+
+
 def test_capability_cache_missing_or_corrupt_file_reads_unknown(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
