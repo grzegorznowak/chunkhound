@@ -239,6 +239,11 @@ class LLMManager:
                 if base_url is None
                 else OutputLimitCapability.UNKNOWN
             ),
+            "structured_reasoning_disable_extra_body": (
+                spec.structured_reasoning_disable_extra_body
+                if base_url is None
+                else None
+            ),
         }
 
         # Structured outputs: config override > spec default > class default

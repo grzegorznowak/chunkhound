@@ -10,6 +10,7 @@ Subclass overrides of _get_provider_name() / _get_default_base_url() are optiona
 
 import asyncio
 import json
+from collections.abc import Mapping
 from typing import Any
 
 import httpx
@@ -25,6 +26,10 @@ from chunkhound.interfaces.llm_provider import (
     OutputLimitCapability,
     OutputLimitIntent,
     OutputLimitMetadata,
+)
+from chunkhound.providers.llm.capability_cache import (
+    CapabilityState,
+    LLMCapabilityStore,
 )
 from chunkhound.utils.json_extraction import (
     build_schema_system_instruction,
@@ -71,6 +76,8 @@ class OpenAICompatibleProvider(LLMProvider):
         reasoning_effort: str | None = None,
         synthesis_concurrency: int = 3,
         output_limit_omission: OutputLimitCapability = OutputLimitCapability.UNKNOWN,
+        structured_reasoning_disable_extra_body: Mapping[str, Any] | None = None,
+        capability_store: LLMCapabilityStore | None = None,
     ):
         """Initialize OpenAI-compatible provider.
 
@@ -98,6 +105,9 @@ class OpenAICompatibleProvider(LLMProvider):
             synthesis_concurrency: Recommended parallel synthesis operations count.
             output_limit_omission: Authoritative omission capability for the
                 configured endpoint. Generic and custom endpoints default to unknown.
+            structured_reasoning_disable_extra_body: Extra request body used only for
+                structured calls when the endpoint accepts it.
+            capability_store: Persistent structured-request capability store.
         """
         if not OPENAI_AVAILABLE:
             raise ImportError(
@@ -117,6 +127,14 @@ class OpenAICompatibleProvider(LLMProvider):
         self._output_limit_metadata = OutputLimitMetadata(
             omission=output_limit_omission
         )
+        self._structured_reasoning_disable_extra_body = (
+            structured_reasoning_disable_extra_body
+        )
+        self._capability_store = capability_store or LLMCapabilityStore()
+        self._structured_reasoning_capability: CapabilityState = (
+            self._capability_store.get(self.name, self._model)
+        )
+        self._structured_reasoning_capability_lock = asyncio.Lock()
 
         # Use provided base_url, or default_base_url, or subclass override
         effective_base_url = (
@@ -205,6 +223,13 @@ class OpenAICompatibleProvider(LLMProvider):
             kwargs[max_tokens_param] = max_completion_tokens
         if response_format is not None:
             kwargs["response_format"] = response_format
+            if (
+                self._structured_reasoning_disable_extra_body is not None
+                and self._structured_reasoning_capability != "rejected"
+            ):
+                kwargs["extra_body"] = dict(
+                    self._structured_reasoning_disable_extra_body
+                )
         if self._reasoning_effort:
             kwargs["reasoning_effort"] = self._reasoning_effort
         return kwargs
@@ -355,6 +380,76 @@ class OpenAICompatibleProvider(LLMProvider):
             logger.error(f"{self.name} completion failed: {e}")
             raise RuntimeError(f"LLM completion failed: {e}") from e
 
+    async def _create_structured_completion(self, kwargs: dict[str, Any]) -> Any:
+        """Create a structured completion with sticky payload negotiation."""
+        if self._structured_reasoning_disable_extra_body is None:
+            return await self._client.chat.completions.create(**kwargs)
+
+        if self._structured_reasoning_state() == "unknown":
+            async with self._structured_reasoning_capability_lock:
+                current_state = self._structured_reasoning_state()
+                if current_state != "unknown":
+                    kwargs = self._set_structured_payload(
+                        kwargs,
+                        current_state == "accepted",
+                    )
+                    return await self._client.chat.completions.create(**kwargs)
+                return await self._probe_structured_reasoning_payload(kwargs)
+
+        try:
+            return await self._client.chat.completions.create(**kwargs)
+        except Exception as error:
+            if (
+                self._structured_reasoning_capability != "accepted"
+                or not self._is_payload_rejection(error)
+            ):
+                raise
+            response = await self._client.chat.completions.create(
+                **self._set_structured_payload(kwargs, False)
+            )
+            self._set_structured_reasoning_capability("rejected")
+            return response
+
+    async def _probe_structured_reasoning_payload(self, kwargs: dict[str, Any]) -> Any:
+        try:
+            response = await self._client.chat.completions.create(**kwargs)
+        except Exception as error:
+            if not self._is_payload_rejection(error):
+                raise
+            response = await self._client.chat.completions.create(
+                **self._set_structured_payload(kwargs, False)
+            )
+            self._set_structured_reasoning_capability("rejected")
+            return response
+
+        self._set_structured_reasoning_capability("accepted")
+        return response
+
+    def _set_structured_payload(
+        self, kwargs: dict[str, Any], enabled: bool
+    ) -> dict[str, Any]:
+        updated = dict(kwargs)
+        if enabled:
+            updated["extra_body"] = dict(
+                self._structured_reasoning_disable_extra_body or {}
+            )
+        else:
+            updated.pop("extra_body", None)
+        return updated
+
+    @staticmethod
+    def _is_payload_rejection(error: Exception) -> bool:
+        response = getattr(error, "response", None)
+        return getattr(response, "status_code", None) in {400, 422}
+
+    def _set_structured_reasoning_capability(self, state: CapabilityState) -> None:
+        self._capability_store.set(self.name, self._model, state)
+        self._structured_reasoning_capability = state
+
+    def _structured_reasoning_state(self) -> CapabilityState:
+        """Return the in-memory structured-reasoning capability state."""
+        return self._structured_reasoning_capability
+
     async def complete_structured(
         self,
         prompt: str,
@@ -394,8 +489,8 @@ class OpenAICompatibleProvider(LLMProvider):
                     messages.append({"role": "system", "content": system})
                 messages.append({"role": "user", "content": prompt})
 
-                response = await self._create_chat_completion(
-                    **self._build_chat_completion_kwargs(
+                response = await self._create_structured_completion(
+                    self._build_chat_completion_kwargs(
                         messages,
                         resolved_max_tokens,
                         request_timeout,
@@ -426,8 +521,8 @@ class OpenAICompatibleProvider(LLMProvider):
                     {"role": "user", "content": prompt},
                 ]
 
-                response = await self._create_chat_completion(
-                    **self._build_chat_completion_kwargs(
+                response = await self._create_structured_completion(
+                    self._build_chat_completion_kwargs(
                         messages,
                         resolved_max_tokens,
                         request_timeout,
