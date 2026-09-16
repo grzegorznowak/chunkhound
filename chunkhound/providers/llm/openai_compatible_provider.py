@@ -9,6 +9,7 @@ Subclass overrides of _get_provider_name() / _get_default_base_url() are optiona
 """
 
 import asyncio
+import copy
 import json
 from collections.abc import Mapping
 from typing import Any
@@ -134,7 +135,10 @@ class OpenAICompatibleProvider(LLMProvider):
         self._structured_reasoning_capability: CapabilityState = (
             self._capability_store.get(self.name, self._model)
         )
-        self._structured_reasoning_capability_lock = asyncio.Lock()
+        self._structured_reasoning_capability_lock: asyncio.Lock | None = None
+        self._structured_reasoning_capability_loop: asyncio.AbstractEventLoop | None = (
+            None
+        )
 
         # Use provided base_url, or default_base_url, or subclass override
         effective_base_url = (
@@ -227,7 +231,7 @@ class OpenAICompatibleProvider(LLMProvider):
                 self._structured_reasoning_disable_extra_body is not None
                 and self._structured_reasoning_capability != "rejected"
             ):
-                kwargs["extra_body"] = dict(
+                kwargs["extra_body"] = copy.deepcopy(
                     self._structured_reasoning_disable_extra_body
                 )
         if self._reasoning_effort:
@@ -385,16 +389,14 @@ class OpenAICompatibleProvider(LLMProvider):
         if self._structured_reasoning_disable_extra_body is None:
             return await self._client.chat.completions.create(**kwargs)
 
-        if self._structured_reasoning_state() == "unknown":
-            async with self._structured_reasoning_capability_lock:
-                current_state = self._structured_reasoning_state()
-                if current_state != "unknown":
-                    kwargs = self._set_structured_payload(
-                        kwargs,
-                        current_state == "accepted",
-                    )
-                    return await self._client.chat.completions.create(**kwargs)
-                return await self._probe_structured_reasoning_payload(kwargs)
+        state: CapabilityState = self._structured_reasoning_capability
+        if state == "unknown":
+            async with self._capability_lock():
+                state = self._structured_reasoning_capability
+                if state == "unknown":
+                    return await self._probe_structured_reasoning_payload(kwargs)
+                kwargs = self._set_structured_payload(kwargs, state == "accepted")
+            return await self._client.chat.completions.create(**kwargs)
 
         try:
             return await self._client.chat.completions.create(**kwargs)
@@ -430,7 +432,7 @@ class OpenAICompatibleProvider(LLMProvider):
     ) -> dict[str, Any]:
         updated = dict(kwargs)
         if enabled:
-            updated["extra_body"] = dict(
+            updated["extra_body"] = copy.deepcopy(
                 self._structured_reasoning_disable_extra_body or {}
             )
         else:
@@ -446,9 +448,16 @@ class OpenAICompatibleProvider(LLMProvider):
         self._capability_store.set(self.name, self._model, state)
         self._structured_reasoning_capability = state
 
-    def _structured_reasoning_state(self) -> CapabilityState:
-        """Return the in-memory structured-reasoning capability state."""
-        return self._structured_reasoning_capability
+    def _capability_lock(self) -> asyncio.Lock:
+        """Return a capability lock bound to the current event loop."""
+        loop = asyncio.get_running_loop()
+        if (
+            self._structured_reasoning_capability_lock is None
+            or self._structured_reasoning_capability_loop is not loop
+        ):
+            self._structured_reasoning_capability_lock = asyncio.Lock()
+            self._structured_reasoning_capability_loop = loop
+        return self._structured_reasoning_capability_lock
 
     async def complete_structured(
         self,
