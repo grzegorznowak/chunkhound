@@ -161,6 +161,22 @@ async def test_transient_probe_failure_is_not_replayed_or_cached(
 
 
 @pytest.mark.asyncio
+async def test_cached_rejected_first_call_never_sends_payload(
+    mock_completion: AsyncMock,
+) -> None:
+    """A persisted rejection omits the payload on the first instance call."""
+    store = FakeCapabilityStore("rejected")
+    mock_completion.return_value = _response()
+    provider = _provider(store)
+
+    assert await provider.complete_structured("cached", SCHEMA) == {"answer": "42"}
+
+    assert mock_completion.call_count == 1
+    assert "extra_body" not in mock_completion.call_args.kwargs
+    assert store.set_calls == []
+
+
+@pytest.mark.asyncio
 async def test_cached_accepted_rejection_replays_and_flips_state(
     mock_completion: AsyncMock,
 ) -> None:
