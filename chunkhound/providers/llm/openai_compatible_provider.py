@@ -401,10 +401,7 @@ class OpenAICompatibleProvider(LLMProvider):
         try:
             return await self._client.chat.completions.create(**kwargs)
         except Exception as error:
-            if (
-                self._structured_reasoning_capability != "accepted"
-                or not self._is_payload_rejection(error)
-            ):
+            if "extra_body" not in kwargs or not self._is_payload_rejection(error):
                 raise
             response = await self._client.chat.completions.create(
                 **self._set_structured_payload(kwargs, False)
@@ -445,8 +442,16 @@ class OpenAICompatibleProvider(LLMProvider):
         return getattr(response, "status_code", None) in {400, 422}
 
     def _set_structured_reasoning_capability(self, state: CapabilityState) -> None:
-        self._capability_store.set(self.name, self._model, state)
+        if self._structured_reasoning_capability == state:
+            return
         self._structured_reasoning_capability = state
+        try:
+            self._capability_store.set(self.name, self._model, state)
+        except OSError as error:
+            logger.warning(
+                f"Failed to persist {self.name} structured reasoning "
+                f"capability: {error}"
+            )
 
     def _capability_lock(self) -> asyncio.Lock:
         """Return a capability lock bound to the current event loop."""

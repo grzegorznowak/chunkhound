@@ -13,6 +13,7 @@ import httpx
 import pytest
 from openai import APIStatusError, APITimeoutError
 
+from chunkhound.providers.llm.capability_cache import LLMCapabilityStore
 from chunkhound.providers.llm.openai_compatible_provider import OpenAICompatibleProvider
 from tests.fixtures.openai_compatible_server import (
     ChatCompletionScript,
@@ -281,6 +282,221 @@ async def test_structured_reasoning_payload_reaches_wire_body() -> None:
             assert body["reasoning"] == {"enabled": False}
             assert "extra_body" not in body
             server.assert_all_scripts_consumed()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_cached_accepted_rejections_each_replay_once(
+    mock_completion: AsyncMock,
+) -> None:
+    """Each flagged request may recover even after another flips the state."""
+    store = FakeCapabilityStore("accepted")
+    both_flagged = asyncio.Event()
+    flagged_calls = 0
+
+    async def complete(**kwargs: Any) -> SimpleNamespace:
+        nonlocal flagged_calls
+        if "extra_body" in kwargs:
+            flagged_calls += 1
+            if flagged_calls == 2:
+                both_flagged.set()
+            await asyncio.wait_for(both_flagged.wait(), timeout=5)
+            raise _status_error(400)
+        return _response()
+
+    mock_completion.side_effect = complete
+    provider = _provider(store)
+
+    results = await asyncio.gather(
+        provider.complete_structured("first", SCHEMA),
+        provider.complete_structured("second", SCHEMA),
+    )
+
+    assert results == [{"answer": "42"}] * 2
+    calls = mock_completion.call_args_list
+    assert sum("extra_body" in call.kwargs for call in calls) == 2
+    assert sum("extra_body" not in call.kwargs for call in calls) == 2
+    assert store.state == "rejected"
+    assert store.set_calls == [("openrouter", "poolside/laguna-xs-2.1", "rejected")]
+
+
+@pytest.mark.asyncio
+async def test_unknown_accepted_probe_releases_followers_before_network_io(
+    mock_completion: AsyncMock,
+) -> None:
+    """Followers are only serialized while the single-flight probe resolves."""
+    store = FakeCapabilityStore()
+    leader_started = asyncio.Event()
+    release_leader = asyncio.Event()
+    follower_started = {name: asyncio.Event() for name in ("second", "third")}
+
+    async def complete(**kwargs: Any) -> SimpleNamespace:
+        prompt = kwargs["messages"][-1]["content"]
+        assert "extra_body" in kwargs
+        if prompt == "first":
+            leader_started.set()
+            await release_leader.wait()
+        else:
+            follower_started[prompt].set()
+            other = "third" if prompt == "second" else "second"
+            await asyncio.wait_for(follower_started[other].wait(), timeout=5)
+        return _response()
+
+    mock_completion.side_effect = complete
+    provider = _provider(store)
+
+    leader = asyncio.create_task(provider.complete_structured("first", SCHEMA))
+    await asyncio.wait_for(leader_started.wait(), timeout=1)
+    followers = [
+        asyncio.create_task(provider.complete_structured(name, SCHEMA))
+        for name in ("second", "third")
+    ]
+    release_leader.set()
+
+    results = await asyncio.wait_for(asyncio.gather(leader, *followers), timeout=5)
+
+    assert results == [{"answer": "42"}] * 3
+    assert all(event.is_set() for event in follower_started.values())
+    assert mock_completion.call_count == 3
+    assert all("extra_body" in call.kwargs for call in mock_completion.call_args_list)
+    assert store.set_calls == [("openrouter", "poolside/laguna-xs-2.1", "accepted")]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("initial_state", ["unknown", "accepted"])
+async def test_replay_failure_preserves_prior_state_and_surfaces_replay_error(
+    mock_completion: AsyncMock, initial_state: str
+) -> None:
+    """Only a successful unflagged replay may replace the prior capability."""
+    store = FakeCapabilityStore(initial_state)
+    replay_error = APITimeoutError(httpx.Request("POST", "https://example.test"))
+    mock_completion.side_effect = [_status_error(400), replay_error]
+    provider = _provider(store)
+
+    with pytest.raises(RuntimeError, match="structured completion failed") as raised:
+        await provider.complete_structured("probe", SCHEMA)
+
+    assert raised.value.__cause__ is replay_error
+    assert store.state == initial_state
+    assert store.set_calls == []
+
+
+@pytest.mark.asyncio
+async def test_transient_probe_failure_is_reprobed_by_next_call(
+    mock_completion: AsyncMock,
+) -> None:
+    """A transient failure leaves unknown capability available for reprobe."""
+    store = FakeCapabilityStore()
+    mock_completion.side_effect = [_status_error(500), _response()]
+    provider = _provider(store)
+
+    with pytest.raises(RuntimeError, match="structured completion failed"):
+        await provider.complete_structured("first", SCHEMA)
+    assert await provider.complete_structured("second", SCHEMA) == {"answer": "42"}
+
+    assert all("extra_body" in call.kwargs for call in mock_completion.call_args_list)
+    assert store.set_calls == [("openrouter", "poolside/laguna-xs-2.1", "accepted")]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("initial_state", "payload", "error_factory", "has_payload"),
+    [
+        ("rejected", PAYLOAD, lambda: _status_error(400), False),
+        ("accepted", PAYLOAD, lambda: _status_error(500), True),
+        ("unknown", None, lambda: _status_error(400), False),
+    ],
+)
+async def test_unflagged_and_nonrejection_failures_are_not_replayed(
+    mock_completion: AsyncMock,
+    initial_state: str,
+    payload: dict[str, Any] | None,
+    error_factory: Callable[[], Exception],
+    has_payload: bool,
+) -> None:
+    """Only flagged 400/422 responses receive a single fallback attempt."""
+    store = FakeCapabilityStore(initial_state)
+    mock_completion.side_effect = error_factory()
+    provider = _provider(store, structured_reasoning_disable_extra_body=payload)
+
+    with pytest.raises(RuntimeError, match="structured completion failed"):
+        await provider.complete_structured("probe", SCHEMA)
+
+    assert mock_completion.call_count == 1
+    assert ("extra_body" in mock_completion.call_args.kwargs) is has_payload
+    assert store.set_calls == []
+
+
+@pytest.mark.asyncio
+async def test_probe_non_http_exception_is_not_replayed(
+    mock_completion: AsyncMock,
+) -> None:
+    """Non-HTTP probe failures retain the normal one-call error behavior."""
+    store = FakeCapabilityStore()
+    mock_completion.side_effect = TypeError("boom")
+    provider = _provider(store)
+
+    with pytest.raises(RuntimeError, match="structured completion failed"):
+        await provider.complete_structured("probe", SCHEMA)
+
+    assert mock_completion.call_count == 1
+    assert "extra_body" in mock_completion.call_args.kwargs
+    assert store.set_calls == []
+
+
+@pytest.mark.asyncio
+async def test_structured_payload_is_deep_copied_per_request(
+    mock_completion: AsyncMock,
+) -> None:
+    """SDK-side mutation cannot alter the configured payload or later calls."""
+    source_payload = {"reasoning": {"enabled": False}}
+    store = FakeCapabilityStore("accepted")
+    mock_completion.return_value = _response()
+    provider = _provider(store, structured_reasoning_disable_extra_body=source_payload)
+
+    assert await provider.complete_structured("first", SCHEMA) == {"answer": "42"}
+    first_payload = mock_completion.call_args.kwargs["extra_body"]
+    first_payload["reasoning"]["enabled"] = True
+    assert await provider.complete_structured("second", SCHEMA) == {"answer": "42"}
+    second_payload = mock_completion.call_args.kwargs["extra_body"]
+
+    assert source_payload == {"reasoning": {"enabled": False}}
+    assert second_payload == {"reasoning": {"enabled": False}}
+    assert first_payload is not second_payload
+
+
+def test_capability_lock_rebinds_across_event_loops(mock_completion: AsyncMock) -> None:
+    """A provider reused by separate asyncio.run calls gets a fresh lock."""
+    store = FakeCapabilityStore()
+    mock_completion.side_effect = [_status_error(500), _response()]
+    provider = _provider(store)
+
+    with pytest.raises(RuntimeError, match="structured completion failed"):
+        asyncio.run(provider.complete_structured("first", SCHEMA))
+    second = asyncio.run(provider.complete_structured("second", SCHEMA))
+    assert second == {"answer": "42"}
+
+
+def test_successful_structured_call_survives_cache_write_failure(
+    mock_completion: AsyncMock, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """Persistent-cache I/O failures do not discard a successful response."""
+    blocked_parent = tmp_path / "not-a-directory"
+    blocked_parent.write_text("blocked")
+    monkeypatch.setenv(
+        "CHUNKHOUND_LLM_CAPABILITY_CACHE", str(blocked_parent / "capabilities.json")
+    )
+    store = LLMCapabilityStore()
+    mock_completion.return_value = _response()
+    provider = _provider(store)
+
+    first = asyncio.run(provider.complete_structured("first", SCHEMA))
+    second = asyncio.run(provider.complete_structured("second", SCHEMA))
+
+    assert first == {"answer": "42"}
+    assert second == {"answer": "42"}
+    assert provider._structured_reasoning_capability == "accepted"
+    assert mock_completion.call_count == 2
+    assert all("extra_body" in call.kwargs for call in mock_completion.call_args_list)
 
 
 def _provider(
