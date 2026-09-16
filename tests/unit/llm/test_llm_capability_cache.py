@@ -1,0 +1,175 @@
+"""Persistence contracts for learned LLM request capabilities."""
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+import time
+from pathlib import Path
+
+import pytest
+
+from chunkhound.providers.llm import capability_cache
+
+ENV_VAR = "CHUNKHOUND_LLM_CAPABILITY_CACHE"
+CACHE_NAME = "llm-capabilities.json"
+KEY = "openrouter:poolside/laguna-xs-2.1"
+
+
+@pytest.fixture
+def overridden_cache_path(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> Path:
+    cache_path = tmp_path / "nested" / "capabilities.json"
+    monkeypatch.setenv(ENV_VAR, str(cache_path))
+    return cache_path
+
+
+@pytest.mark.parametrize("state", ["accepted", "rejected"])
+def test_capability_cache_env_override_round_trips_both_states(
+    overridden_cache_path: Path,
+    state: str,
+) -> None:
+    """The explicit file target persists learned state across instances."""
+    capability_cache.LLMCapabilityStore().set(
+        "openrouter", "poolside/laguna-xs-2.1", state
+    )
+
+    assert overridden_cache_path.is_file()
+    assert (
+        capability_cache.LLMCapabilityStore().get(
+            "openrouter", "poolside/laguna-xs-2.1"
+        )
+        == state
+    )
+
+
+def test_capability_cache_write_uses_atomic_replace(
+    monkeypatch: pytest.MonkeyPatch,
+    overridden_cache_path: Path,
+) -> None:
+    """A write replaces the target atomically instead of editing it in place."""
+    replace_calls: list[tuple[Path, Path]] = []
+    original_replace = os.replace
+
+    def recording_replace(source: str | Path, destination: str | Path) -> None:
+        replace_calls.append((Path(source), Path(destination)))
+        original_replace(source, destination)
+
+    monkeypatch.setattr(os, "replace", recording_replace)
+
+    capability_cache.LLMCapabilityStore().set("openrouter", "model", "accepted")
+
+    assert len(replace_calls) == 1
+    temporary_path, destination_path = replace_calls[0]
+    assert destination_path == overridden_cache_path
+    assert temporary_path != overridden_cache_path
+    assert not temporary_path.exists()
+
+
+@pytest.mark.parametrize(
+    ("state", "accepted"),
+    [("accepted", True), ("rejected", False)],
+)
+def test_capability_cache_json_schema_is_versioned_per_model(
+    overridden_cache_path: Path,
+    state: str,
+    accepted: bool,
+) -> None:
+    """Disk entries use the locked provider:model value schema."""
+    before = time.time()
+    capability_cache.LLMCapabilityStore().set(
+        "openrouter", "poolside/laguna-xs-2.1", state
+    )
+    after = time.time()
+
+    payload = json.loads(overridden_cache_path.read_text(encoding="utf-8"))
+    assert set(payload) == {KEY}
+    assert payload[KEY]["accepted"] is accepted
+    assert before <= payload[KEY]["ts"] <= after
+    assert payload[KEY]["format_version"] == 1
+    assert set(payload[KEY]) == {"accepted", "ts", "format_version"}
+
+
+@pytest.mark.parametrize(
+    ("platform", "cache_root_kind"),
+    [
+        pytest.param("linux", "xdg", id="xdg-cache-home"),
+        pytest.param("linux", "home", id="unix-home-fallback"),
+        pytest.param("win32", "local-appdata", id="windows-local-appdata"),
+    ],
+)
+def test_capability_cache_default_path_follows_platform_conventions(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    platform: str,
+    cache_root_kind: str,
+) -> None:
+    """Without an override, the user-scoped cache follows ChunkHound precedent."""
+    home = tmp_path / "home"
+    xdg = tmp_path / "xdg"
+    local_appdata = tmp_path / "local-appdata"
+    monkeypatch.delenv(ENV_VAR, raising=False)
+    monkeypatch.delenv("XDG_CACHE_HOME", raising=False)
+    monkeypatch.delenv("LOCALAPPDATA", raising=False)
+    monkeypatch.setattr(sys, "platform", platform)
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+
+    if cache_root_kind == "xdg":
+        monkeypatch.setenv("XDG_CACHE_HOME", str(xdg))
+        expected = xdg / "chunkhound" / CACHE_NAME
+    elif cache_root_kind == "local-appdata":
+        monkeypatch.setenv("LOCALAPPDATA", str(local_appdata))
+        expected = local_appdata / "ChunkHound" / CACHE_NAME
+    else:
+        expected = home / ".cache" / "chunkhound" / CACHE_NAME
+
+    capability_cache.LLMCapabilityStore().set("openrouter", "model", "accepted")
+
+    assert expected.is_file()
+
+
+def test_capability_cache_missing_or_corrupt_file_reads_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Unavailable persistence never prevents an LLM request."""
+    cache_path = tmp_path / "capabilities.json"
+    monkeypatch.setenv(ENV_VAR, str(cache_path))
+
+    assert capability_cache.LLMCapabilityStore().get("openrouter", "model") == "unknown"
+
+    cache_path.write_text("{not valid json", encoding="utf-8")
+    assert capability_cache.LLMCapabilityStore().get("openrouter", "model") == "unknown"
+
+
+@pytest.mark.parametrize("accepted", [True, False], ids=["accepted", "rejected"])
+def test_capability_cache_expires_both_states_after_thirty_days(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    accepted: bool,
+) -> None:
+    """Accepted and rejected decisions share the fixed 30-day TTL."""
+    cache_path = tmp_path / "capabilities.json"
+    monkeypatch.setenv(ENV_VAR, str(cache_path))
+    cache_path.write_text(
+        json.dumps(
+            {
+                KEY: {
+                    "accepted": accepted,
+                    "ts": time.time() - (30 * 24 * 60 * 60) - 1,
+                    "format_version": 1,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert (
+        capability_cache.LLMCapabilityStore().get(
+            "openrouter", "poolside/laguna-xs-2.1"
+        )
+        == "unknown"
+    )
