@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -171,6 +172,146 @@ def test_capability_cache_merges_keys_across_writes(
 
     payload = json.loads(overridden_cache_path.read_text(encoding="utf-8"))
     assert set(payload) == {"openrouter:first-model", "openrouter:second-model"}
+
+
+def test_cache_rejects_wrong_typed_or_versioned_entries_and_keeps_valid_siblings(
+    overridden_cache_path: Path,
+) -> None:
+    overridden_cache_path.parent.mkdir(parents=True)
+    overridden_cache_path.write_text(
+        json.dumps(
+            {
+                "openrouter:bool-version": {
+                    "accepted": True,
+                    "ts": time.time(),
+                    "format_version": True,
+                },
+                "openrouter:future-version": {
+                    "accepted": True,
+                    "ts": time.time(),
+                    "format_version": 2,
+                },
+                "openrouter:non-bool-accepted": {
+                    "accepted": 1,
+                    "ts": time.time(),
+                    "format_version": 1,
+                },
+                "openrouter:string-ts": {
+                    "accepted": True,
+                    "ts": "now",
+                    "format_version": 1,
+                },
+                "openrouter:bool-ts": {
+                    "accepted": True,
+                    "ts": True,
+                    "format_version": 1,
+                },
+                "openrouter:valid": {
+                    "accepted": False,
+                    "ts": time.time(),
+                    "format_version": 1,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    store = capability_cache.LLMCapabilityStore()
+
+    for model in (
+        "bool-version",
+        "future-version",
+        "non-bool-accepted",
+        "string-ts",
+        "bool-ts",
+    ):
+        assert store.get("openrouter", model) == "unknown"
+    assert store.get("openrouter", "valid") == "rejected"
+
+
+@pytest.mark.parametrize("accepted", [True, False], ids=["accepted", "rejected"])
+@pytest.mark.parametrize(
+    ("seconds_inside_boundary", "expected"),
+    [(0, "unknown"), (1, None)],
+    ids=["at-boundary", "inside-boundary"],
+)
+def test_capability_cache_ttl_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+    overridden_cache_path: Path,
+    accepted: bool,
+    seconds_inside_boundary: int,
+    expected: str | None,
+) -> None:
+    fixed = 2_000_000_000.0
+    monkeypatch.setattr(capability_cache.time, "time", lambda: fixed)
+    overridden_cache_path.parent.mkdir(parents=True)
+    overridden_cache_path.write_text(
+        json.dumps(
+            {
+                KEY: {
+                    "accepted": accepted,
+                    "ts": fixed - (30 * 24 * 60 * 60) + seconds_inside_boundary,
+                    "format_version": 1,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    expected_state = expected or ("accepted" if accepted else "rejected")
+    assert (
+        capability_cache.LLMCapabilityStore().get(
+            "openrouter", "poolside/laguna-xs-2.1"
+        )
+        == expected_state
+    )
+
+
+def test_capability_cache_write_waits_for_cross_process_lock(
+    overridden_cache_path: Path,
+) -> None:
+    lock_path = overridden_cache_path.with_name(f"{overridden_cache_path.name}.lock")
+    lock_path.parent.mkdir(parents=True)
+    store = capability_cache.LLMCapabilityStore()
+    writer = threading.Thread(
+        target=store.set,
+        args=("openrouter", "locked", "accepted"),
+    )
+
+    with lock_path.open("a+b") as handle:
+        capability_cache._acquire_cache_lock(handle)
+        try:
+            writer.start()
+            writer.join(timeout=0.1)
+            assert writer.is_alive()
+        finally:
+            capability_cache._release_cache_lock(handle)
+
+    writer.join(timeout=15)
+    assert not writer.is_alive()
+    assert store.get("openrouter", "locked") == "accepted"
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [[], None, "text", {}, {"openrouter:model": "not-a-dict"}],
+)
+def test_cache_reads_unknown_for_unexpected_top_level_shapes(
+    overridden_cache_path: Path,
+    payload: object,
+) -> None:
+    overridden_cache_path.parent.mkdir(parents=True)
+    overridden_cache_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    assert capability_cache.LLMCapabilityStore().get("openrouter", "model") == "unknown"
+
+
+def test_capability_cache_set_rejects_unknown_state(
+    overridden_cache_path: Path,
+) -> None:
+    with pytest.raises(ValueError, match="accepted.*rejected"):
+        capability_cache.LLMCapabilityStore().set("openrouter", "model", "unknown")
+
+    assert not overridden_cache_path.exists()
 
 
 def test_capability_cache_missing_or_corrupt_file_reads_unknown(

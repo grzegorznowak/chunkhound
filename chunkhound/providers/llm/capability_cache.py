@@ -101,8 +101,11 @@ class LLMCapabilityStore:
 
         accepted = entry.get("accepted")
         timestamp = entry.get("ts")
+        format_version = entry.get("format_version")
         if (
-            entry.get("format_version") != _FORMAT_VERSION
+            isinstance(format_version, bool)
+            or not isinstance(format_version, int)
+            or format_version != _FORMAT_VERSION
             or not isinstance(accepted, bool)
             or isinstance(timestamp, bool)
             or not isinstance(timestamp, (int, float))
