@@ -443,3 +443,28 @@ def test_capability_cache_expires_both_states_after_thirty_days(
         )
         == "unknown"
     )
+
+
+@pytest.mark.parametrize(
+    "corrupt_content",
+    [
+        pytest.param(b"\xff\xfe\x00", id="invalid-utf-8"),
+        pytest.param(("[" * 2000 + "]" * 2000).encode(), id="deeply-nested-json"),
+    ],
+)
+def test_capability_cache_tolerates_unreadable_cache_files(
+    overridden_cache_path: Path,
+    corrupt_content: bytes,
+) -> None:
+    """Unreadable persisted bytes never raise and are replaced on the next write."""
+    overridden_cache_path.parent.mkdir(parents=True)
+    overridden_cache_path.write_bytes(corrupt_content)
+    store = capability_cache.LLMCapabilityStore()
+
+    assert store.get("openrouter", "model") == "unknown"
+
+    store.set("openrouter", "model", "accepted")
+
+    payload = json.loads(overridden_cache_path.read_text(encoding="utf-8"))
+    assert set(payload) == {"openrouter:model"}
+    assert store.get("openrouter", "model") == "accepted"

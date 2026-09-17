@@ -146,6 +146,8 @@ class LLMCapabilityStore:
     def _read(self) -> dict[str, Any]:
         try:
             data = json.loads(self._path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+        except (OSError, ValueError, RecursionError):
+            # ValueError covers json.JSONDecodeError and UnicodeDecodeError;
+            # RecursionError covers pathologically nested JSON payloads.
             return {}
         return data if isinstance(data, dict) else {}
