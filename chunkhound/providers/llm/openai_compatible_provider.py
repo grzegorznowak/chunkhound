@@ -387,7 +387,7 @@ class OpenAICompatibleProvider(LLMProvider):
     async def _create_structured_completion(self, kwargs: dict[str, Any]) -> Any:
         """Create a structured completion with sticky payload negotiation."""
         if self._structured_reasoning_disable_extra_body is None:
-            return await self._client.chat.completions.create(**kwargs)
+            return await self._create_chat_completion(**kwargs)
 
         state: CapabilityState = self._structured_reasoning_capability
         if state == "unknown":
@@ -396,10 +396,10 @@ class OpenAICompatibleProvider(LLMProvider):
                 if state == "unknown":
                     return await self._probe_structured_reasoning_payload(kwargs)
                 kwargs = self._set_structured_payload(kwargs, state == "accepted")
-            return await self._client.chat.completions.create(**kwargs)
+            return await self._create_chat_completion(**kwargs)
 
         try:
-            return await self._client.chat.completions.create(**kwargs)
+            return await self._create_chat_completion(**kwargs)
         except Exception as error:
             if "extra_body" not in kwargs or not self._is_payload_rejection(error):
                 raise
@@ -407,7 +407,7 @@ class OpenAICompatibleProvider(LLMProvider):
 
     async def _probe_structured_reasoning_payload(self, kwargs: dict[str, Any]) -> Any:
         try:
-            response = await self._client.chat.completions.create(**kwargs)
+            response = await self._create_chat_completion(**kwargs)
         except Exception as error:
             if not self._is_payload_rejection(error):
                 raise
@@ -418,7 +418,7 @@ class OpenAICompatibleProvider(LLMProvider):
 
     async def _replay_without_payload(self, kwargs: dict[str, Any]) -> Any:
         """Retry an unflagged request and record the capability rejection."""
-        response = await self._client.chat.completions.create(
+        response = await self._create_chat_completion(
             **self._set_structured_payload(kwargs, False)
         )
         self._set_structured_reasoning_capability("rejected")
