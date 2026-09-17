@@ -228,6 +228,93 @@ def test_cache_rejects_wrong_typed_or_versioned_entries_and_keeps_valid_siblings
     assert store.get("openrouter", "valid") == "rejected"
 
 
+def test_capability_cache_isolates_same_model_across_providers(
+    overridden_cache_path: Path,
+) -> None:
+    """One model name under two providers keeps independent decisions."""
+    store = capability_cache.LLMCapabilityStore()
+
+    store.set("openrouter", "shared-model", "accepted")
+    store.set("other", "shared-model", "rejected")
+
+    assert store.get("openrouter", "shared-model") == "accepted"
+    assert store.get("other", "shared-model") == "rejected"
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        pytest.param(
+            {"accepted": True, "ts": time.time()},
+            id="missing-format-version",
+        ),
+        pytest.param(
+            {"accepted": True, "ts": time.time(), "format_version": None},
+            id="null-format-version",
+        ),
+        pytest.param(
+            {"accepted": True, "ts": time.time(), "format_version": "1"},
+            id="string-format-version",
+        ),
+    ],
+)
+def test_capability_cache_rejects_unusable_format_versions(
+    overridden_cache_path: Path,
+    entry: dict[str, object],
+) -> None:
+    """Entries without an integer format version never supply a decision."""
+    overridden_cache_path.parent.mkdir(parents=True)
+    overridden_cache_path.write_text(json.dumps({KEY: entry}), encoding="utf-8")
+
+    assert (
+        capability_cache.LLMCapabilityStore().get(
+            "openrouter", "poolside/laguna-xs-2.1"
+        )
+        == "unknown"
+    )
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        pytest.param(
+            {"ts": time.time(), "format_version": 1},
+            id="missing-accepted",
+        ),
+        pytest.param(
+            {"accepted": None, "ts": time.time(), "format_version": 1},
+            id="null-accepted",
+        ),
+        pytest.param(
+            {"accepted": "true", "ts": time.time(), "format_version": 1},
+            id="string-accepted",
+        ),
+        pytest.param(
+            {"accepted": True, "format_version": 1},
+            id="missing-ts",
+        ),
+        pytest.param(
+            {"accepted": True, "ts": None, "format_version": 1},
+            id="null-ts",
+        ),
+    ],
+)
+def test_capability_cache_rejects_missing_or_null_required_fields(
+    overridden_cache_path: Path,
+    entry: dict[str, object],
+) -> None:
+    """Missing or non-conforming required fields read as unknown without raising."""
+    overridden_cache_path.parent.mkdir(parents=True)
+    overridden_cache_path.write_text(json.dumps({KEY: entry}), encoding="utf-8")
+
+    assert (
+        capability_cache.LLMCapabilityStore().get(
+            "openrouter", "poolside/laguna-xs-2.1"
+        )
+        == "unknown"
+    )
+
+
 @pytest.mark.parametrize("accepted", [True, False], ids=["accepted", "rejected"])
 @pytest.mark.parametrize(
     ("seconds_inside_boundary", "expected"),
