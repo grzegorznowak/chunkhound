@@ -403,11 +403,7 @@ class OpenAICompatibleProvider(LLMProvider):
         except Exception as error:
             if "extra_body" not in kwargs or not self._is_payload_rejection(error):
                 raise
-            response = await self._client.chat.completions.create(
-                **self._set_structured_payload(kwargs, False)
-            )
-            self._set_structured_reasoning_capability("rejected")
-            return response
+            return await self._replay_without_payload(kwargs)
 
     async def _probe_structured_reasoning_payload(self, kwargs: dict[str, Any]) -> Any:
         try:
@@ -415,13 +411,17 @@ class OpenAICompatibleProvider(LLMProvider):
         except Exception as error:
             if not self._is_payload_rejection(error):
                 raise
-            response = await self._client.chat.completions.create(
-                **self._set_structured_payload(kwargs, False)
-            )
-            self._set_structured_reasoning_capability("rejected")
-            return response
+            return await self._replay_without_payload(kwargs)
 
         self._set_structured_reasoning_capability("accepted")
+        return response
+
+    async def _replay_without_payload(self, kwargs: dict[str, Any]) -> Any:
+        """Retry an unflagged request and record the capability rejection."""
+        response = await self._client.chat.completions.create(
+            **self._set_structured_payload(kwargs, False)
+        )
+        self._set_structured_reasoning_capability("rejected")
         return response
 
     def _set_structured_payload(
