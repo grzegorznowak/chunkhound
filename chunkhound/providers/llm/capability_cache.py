@@ -65,6 +65,25 @@ def _locked_cache_file(cache_path: Path) -> Generator[None, None, None]:
             _release_cache_lock(handle)
 
 
+def _is_live_entry(entry: object) -> bool:
+    """Return whether a persisted entry is well-formed, current, and unexpired."""
+    if not isinstance(entry, dict):
+        return False
+
+    accepted = entry.get("accepted")
+    timestamp = entry.get("ts")
+    format_version = entry.get("format_version")
+    return not (
+        isinstance(format_version, bool)
+        or not isinstance(format_version, int)
+        or format_version != _FORMAT_VERSION
+        or not isinstance(accepted, bool)
+        or isinstance(timestamp, bool)
+        or not isinstance(timestamp, (int, float))
+        or time.time() - timestamp >= _TTL_SECONDS
+    )
+
+
 def _default_cache_path() -> Path:
     """Return the user-scoped capability cache file path."""
     override = os.environ.get(_CACHE_ENV)
@@ -96,23 +115,9 @@ class LLMCapabilityStore:
 
     def get(self, provider: str, model: str) -> CapabilityState:
         entry = self._read().get(f"{provider}:{model}")
-        if not isinstance(entry, dict):
+        if not _is_live_entry(entry):
             return "unknown"
-
-        accepted = entry.get("accepted")
-        timestamp = entry.get("ts")
-        format_version = entry.get("format_version")
-        if (
-            isinstance(format_version, bool)
-            or not isinstance(format_version, int)
-            or format_version != _FORMAT_VERSION
-            or not isinstance(accepted, bool)
-            or isinstance(timestamp, bool)
-            or not isinstance(timestamp, (int, float))
-            or time.time() - timestamp >= _TTL_SECONDS
-        ):
-            return "unknown"
-        return "accepted" if accepted else "rejected"
+        return "accepted" if entry["accepted"] else "rejected"
 
     def set(self, provider: str, model: str, state: CapabilityState) -> None:
         if state not in {"accepted", "rejected"}:
@@ -120,7 +125,11 @@ class LLMCapabilityStore:
 
         try:
             with _locked_cache_file(self._path):
-                payload = self._read()
+                payload = {
+                    key: entry
+                    for key, entry in self._read().items()
+                    if _is_live_entry(entry)
+                }
                 payload[f"{provider}:{model}"] = {
                     "accepted": state == "accepted",
                     "ts": time.time(),

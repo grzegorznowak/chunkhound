@@ -468,3 +468,41 @@ def test_capability_cache_tolerates_unreadable_cache_files(
     payload = json.loads(overridden_cache_path.read_text(encoding="utf-8"))
     assert set(payload) == {"openrouter:model"}
     assert store.get("openrouter", "model") == "accepted"
+
+
+def test_capability_cache_set_prunes_malformed_and_expired_entries(
+    overridden_cache_path: Path,
+) -> None:
+    """A write drops entries that can no longer supply a decision."""
+    now = time.time()
+    overridden_cache_path.parent.mkdir(parents=True)
+    overridden_cache_path.write_text(
+        json.dumps(
+            {
+                "openrouter:expired": {
+                    "accepted": True,
+                    "ts": now - (30 * 24 * 60 * 60) - 1,
+                    "format_version": 1,
+                },
+                "openrouter:old-version": {
+                    "accepted": True,
+                    "ts": now,
+                    "format_version": 0,
+                },
+                "openrouter:valid": {
+                    "accepted": False,
+                    "ts": now,
+                    "format_version": 1,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    store = capability_cache.LLMCapabilityStore()
+
+    store.set("openrouter", "new", "accepted")
+
+    payload = json.loads(overridden_cache_path.read_text(encoding="utf-8"))
+    assert set(payload) == {"openrouter:valid", "openrouter:new"}
+    assert store.get("openrouter", "valid") == "rejected"
+    assert store.get("openrouter", "new") == "accepted"
