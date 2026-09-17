@@ -256,6 +256,10 @@ def test_capability_cache_isolates_same_model_across_providers(
             {"accepted": True, "ts": time.time(), "format_version": "1"},
             id="string-format-version",
         ),
+        pytest.param(
+            {"accepted": True, "ts": time.time(), "format_version": 1.0},
+            id="float-format-version",
+        ),
     ],
 )
 def test_capability_cache_rejects_unusable_format_versions(
@@ -473,7 +477,7 @@ def test_capability_cache_tolerates_unreadable_cache_files(
 def test_capability_cache_set_prunes_malformed_and_expired_entries(
     overridden_cache_path: Path,
 ) -> None:
-    """A write drops entries that can no longer supply a decision."""
+    """A write drops dead entries but preserves data from newer formats."""
     now = time.time()
     overridden_cache_path.parent.mkdir(parents=True)
     overridden_cache_path.write_text(
@@ -489,6 +493,12 @@ def test_capability_cache_set_prunes_malformed_and_expired_entries(
                     "ts": now,
                     "format_version": 0,
                 },
+                "openrouter:junk": "not-a-dict",
+                "openrouter:future-version": {
+                    "accepted": True,
+                    "ts": now,
+                    "format_version": 2,
+                },
                 "openrouter:valid": {
                     "accepted": False,
                     "ts": now,
@@ -503,6 +513,45 @@ def test_capability_cache_set_prunes_malformed_and_expired_entries(
     store.set("openrouter", "new", "accepted")
 
     payload = json.loads(overridden_cache_path.read_text(encoding="utf-8"))
-    assert set(payload) == {"openrouter:valid", "openrouter:new"}
+    assert set(payload) == {
+        "openrouter:future-version",
+        "openrouter:valid",
+        "openrouter:new",
+    }
     assert store.get("openrouter", "valid") == "rejected"
     assert store.get("openrouter", "new") == "accepted"
+    assert store.get("openrouter", "future-version") == "unknown"
+
+
+def test_capability_cache_tolerates_overflowing_sibling_timestamps(
+    overridden_cache_path: Path,
+) -> None:
+    """An astronomically large sibling ts never breaks reads or writes."""
+    now = time.time()
+    overridden_cache_path.parent.mkdir(parents=True)
+    overridden_cache_path.write_text(
+        json.dumps(
+            {
+                "openrouter:huge": {
+                    "accepted": True,
+                    "ts": 10**1000,
+                    "format_version": 1,
+                },
+                "openrouter:valid": {
+                    "accepted": True,
+                    "ts": now,
+                    "format_version": 1,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    store = capability_cache.LLMCapabilityStore()
+
+    assert store.get("openrouter", "huge") == "unknown"
+
+    store.set("openrouter", "new", "accepted")
+
+    payload = json.loads(overridden_cache_path.read_text(encoding="utf-8"))
+    assert set(payload) == {"openrouter:valid", "openrouter:new"}
+    assert store.get("openrouter", "valid") == "accepted"

@@ -11,7 +11,7 @@ import time
 from collections.abc import Generator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, TypeGuard
 
 if os.name == "nt":
     import msvcrt
@@ -65,7 +65,7 @@ def _locked_cache_file(cache_path: Path) -> Generator[None, None, None]:
             _release_cache_lock(handle)
 
 
-def _is_live_entry(entry: object) -> bool:
+def _is_live_entry(entry: object) -> TypeGuard[dict[str, Any]]:
     """Return whether a persisted entry is well-formed, current, and unexpired."""
     if not isinstance(entry, dict):
         return False
@@ -73,14 +73,32 @@ def _is_live_entry(entry: object) -> bool:
     accepted = entry.get("accepted")
     timestamp = entry.get("ts")
     format_version = entry.get("format_version")
-    return not (
+    if (
         isinstance(format_version, bool)
         or not isinstance(format_version, int)
         or format_version != _FORMAT_VERSION
         or not isinstance(accepted, bool)
         or isinstance(timestamp, bool)
         or not isinstance(timestamp, (int, float))
-        or time.time() - timestamp >= _TTL_SECONDS
+    ):
+        return False
+
+    try:
+        return not (time.time() - timestamp >= _TTL_SECONDS)
+    except OverflowError:
+        # Timestamps too extreme for float arithmetic cannot be trusted.
+        return False
+
+
+def _is_newer_format_entry(entry: object) -> bool:
+    """Return whether an entry was persisted by a newer cache format."""
+    if not isinstance(entry, dict):
+        return False
+    format_version = entry.get("format_version")
+    return (
+        isinstance(format_version, int)
+        and not isinstance(format_version, bool)
+        and format_version > _FORMAT_VERSION
     )
 
 
@@ -128,7 +146,7 @@ class LLMCapabilityStore:
                 payload = {
                     key: entry
                     for key, entry in self._read().items()
-                    if _is_live_entry(entry)
+                    if _is_live_entry(entry) or _is_newer_format_entry(entry)
                 }
                 payload[f"{provider}:{model}"] = {
                     "accepted": state == "accepted",
