@@ -178,12 +178,14 @@ async def test_cached_rejected_first_call_never_sends_payload(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("status_code", [400, 422])
 async def test_cached_accepted_rejection_replays_and_flips_state(
     mock_completion: AsyncMock,
+    status_code: int,
 ) -> None:
-    """A contradictory 400 immediately replaces stale accepted state."""
+    """A contradictory 400/422 immediately replaces stale accepted state."""
     store = FakeCapabilityStore("accepted")
-    mock_completion.side_effect = [_status_error(400), _response()]
+    mock_completion.side_effect = [_status_error(status_code), _response()]
     provider = _provider(store)
 
     assert await provider.complete_structured("changed", SCHEMA) == {"answer": "42"}
