@@ -264,7 +264,10 @@ async def test_structured_call_without_payload_keeps_existing_shape(
 
 
 @pytest.mark.asyncio
-async def test_structured_reasoning_payload_reaches_wire_body() -> None:
+@pytest.mark.parametrize("supports_structured_outputs", [False, True])
+async def test_structured_reasoning_payload_reaches_wire_body(
+    supports_structured_outputs: bool,
+) -> None:
     """The SDK must serialize extra_body as OpenRouter's top-level reasoning key."""
     marker = "structured-reasoning-wire-marker"
     script = ChatCompletionScript(
@@ -275,14 +278,21 @@ async def test_structured_reasoning_payload_reaches_wire_body() -> None:
     store = FakeCapabilityStore("accepted")
 
     with OpenAICompatibleTestServer([script]) as server:
-        async with _wire_provider(server, store) as provider:
+        async with _wire_provider(
+            server,
+            store,
+            supports_structured_outputs=supports_structured_outputs,
+        ) as provider:
             assert await provider.complete_structured(marker, SCHEMA) == {
                 "answer": "42"
             }
 
+            assert len(server.requests) == 1
             body = server.requests[0]["json"]
             assert body["reasoning"] == {"enabled": False}
             assert "extra_body" not in body
+            if supports_structured_outputs:
+                assert body["response_format"]["type"] == "json_schema"
             server.assert_all_scripts_consumed()
 
 
@@ -548,6 +558,8 @@ def _status_error(status_code: int) -> APIStatusError:
 async def _wire_provider(
     server: OpenAICompatibleTestServer,
     capability_store: FakeCapabilityStore,
+    *,
+    supports_structured_outputs: bool = False,
 ) -> AsyncIterator[OpenAICompatibleProvider]:
     provider = _provider(
         capability_store,
@@ -556,6 +568,7 @@ async def _wire_provider(
         default_base_url=None,
         model="loopback-test-model",
         max_retries=0,
+        supports_structured_outputs=supports_structured_outputs,
     )
     try:
         yield provider
