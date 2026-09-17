@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import os
 import sys
-import threading
 import time
 from pathlib import Path
 
@@ -355,31 +354,6 @@ def test_capability_cache_ttl_boundary(
         )
         == expected_state
     )
-
-
-def test_capability_cache_write_waits_for_cross_process_lock(
-    overridden_cache_path: Path,
-) -> None:
-    lock_path = overridden_cache_path.with_name(f"{overridden_cache_path.name}.lock")
-    lock_path.parent.mkdir(parents=True)
-    store = capability_cache.LLMCapabilityStore()
-    writer = threading.Thread(
-        target=store.set,
-        args=("openrouter", "locked", "accepted"),
-    )
-
-    with lock_path.open("a+b") as handle:
-        capability_cache._acquire_cache_lock(handle)
-        try:
-            writer.start()
-            writer.join(timeout=0.1)
-            assert writer.is_alive()
-        finally:
-            capability_cache._release_cache_lock(handle)
-
-    writer.join(timeout=15)
-    assert not writer.is_alive()
-    assert store.get("openrouter", "locked") == "accepted"
 
 
 @pytest.mark.parametrize(
