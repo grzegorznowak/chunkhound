@@ -11,6 +11,7 @@ Subclass overrides of _get_provider_name() / _get_default_base_url() are optiona
 import asyncio
 import copy
 import json
+import time
 from collections.abc import Mapping
 from typing import Any
 
@@ -31,6 +32,7 @@ from chunkhound.interfaces.llm_provider import (
 from chunkhound.providers.llm.capability_cache import (
     CapabilityState,
     LLMCapabilityStore,
+    state_ttl_seconds,
 )
 from chunkhound.utils.json_extraction import (
     build_schema_system_instruction,
@@ -132,9 +134,12 @@ class OpenAICompatibleProvider(LLMProvider):
             structured_reasoning_disable_extra_body
         )
         self._capability_store = capability_store or LLMCapabilityStore()
-        self._structured_reasoning_capability: CapabilityState = (
-            self._capability_store.get(self.name, self._model)
-        )
+        (
+            capability,
+            deadline,
+        ) = self._capability_store.get_with_expiry(self.name, self._model)
+        self._structured_reasoning_capability: CapabilityState = capability
+        self._structured_reasoning_capability_deadline: float | None = deadline
         self._structured_reasoning_capability_lock: asyncio.Lock | None = None
         self._structured_reasoning_capability_loop: asyncio.AbstractEventLoop | None = (
             None
@@ -217,6 +222,7 @@ class OpenAICompatibleProvider(LLMProvider):
         response_format: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Build chat-completions kwargs for subclasses to extend safely."""
+        self._expire_capability_if_due()
         max_tokens_param = self._get_max_completion_tokens_param_name()
         kwargs: dict[str, Any] = {
             "model": self._model,
@@ -386,12 +392,15 @@ class OpenAICompatibleProvider(LLMProvider):
 
     async def _create_structured_completion(self, kwargs: dict[str, Any]) -> Any:
         """Create a structured completion with sticky payload negotiation."""
+        self._expire_capability_if_due()
         if self._structured_reasoning_disable_extra_body is None:
             return await self._create_chat_completion(**kwargs)
 
         state: CapabilityState = self._structured_reasoning_capability
+        kwargs = self._set_structured_payload(kwargs, state != "rejected")
         if state == "unknown":
             async with self._capability_lock():
+                self._expire_capability_if_due()
                 state = self._structured_reasoning_capability
                 if state == "unknown":
                     return await self._probe_structured_reasoning_payload(kwargs)
@@ -444,17 +453,34 @@ class OpenAICompatibleProvider(LLMProvider):
         response = getattr(error, "response", None)
         return getattr(response, "status_code", None) in {400, 422}
 
+    def _expire_capability_if_due(self) -> None:
+        """Reset expired in-memory capability decisions without writing."""
+        if (
+            self._structured_reasoning_disable_extra_body is None
+            or self._structured_reasoning_capability == "unknown"
+        ):
+            return
+        deadline = self._structured_reasoning_capability_deadline
+        if deadline is None or time.time() < deadline:
+            return
+        self._structured_reasoning_capability = "unknown"
+        self._structured_reasoning_capability_deadline = None
+
     def _set_structured_reasoning_capability(self, state: CapabilityState) -> None:
         if self._structured_reasoning_capability == state:
             return
         self._structured_reasoning_capability = state
         try:
-            self._capability_store.set(self.name, self._model, state)
+            deadline = self._capability_store.set(self.name, self._model, state)
+            if deadline is None:
+                deadline = time.time() + state_ttl_seconds(state)
         except OSError as error:
             logger.warning(
                 f"Failed to persist {self.name} structured reasoning "
                 f"capability: {error}"
             )
+            deadline = time.time() + state_ttl_seconds(state)
+        self._structured_reasoning_capability_deadline = deadline
 
     def _capability_lock(self) -> asyncio.Lock:
         """Return a capability lock bound to the current event loop."""

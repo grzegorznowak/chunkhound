@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
@@ -13,6 +14,7 @@ import httpx
 import pytest
 from openai import APIStatusError, APITimeoutError
 
+from chunkhound.providers.llm import capability_cache
 from chunkhound.providers.llm.capability_cache import LLMCapabilityStore
 from chunkhound.providers.llm.openai_compatible_provider import OpenAICompatibleProvider
 from tests.fixtures.openai_compatible_server import (
@@ -32,18 +34,34 @@ SCHEMA = {
 class FakeCapabilityStore:
     """Small persistence-boundary fake; provider memory remains real."""
 
-    def __init__(self, state: str = "unknown") -> None:
+    def __init__(
+        self,
+        state: str = "unknown",
+        deadline: float | None = None,
+        fail_set: bool = False,
+    ) -> None:
         self.state = state
+        self.deadline = deadline
+        self.fail_set = fail_set
         self.get_calls: list[tuple[str, str]] = []
         self.set_calls: list[tuple[str, str, str]] = []
 
-    def get(self, provider: str, model: str) -> str:
+    def get_with_expiry(self, provider: str, model: str) -> tuple[str, float | None]:
         self.get_calls.append((provider, model))
-        return self.state
+        if self.state == "unknown":
+            return "unknown", None
+        return self.state, self.deadline
 
-    def set(self, provider: str, model: str, state: str) -> None:
+    def get(self, provider: str, model: str) -> str:
+        return self.get_with_expiry(provider, model)[0]
+
+    def set(self, provider: str, model: str, state: str) -> float:
+        if self.fail_set:
+            raise OSError("boom")
         self.set_calls.append((provider, model, state))
         self.state = state
+        self.deadline = time.time() + capability_cache.state_ttl_seconds(state)
+        return self.deadline
 
 
 @pytest.fixture
@@ -178,6 +196,66 @@ async def test_cached_rejected_first_call_never_sends_payload(
 
 
 @pytest.mark.asyncio
+async def test_live_cached_rejected_capability_skips_probe(
+    mock_completion: AsyncMock,
+) -> None:
+    """A future rejected lease omits the payload without persisting a probe."""
+    store = FakeCapabilityStore("rejected", deadline=time.time() + 3600)
+    mock_completion.return_value = _response()
+    provider = _provider(store)
+
+    assert await provider.complete_structured("cached", SCHEMA) == {"answer": "42"}
+
+    assert mock_completion.call_count == 1
+    assert "extra_body" not in mock_completion.call_args.kwargs
+    assert store.set_calls == []
+
+
+@pytest.mark.asyncio
+async def test_expired_cached_rejected_capability_reprobes(
+    mock_completion: AsyncMock,
+) -> None:
+    """An expired rejected lease becomes unknown and probes again."""
+    store = FakeCapabilityStore("rejected", deadline=time.time() - 1)
+    mock_completion.return_value = _response()
+    provider = _provider(store)
+
+    assert await provider.complete_structured("expired", SCHEMA) == {"answer": "42"}
+
+    assert mock_completion.call_args.kwargs["extra_body"] == PAYLOAD
+    assert store.state == "accepted"
+    assert store.set_calls == [("openrouter", "poolside/laguna-xs-2.1", "accepted")]
+
+
+def test_construction_preserves_cached_capability_deadline(
+    mock_completion: AsyncMock,
+) -> None:
+    """Loading a capability retains its persisted deadline without a rewrite."""
+    deadline = time.time() + 3600
+    store = FakeCapabilityStore("rejected", deadline=deadline)
+    provider = _provider(store)
+
+    assert provider._structured_reasoning_capability_deadline == deadline
+    assert store.set_calls == []
+
+
+@pytest.mark.asyncio
+async def test_running_provider_reprobes_after_capability_deadline(
+    mock_completion: AsyncMock,
+) -> None:
+    """A provider expires its in-memory rejection instead of retaining it forever."""
+    store = FakeCapabilityStore("rejected", deadline=time.time() + 3600)
+    mock_completion.return_value = _response()
+    provider = _provider(store)
+    provider._structured_reasoning_capability_deadline = time.time() - 1
+
+    assert await provider.complete_structured("expired", SCHEMA) == {"answer": "42"}
+
+    assert mock_completion.call_args.kwargs["extra_body"] == PAYLOAD
+    assert store.set_calls == [("openrouter", "poolside/laguna-xs-2.1", "accepted")]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("status_code", [400, 422])
 async def test_cached_accepted_rejection_replays_and_flips_state(
     mock_completion: AsyncMock,
@@ -231,6 +309,39 @@ async def test_concurrent_unknown_calls_single_flight_the_probe(
     assert len(calls) == 4
     assert sum("extra_body" in call.kwargs for call in calls) == 1
     assert store.set_calls == [("openrouter", "poolside/laguna-xs-2.1", "rejected")]
+
+
+@pytest.mark.asyncio
+async def test_concurrent_expired_rejection_single_flights_one_probe(
+    mock_completion: AsyncMock,
+) -> None:
+    """Concurrent expired leases share one rejected probe before unflagged sends."""
+    store = FakeCapabilityStore("rejected", deadline=time.time() - 1)
+    probe_started = asyncio.Event()
+    release_probe = asyncio.Event()
+
+    async def complete(**kwargs: Any) -> SimpleNamespace:
+        if "extra_body" in kwargs:
+            probe_started.set()
+            await release_probe.wait()
+            raise _status_error(400)
+        return _response()
+
+    mock_completion.side_effect = complete
+    provider = _provider(store)
+    calls = [
+        asyncio.create_task(provider.complete_structured(prompt, SCHEMA))
+        for prompt in ("first", "second", "third")
+    ]
+    await asyncio.wait_for(probe_started.wait(), timeout=1)
+    release_probe.set()
+
+    assert await asyncio.gather(*calls) == [{"answer": "42"}] * 3
+    assert (
+        sum("extra_body" in call.kwargs for call in mock_completion.call_args_list)
+        == 1
+    )
+    assert store.state == "rejected"
 
 
 @pytest.mark.asyncio
@@ -568,6 +679,22 @@ def test_capability_lock_rebinds_across_event_loops(mock_completion: AsyncMock) 
         asyncio.run(provider.complete_structured("first", SCHEMA))
     second = asyncio.run(provider.complete_structured("second", SCHEMA))
     assert second == {"answer": "42"}
+
+
+@pytest.mark.asyncio
+async def test_failed_persistence_keeps_finite_in_memory_capability_lease(
+    mock_completion: AsyncMock,
+) -> None:
+    """A successful probe remains sticky in memory when its write fails."""
+    store = FakeCapabilityStore(fail_set=True)
+    mock_completion.return_value = _response()
+    provider = _provider(store)
+
+    assert await provider.complete_structured("probe", SCHEMA) == {"answer": "42"}
+
+    assert provider._structured_reasoning_capability == "accepted"
+    assert provider._structured_reasoning_capability_deadline is not None
+    assert provider._structured_reasoning_capability_deadline > time.time()
 
 
 def test_successful_structured_call_survives_cache_write_failure(

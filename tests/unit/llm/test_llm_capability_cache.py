@@ -333,13 +333,16 @@ def test_capability_cache_ttl_boundary(
 ) -> None:
     fixed = 2_000_000_000.0
     monkeypatch.setattr(capability_cache.time, "time", lambda: fixed)
+    state = "accepted" if accepted else "rejected"
     overridden_cache_path.parent.mkdir(parents=True)
     overridden_cache_path.write_text(
         json.dumps(
             {
                 KEY: {
                     "accepted": accepted,
-                    "ts": fixed - (30 * 24 * 60 * 60) + seconds_inside_boundary,
+                    "ts": fixed
+                    - capability_cache.state_ttl_seconds(state)
+                    + seconds_inside_boundary,
                     "format_version": 1,
                 }
             }
@@ -347,7 +350,7 @@ def test_capability_cache_ttl_boundary(
         encoding="utf-8",
     )
 
-    expected_state = expected or ("accepted" if accepted else "rejected")
+    expected_state = expected or state
     assert (
         capability_cache.LLMCapabilityStore().get(
             "openrouter", "poolside/laguna-xs-2.1"
@@ -393,34 +396,36 @@ def test_capability_cache_missing_or_corrupt_file_reads_unknown(
     assert capability_cache.LLMCapabilityStore().get("openrouter", "model") == "unknown"
 
 
-@pytest.mark.parametrize("accepted", [True, False], ids=["accepted", "rejected"])
-def test_capability_cache_expires_both_states_after_thirty_days(
+def test_capability_cache_expires_rejected_after_one_day_and_accepted_after_30_days(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
-    accepted: bool,
 ) -> None:
-    """Accepted and rejected decisions share the fixed 30-day TTL."""
+    """Rejected leases expire after one day while accepted leases last 30 days."""
+    fixed = 2_000_000_000.0
+    monkeypatch.setattr(capability_cache.time, "time", lambda: fixed)
     cache_path = tmp_path / "capabilities.json"
     monkeypatch.setenv(ENV_VAR, str(cache_path))
-    cache_path.write_text(
-        json.dumps(
-            {
-                KEY: {
-                    "accepted": accepted,
-                    "ts": time.time() - (30 * 24 * 60 * 60) - 1,
-                    "format_version": 1,
-                }
-            }
-        ),
-        encoding="utf-8",
-    )
 
-    assert (
-        capability_cache.LLMCapabilityStore().get(
+    def state_for(accepted: bool, age: float) -> str:
+        cache_path.write_text(
+            json.dumps(
+                {
+                    KEY: {
+                        "accepted": accepted,
+                        "ts": fixed - age,
+                        "format_version": 1,
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        return capability_cache.LLMCapabilityStore().get(
             "openrouter", "poolside/laguna-xs-2.1"
         )
-        == "unknown"
-    )
+
+    assert state_for(False, 24 * 60 * 60 + 1) == "unknown"
+    assert state_for(False, 23 * 60 * 60) == "rejected"
+    assert state_for(True, 30 * 24 * 60 * 60 + 1) == "unknown"
 
 
 @pytest.mark.parametrize(
@@ -451,8 +456,9 @@ def test_capability_cache_tolerates_unreadable_cache_files(
 def test_capability_cache_set_prunes_malformed_and_expired_entries(
     overridden_cache_path: Path,
 ) -> None:
-    """A write drops dead entries but preserves data from newer formats."""
+    """A write uses the decision's TTL while preserving newer formats."""
     now = time.time()
+    old_but_accepted = now - 2 * 24 * 60 * 60
     overridden_cache_path.parent.mkdir(parents=True)
     overridden_cache_path.write_text(
         json.dumps(
@@ -460,6 +466,16 @@ def test_capability_cache_set_prunes_malformed_and_expired_entries(
                 "openrouter:expired": {
                     "accepted": True,
                     "ts": now - (30 * 24 * 60 * 60) - 1,
+                    "format_version": 1,
+                },
+                "openrouter:expired-rejected": {
+                    "accepted": False,
+                    "ts": old_but_accepted,
+                    "format_version": 1,
+                },
+                "openrouter:old-accepted": {
+                    "accepted": True,
+                    "ts": old_but_accepted,
                     "format_version": 1,
                 },
                 "openrouter:old-version": {
@@ -488,13 +504,46 @@ def test_capability_cache_set_prunes_malformed_and_expired_entries(
 
     payload = json.loads(overridden_cache_path.read_text(encoding="utf-8"))
     assert set(payload) == {
+        "openrouter:old-accepted",
         "openrouter:future-version",
         "openrouter:valid",
         "openrouter:new",
     }
+    assert store.get("openrouter", "old-accepted") == "accepted"
     assert store.get("openrouter", "valid") == "rejected"
     assert store.get("openrouter", "new") == "accepted"
     assert store.get("openrouter", "future-version") == "unknown"
+
+
+@pytest.mark.parametrize("state", ["accepted", "rejected"])
+def test_capability_cache_set_returns_and_reads_persisted_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+    overridden_cache_path: Path,
+    state: str,
+) -> None:
+    """Writes and reads agree on each decision's persisted deadline."""
+    fixed = 2_000_000_000.0
+    monkeypatch.setattr(capability_cache.time, "time", lambda: fixed)
+    store = capability_cache.LLMCapabilityStore()
+
+    deadline = store.set("openrouter", "model", state)
+
+    assert deadline == fixed + capability_cache.state_ttl_seconds(state)
+    assert store.get_with_expiry("openrouter", "model") == (state, deadline)
+
+    overridden_cache_path.write_text(
+        json.dumps(
+            {
+                "openrouter:dead": {
+                    "accepted": state == "accepted",
+                    "ts": fixed - capability_cache.state_ttl_seconds(state),
+                    "format_version": 1,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert store.get_with_expiry("openrouter", "dead") == ("unknown", None)
 
 
 def test_capability_cache_tolerates_overflowing_sibling_timestamps(

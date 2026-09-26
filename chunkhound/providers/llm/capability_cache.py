@@ -13,14 +13,24 @@ from typing import Any, Literal, TypeGuard
 _CACHE_ENV = "CHUNKHOUND_LLM_CAPABILITY_CACHE"
 _CACHE_FILENAME = "llm-capabilities.json"
 _FORMAT_VERSION = 1
-_TTL_SECONDS = 30 * 24 * 60 * 60
+_ACCEPTED_TTL_SECONDS = 30 * 24 * 60 * 60
+_REJECTED_TTL_SECONDS = 24 * 60 * 60
 CapabilityState = Literal["unknown", "accepted", "rejected"]
 
 
-def _is_live_entry(entry: object) -> TypeGuard[dict[str, Any]]:
-    """Return whether a persisted entry is well-formed, current, and unexpired."""
+def state_ttl_seconds(state: CapabilityState) -> float:
+    """Return the lease duration for a persisted capability decision."""
+    if state == "accepted":
+        return _ACCEPTED_TTL_SECONDS
+    if state == "rejected":
+        return _REJECTED_TTL_SECONDS
+    raise ValueError("Unknown capabilities do not have a lease")
+
+
+def _read_decision(entry: object) -> tuple[CapabilityState, float] | None:
+    """Return a live capability decision and its persisted deadline."""
     if not isinstance(entry, dict):
-        return False
+        return None
 
     accepted = entry.get("accepted")
     timestamp = entry.get("ts")
@@ -33,13 +43,21 @@ def _is_live_entry(entry: object) -> TypeGuard[dict[str, Any]]:
         or isinstance(timestamp, bool)
         or not isinstance(timestamp, (int, float))
     ):
-        return False
+        return None
 
+    ttl = _ACCEPTED_TTL_SECONDS if accepted else _REJECTED_TTL_SECONDS
     try:
-        return not (time.time() - timestamp >= _TTL_SECONDS)
+        if time.time() - timestamp >= ttl:
+            return None
+        return ("accepted" if accepted else "rejected", timestamp + ttl)
     except OverflowError:
         # Timestamps too extreme for float arithmetic cannot be trusted.
-        return False
+        return None
+
+
+def _is_live_entry(entry: object) -> TypeGuard[dict[str, Any]]:
+    """Return whether a persisted entry is well-formed, current, and unexpired."""
+    return _read_decision(entry) is not None
 
 
 def _is_newer_format_entry(entry: object) -> bool:
@@ -78,7 +96,7 @@ def _default_cache_path() -> Path:
 
 
 class LLMCapabilityStore:
-    """Store accepted or rejected provider/model capabilities for 30 days.
+    """Store provider/model capabilities with state-dependent leases.
 
     Persistence is best-effort and uncoordinated: concurrent writers race on
     a whole-file rewrite, so the last writer wins and a concurrently learned
@@ -89,16 +107,24 @@ class LLMCapabilityStore:
     def __init__(self) -> None:
         self._path = _default_cache_path()
 
-    def get(self, provider: str, model: str) -> CapabilityState:
-        entry = self._read().get(f"{provider}:{model}")
-        if not _is_live_entry(entry):
-            return "unknown"
-        return "accepted" if entry["accepted"] else "rejected"
+    def get_with_expiry(
+        self, provider: str, model: str
+    ) -> tuple[CapabilityState, float | None]:
+        """Return a live decision and its persisted deadline without writing."""
+        decision = _read_decision(self._read().get(f"{provider}:{model}"))
+        return decision if decision is not None else ("unknown", None)
 
-    def set(self, provider: str, model: str, state: CapabilityState) -> None:
+    def get(self, provider: str, model: str) -> CapabilityState:
+        """Return a live decision, or unknown when no live lease exists."""
+        return self.get_with_expiry(provider, model)[0]
+
+    def set(self, provider: str, model: str, state: CapabilityState) -> float:
+        """Persist a capability decision and return its deadline."""
         if state not in {"accepted", "rejected"}:
             raise ValueError("Capability state must be 'accepted' or 'rejected'")
 
+        timestamp = time.time()
+        deadline = timestamp + state_ttl_seconds(state)
         try:
             payload = {
                 key: entry
@@ -107,7 +133,7 @@ class LLMCapabilityStore:
             }
             payload[f"{provider}:{model}"] = {
                 "accepted": state == "accepted",
-                "ts": time.time(),
+                "ts": timestamp,
                 "format_version": _FORMAT_VERSION,
             }
             self._path.parent.mkdir(parents=True, exist_ok=True)
@@ -127,6 +153,7 @@ class LLMCapabilityStore:
                 self._path,
                 exc_info=True,
             )
+        return deadline
 
     def _read(self) -> dict[str, Any]:
         try:
