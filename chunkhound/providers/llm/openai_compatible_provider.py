@@ -140,6 +140,9 @@ class OpenAICompatibleProvider(LLMProvider):
         ) = self._capability_store.get_with_expiry(self.name, self._model)
         self._structured_reasoning_capability: CapabilityState = capability
         self._structured_reasoning_capability_deadline: float | None = deadline
+        self._structured_reasoning_empty_failures = 0
+        self._structured_reasoning_last_empty_ts: float | None = None
+        self._structured_reasoning_empty_warned = False
         self._structured_reasoning_capability_lock: asyncio.Lock | None = None
         self._structured_reasoning_capability_loop: asyncio.AbstractEventLoop | None = (
             None
@@ -493,6 +496,31 @@ class OpenAICompatibleProvider(LLMProvider):
             self._structured_reasoning_capability_loop = loop
         return self._structured_reasoning_capability_lock
 
+    def _record_empty_structured_content(self) -> None:
+        """Count an empty structured response only under a rejected capability."""
+        if self._structured_reasoning_capability != "rejected":
+            return
+        self._structured_reasoning_empty_failures += 1
+        self._structured_reasoning_last_empty_ts = time.time()
+        if not self._structured_reasoning_empty_warned:
+            self._structured_reasoning_empty_warned = True
+            logger.warning(
+                f"{self.name}:{self._model} returned empty structured content "
+                "while reasoning-disable is known-rejected; results may be incomplete."
+            )
+
+    def get_structured_reasoning_health(self) -> dict[str, Any] | None:
+        """Read-only health for empty structured failures under rejection."""
+        if self._structured_reasoning_empty_failures == 0:
+            return None
+        return {
+            "provider": self.name,
+            "model": self._model,
+            "capability": self._structured_reasoning_capability,
+            "empty_failures": self._structured_reasoning_empty_failures,
+            "last_empty_ts": self._structured_reasoning_last_empty_ts,
+        }
+
     async def complete_structured(
         self,
         prompt: str,
@@ -607,9 +635,15 @@ class OpenAICompatibleProvider(LLMProvider):
                     f"{self.name} structured completion returned empty content "
                     f"(finish_reason={finish_reason})"
                 )
+                self._record_empty_structured_content()
                 raise RuntimeError(
-                    f"LLM structured completion returned empty response "
-                    f"(finish_reason={finish_reason})"
+                    "LLM structured completion returned empty response "
+                    f"(finish_reason={finish_reason}, provider={self.name}, "
+                    f"model={self._model}, "
+                    f"capability={self._structured_reasoning_capability}). "
+                    "This provider/model may be unable to disable reasoning for "
+                    "structured calls, so structured output cannot be relied on. "
+                    "Consider configuring another llm.utility_model."
                 )
 
             # Parse JSON

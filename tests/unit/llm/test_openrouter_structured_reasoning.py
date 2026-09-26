@@ -8,7 +8,7 @@ from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import httpx
 import pytest
@@ -737,7 +737,7 @@ def _provider(
     return OpenAICompatibleProvider(**kwargs)
 
 
-def _response(content: str = '{"answer": "42"}') -> SimpleNamespace:
+def _response(content: str | None = '{"answer": "42"}') -> SimpleNamespace:
     return SimpleNamespace(
         choices=[
             SimpleNamespace(
@@ -783,3 +783,87 @@ async def _wire_provider(
         yield provider
     finally:
         await provider._client.close()
+
+
+@pytest.mark.asyncio
+async def test_rejected_empty_structured_content_records_health(
+    mock_completion: AsyncMock,
+) -> None:
+    mock_completion.return_value = _response(content=None)
+    provider = _provider(FakeCapabilityStore("rejected"))
+
+    with pytest.raises(RuntimeError, match="returned empty response"):
+        await provider.complete_structured("probe", SCHEMA)
+
+    health = provider.get_structured_reasoning_health()
+    assert health is not None
+    assert health["empty_failures"] == 1
+    assert health["capability"] == "rejected"
+    assert health["provider"] == "openrouter"
+    assert health["model"] == "poolside/laguna-xs-2.1"
+    assert health["last_empty_ts"] is not None
+
+
+@pytest.mark.asyncio
+async def test_accepted_empty_structured_content_does_not_record_health(
+    mock_completion: AsyncMock,
+) -> None:
+    mock_completion.return_value = _response(content=None)
+    provider = _provider(FakeCapabilityStore("accepted"))
+
+    with pytest.raises(RuntimeError, match="returned empty response"):
+        await provider.complete_structured("probe", SCHEMA)
+
+    assert provider.get_structured_reasoning_health() is None
+
+
+@pytest.mark.asyncio
+async def test_unknown_empty_structured_content_does_not_record_health(
+    mock_completion: AsyncMock,
+) -> None:
+    mock_completion.return_value = _response(content=None)
+    provider = _provider(FakeCapabilityStore("unknown"))
+
+    with pytest.raises(RuntimeError, match="returned empty response"):
+        await provider.complete_structured("probe", SCHEMA)
+
+    assert provider.get_structured_reasoning_health() is None
+
+
+@pytest.mark.asyncio
+async def test_rejected_empty_structured_error_names_model_and_remediation(
+    mock_completion: AsyncMock,
+) -> None:
+    mock_completion.return_value = _response(content=None)
+    provider = _provider(FakeCapabilityStore("rejected"))
+
+    with pytest.raises(RuntimeError) as error:
+        await provider.complete_structured("probe", SCHEMA)
+
+    for detail in (
+        "LLM structured completion returned empty response",
+        "provider=openrouter",
+        "model=poolside/laguna-xs-2.1",
+        "capability=rejected",
+        "llm.utility_model",
+    ):
+        assert detail in str(error.value)
+
+
+@pytest.mark.asyncio
+async def test_rejected_empty_structured_content_warns_once(
+    mock_completion: AsyncMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    warning = Mock()
+    monkeypatch.setattr(
+        "chunkhound.providers.llm.openai_compatible_provider.logger.warning", warning
+    )
+    mock_completion.return_value = _response(content=None)
+    provider = _provider(FakeCapabilityStore("rejected"))
+
+    for _ in range(2):
+        with pytest.raises(RuntimeError, match="returned empty response"):
+            await provider.complete_structured("probe", SCHEMA)
+
+    warning.assert_called_once()
+    assert provider.get_structured_reasoning_health()["empty_failures"] == 2
