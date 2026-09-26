@@ -396,8 +396,11 @@ class OpenAICompatibleProvider(LLMProvider):
                 if state == "unknown":
                     return await self._probe_structured_reasoning_payload(kwargs)
                 kwargs = self._set_structured_payload(kwargs, state == "accepted")
-            return await self._create_chat_completion(**kwargs)
+            return await self._send_flagged(kwargs)
 
+        return await self._send_flagged(kwargs)
+
+    async def _send_flagged(self, kwargs: dict[str, Any]) -> Any:
         try:
             return await self._create_chat_completion(**kwargs)
         except Exception as error:

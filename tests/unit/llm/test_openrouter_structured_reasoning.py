@@ -374,6 +374,88 @@ async def test_unknown_accepted_probe_releases_followers_before_network_io(
 
 
 @pytest.mark.asyncio
+async def test_probe_follower_rejection_replays_and_flips_capability(
+    mock_completion: AsyncMock,
+) -> None:
+    """A follower retries its own rejected flagged request after an accepted probe."""
+    store = FakeCapabilityStore()
+    leader_started = asyncio.Event()
+    release_leader = asyncio.Event()
+
+    async def complete(**kwargs: Any) -> SimpleNamespace:
+        prompt = kwargs["messages"][-1]["content"]
+        if prompt == "leader":
+            leader_started.set()
+            await release_leader.wait()
+            return _response()
+        if "extra_body" in kwargs:
+            raise _status_error(400)
+        return _response()
+
+    mock_completion.side_effect = complete
+    provider = _provider(store)
+
+    leader = asyncio.create_task(provider.complete_structured("leader", SCHEMA))
+    await asyncio.wait_for(leader_started.wait(), timeout=1)
+    follower = asyncio.create_task(provider.complete_structured("follower", SCHEMA))
+    await asyncio.sleep(0)
+    release_leader.set()
+
+    assert await asyncio.gather(leader, follower) == [{"answer": "42"}] * 2
+
+    follower_calls = [
+        call
+        for call in mock_completion.call_args_list
+        if call.kwargs["messages"][-1]["content"] == "follower"
+    ]
+    assert len(follower_calls) == 2
+    assert "extra_body" in follower_calls[0].kwargs
+    assert "extra_body" not in follower_calls[1].kwargs
+    assert store.state == "rejected"
+    assert store.set_calls == [
+        ("openrouter", "poolside/laguna-xs-2.1", "accepted"),
+        ("openrouter", "poolside/laguna-xs-2.1", "rejected"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_probe_follower_replay_failure_preserves_accepted_capability(
+    mock_completion: AsyncMock,
+) -> None:
+    """An unsuccessful follower replay leaves the leader's acceptance intact."""
+    store = FakeCapabilityStore()
+    leader_started = asyncio.Event()
+    release_leader = asyncio.Event()
+    replay_error = APITimeoutError(httpx.Request("POST", "https://example.test"))
+
+    async def complete(**kwargs: Any) -> SimpleNamespace:
+        prompt = kwargs["messages"][-1]["content"]
+        if prompt == "leader":
+            leader_started.set()
+            await release_leader.wait()
+            return _response()
+        if "extra_body" in kwargs:
+            raise _status_error(400)
+        raise replay_error
+
+    mock_completion.side_effect = complete
+    provider = _provider(store)
+
+    leader = asyncio.create_task(provider.complete_structured("leader", SCHEMA))
+    await asyncio.wait_for(leader_started.wait(), timeout=1)
+    follower = asyncio.create_task(provider.complete_structured("follower", SCHEMA))
+    await asyncio.sleep(0)
+    release_leader.set()
+
+    with pytest.raises(RuntimeError, match="structured completion failed") as raised:
+        await asyncio.gather(leader, follower)
+
+    assert raised.value.__cause__ is replay_error
+    assert store.state == "accepted"
+    assert store.set_calls == [("openrouter", "poolside/laguna-xs-2.1", "accepted")]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("initial_state", ["unknown", "accepted"])
 async def test_replay_failure_preserves_prior_state_and_surfaces_replay_error(
     mock_completion: AsyncMock, initial_state: str
