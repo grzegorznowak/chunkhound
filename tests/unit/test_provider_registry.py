@@ -116,7 +116,8 @@ def test_spec_has_valid_max_tokens_param_name(name, spec):
 )
 def test_spec_synthesis_concurrency_positive(name, spec):
     assert spec.synthesis_concurrency > 0, (
-        f"{name}: synthesis_concurrency must be positive, got {spec.synthesis_concurrency}"
+        f"{name}: synthesis_concurrency must be positive, "
+        f"got {spec.synthesis_concurrency}"
     )
 
 
@@ -236,6 +237,32 @@ def test_manager_forwards_reasoning_disable_payload_only_for_canonical_endpoint(
     assert custom.kwargs[field] is None
 
 
+def test_explicit_canonical_url_suppresses_reasoning_disable_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Supplying the canonical URL explicitly is still a custom base_url."""
+    from chunkhound import llm_manager
+
+    class RecordingProvider:
+        def __init__(self, **kwargs: Any):
+            self.kwargs = kwargs
+
+    monkeypatch.setattr(llm_manager, "OpenAICompatibleProvider", RecordingProvider)
+    manager = object.__new__(llm_manager.LLMManager)
+    canonical_url = OPENAI_COMPATIBLE_PROVIDERS["openrouter"].default_base_url
+
+    provider = manager._create_openai_compatible_provider(
+        "openrouter",
+        {
+            "model": "test-model",
+            "api_key": "sk-test",
+            "base_url": canonical_url,
+        },
+    )
+
+    assert provider.kwargs["structured_reasoning_disable_extra_body"] is None
+
+
 # ── Missing-model error ─────────────────────────────────────────────────────
 
 
@@ -299,7 +326,8 @@ def test_spec_default_supports_structured_outputs(name, spec):
         {"model": "test-model", "api_key": "sk-test"},
     )
     assert provider._supports_structured_outputs is spec.supports_structured_outputs, (
-        f"{name}: expected spec.supports_structured_outputs={spec.supports_structured_outputs}, "
+        f"{name}: expected spec.supports_structured_outputs="
+        f"{spec.supports_structured_outputs}, "
         f"got {provider._supports_structured_outputs}"
     )
 
