@@ -134,12 +134,13 @@ class OpenAICompatibleProvider(LLMProvider):
             structured_reasoning_disable_extra_body
         )
         self._capability_store = capability_store or LLMCapabilityStore()
-        (
-            capability,
-            deadline,
-        ) = self._capability_store.get_with_expiry(self.name, self._model)
-        self._structured_reasoning_capability: CapabilityState = capability
-        self._structured_reasoning_capability_deadline: float | None = deadline
+        self._structured_reasoning_capability: CapabilityState = "unknown"
+        self._structured_reasoning_capability_deadline: float | None = None
+        if self._structured_reasoning_disable_extra_body is not None:
+            (
+                self._structured_reasoning_capability,
+                self._structured_reasoning_capability_deadline,
+            ) = self._capability_store.get_with_expiry(self.name, self._model)
         self._structured_reasoning_empty_failures = 0
         self._structured_reasoning_last_empty_ts: float | None = None
         self._structured_reasoning_empty_warned = False

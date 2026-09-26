@@ -41,6 +41,8 @@ class OpenAICompatibleSpec:
             supports omitting its output-token cap
         docs_url: External API documentation URL
         auth_url: Authentication portal URL
+        structured_reasoning_disable_extra_body: Extra request body sent only
+            for structured calls when the canonical endpoint accepts it
     """
 
     name: str

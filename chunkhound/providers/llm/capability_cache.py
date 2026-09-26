@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import json
-import logging
+import math
 import os
 import sys
 import time
 from pathlib import Path
 from typing import Any, Literal, TypeGuard
+
+from loguru import logger
 
 _CACHE_ENV = "CHUNKHOUND_LLM_CAPABILITY_CACHE"
 _CACHE_FILENAME = "llm-capabilities.json"
@@ -47,6 +49,8 @@ def _read_decision(entry: object) -> tuple[CapabilityState, float] | None:
 
     ttl = _ACCEPTED_TTL_SECONDS if accepted else _REJECTED_TTL_SECONDS
     try:
+        if not math.isfinite(timestamp):
+            return None
         if time.time() - timestamp >= ttl:
             return None
         return ("accepted" if accepted else "rejected", timestamp + ttl)
@@ -148,10 +152,8 @@ class LLMCapabilityStore:
             finally:
                 temporary_path.unlink(missing_ok=True)
         except OSError:
-            logging.warning(
-                "Failed to persist LLM capability cache at %s",
-                self._path,
-                exc_info=True,
+            logger.opt(exception=True).warning(
+                "Failed to persist LLM capability cache at {}", self._path
             )
         return deadline
 

@@ -360,6 +360,38 @@ def test_capability_cache_ttl_boundary(
 
 
 @pytest.mark.parametrize(
+    "timestamp",
+    [float("inf"), float("nan")],
+    ids=["infinite", "not-a-number"],
+)
+def test_capability_cache_rejects_non_finite_timestamps(
+    overridden_cache_path: Path,
+    timestamp: float,
+) -> None:
+    """Non-finite timestamps never yield a live decision."""
+    overridden_cache_path.parent.mkdir(parents=True)
+    overridden_cache_path.write_text(
+        json.dumps(
+            {
+                KEY: {
+                    "accepted": True,
+                    "ts": timestamp,
+                    "format_version": 1,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert (
+        capability_cache.LLMCapabilityStore().get(
+            "openrouter", "poolside/laguna-xs-2.1"
+        )
+        == "unknown"
+    )
+
+
+@pytest.mark.parametrize(
     "payload",
     [[], None, "text", {}, {"openrouter:model": "not-a-dict"}],
 )

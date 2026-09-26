@@ -375,6 +375,22 @@ async def test_structured_call_without_payload_keeps_existing_shape(
 
 
 @pytest.mark.asyncio
+async def test_provider_without_payload_never_reads_capability_store(
+    mock_completion: AsyncMock,
+) -> None:
+    """A provider that cannot negotiate skips the capability store entirely."""
+    store = FakeCapabilityStore()
+    mock_completion.return_value = _response()
+    provider = _provider(store, structured_reasoning_disable_extra_body=None)
+
+    assert store.get_calls == []
+
+    assert await provider.complete_structured("unchanged", SCHEMA) == {"answer": "42"}
+
+    assert store.get_calls == []
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("supports_structured_outputs", [False, True])
 async def test_structured_reasoning_payload_reaches_wire_body(
     supports_structured_outputs: bool,
