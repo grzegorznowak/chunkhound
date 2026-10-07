@@ -1,5 +1,7 @@
 """User-visible cache locations of independent persisted features."""
 
+import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -7,6 +9,51 @@ import pytest
 
 from chunkhound.providers.llm.capability_cache import LLMCapabilityStore
 from chunkhound.watchman_runtime.loader import _default_runtime_cache_dir
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+
+# hatch_build.py imports the watchman loader in the isolated build environment to
+# compute wheel tags. That environment installs only build-system requirements, so
+# the loader's import graph must not reach runtime-only parser dependencies.
+_IMPORT_WITHOUT_PARSER_DEPS = """
+import importlib.abc
+import sys
+
+
+class _BlockTreeSitterLanguagePack(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == "tree_sitter_language_pack" or fullname.startswith(
+            "tree_sitter_language_pack."
+        ):
+            raise ModuleNotFoundError(f"No module named '{fullname}'")
+        return None
+
+
+sys.meta_path.insert(0, _BlockTreeSitterLanguagePack())
+from chunkhound.watchman_runtime.loader import resolve_packaged_watchman_runtime
+
+print("watchman-loader-import-ok")
+"""
+
+
+def test_watchman_loader_import_survives_missing_parser_dependencies() -> None:
+    """The build-time loader import must not pull in runtime-only parser deps."""
+    environment = dict(os.environ)
+    environment["PYTHONPATH"] = os.pathsep.join(
+        [str(_REPO_ROOT), environment.get("PYTHONPATH", "")]
+    ).rstrip(os.pathsep)
+
+    result = subprocess.run(
+        [sys.executable, "-c", _IMPORT_WITHOUT_PARSER_DEPS],
+        cwd=_REPO_ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "watchman-loader-import-ok" in result.stdout
 
 
 @pytest.mark.parametrize(
