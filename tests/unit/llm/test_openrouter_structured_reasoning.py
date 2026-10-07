@@ -130,6 +130,29 @@ async def test_unknown_rejection_replays_once_and_caches_rejected(
 
 
 @pytest.mark.asyncio
+async def test_rejected_replay_with_empty_content_still_records_http_rejection(
+    mock_completion: AsyncMock,
+) -> None:
+    """C03: rejection is an HTTP fact; a 2xx replay with null content still rejects."""
+    store = FakeCapabilityStore()
+    mock_completion.side_effect = [_status_error(400), _response(content=None)]
+    provider = _provider(store)
+
+    with pytest.raises(RuntimeError, match="returned empty response"):
+        await provider.complete_structured("probe", SCHEMA)
+
+    calls = mock_completion.call_args_list
+    assert len(calls) == 2
+    assert calls[0].kwargs["extra_body"] == PAYLOAD
+    assert "extra_body" not in calls[1].kwargs
+    assert store.state == "rejected"
+    assert store.set_calls == [("openrouter", "poolside/laguna-xs-2.1", "rejected")]
+    health = provider.get_structured_reasoning_health()
+    assert health is not None
+    assert health["empty_failures"] == 1
+
+
+@pytest.mark.asyncio
 async def test_replay_failure_does_not_poison_capability_state(
     mock_completion: AsyncMock,
 ) -> None:
@@ -501,8 +524,10 @@ async def test_unknown_accepted_probe_releases_followers_before_network_io(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("status_code", [400, 422])
 async def test_probe_follower_rejection_replays_and_flips_capability(
     mock_completion: AsyncMock,
+    status_code: int,
 ) -> None:
     """A follower retries its own rejected flagged request after an accepted probe."""
     store = FakeCapabilityStore()
@@ -516,7 +541,7 @@ async def test_probe_follower_rejection_replays_and_flips_capability(
             await release_leader.wait()
             return _response()
         if "extra_body" in kwargs:
-            raise _status_error(400)
+            raise _status_error(status_code)
         return _response()
 
     mock_completion.side_effect = complete

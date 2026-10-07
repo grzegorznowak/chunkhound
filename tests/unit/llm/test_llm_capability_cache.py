@@ -458,6 +458,7 @@ def test_capability_cache_expires_rejected_after_one_day_and_accepted_after_30_d
     assert state_for(False, 24 * 60 * 60 + 1) == "unknown"
     assert state_for(False, 23 * 60 * 60) == "rejected"
     assert state_for(True, 30 * 24 * 60 * 60 + 1) == "unknown"
+    assert state_for(True, 29 * 24 * 60 * 60) == "accepted"
 
 
 @pytest.mark.parametrize(
