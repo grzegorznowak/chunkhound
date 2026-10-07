@@ -639,14 +639,26 @@ class OpenAICompatibleProvider(LLMProvider):
                     f"(finish_reason={finish_reason})"
                 )
                 self._record_empty_structured_content()
-                raise RuntimeError(
+                diagnostic = (
                     "LLM structured completion returned empty response "
                     f"(finish_reason={finish_reason}, provider={self.name}, "
-                    f"model={self._model}, "
-                    f"capability={self._structured_reasoning_capability}). "
-                    "This provider/model may be unable to disable reasoning for "
-                    "structured calls, so structured output cannot be relied on. "
-                    "Consider configuring another llm.utility_model."
+                    f"model={self._model}"
+                )
+                if (
+                    self._structured_reasoning_disable_extra_body is not None
+                    and self._structured_reasoning_capability == "rejected"
+                ):
+                    raise RuntimeError(
+                        f"{diagnostic}, capability=rejected). "
+                        "This provider/model may be unable to disable reasoning for "
+                        "structured calls, so structured output cannot be relied on. "
+                        "Configure a different model for structured calls "
+                        "(`llm.utility_model` for utility stages, or the synthesis "
+                        "model for synthesis stages)."
+                    )
+                raise RuntimeError(
+                    f"{diagnostic}). This may indicate a content filter, API error, "
+                    "or model refusal."
                 )
 
             # Parse JSON
