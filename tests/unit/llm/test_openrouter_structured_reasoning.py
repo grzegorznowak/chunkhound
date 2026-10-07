@@ -847,6 +847,31 @@ async def test_unknown_empty_structured_content_does_not_record_health(
 
 
 @pytest.mark.asyncio
+async def test_non_negotiating_empty_structured_error_is_generic(
+    mock_completion: AsyncMock,
+) -> None:
+    mock_completion.return_value = _response(content=None)
+    provider = _provider(
+        FakeCapabilityStore(),
+        provider_name="ollama",
+        model="local-model",
+        default_base_url="http://localhost:11434/v1",
+        structured_reasoning_disable_extra_body=None,
+    )
+
+    with pytest.raises(RuntimeError) as error:
+        await provider.complete_structured("probe", SCHEMA)
+
+    message = str(error.value)
+    assert "returned empty response" in message
+    assert "finish_reason=stop" in message
+    assert "provider=ollama" in message
+    assert "model=local-model" in message
+    assert "reasoning" not in message
+    assert "utility_model" not in message
+
+
+@pytest.mark.asyncio
 async def test_rejected_empty_structured_error_names_model_and_remediation(
     mock_completion: AsyncMock,
 ) -> None:
