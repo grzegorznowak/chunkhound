@@ -17,6 +17,9 @@ from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 
+from chunkhound.core.utils.structured_reasoning_diagnostics import (
+    current_empty_failures,
+)
 from chunkhound.database_factory import DatabaseServices
 from chunkhound.embeddings import EmbeddingManager
 from chunkhound.interfaces.llm_provider import (
@@ -155,17 +158,26 @@ class PluggableResearchService(ProgressEmitterMixin):
         return get_health() if get_health is not None else None
 
     def _attach_structured_reasoning_note(
-        self, result: dict[str, Any], start_health: dict[str, Any] | None
+        self, result: dict[str, Any]
     ) -> dict[str, Any]:
-        end_health = self._structured_reasoning_health()
-        if not end_health:
+        failures = current_empty_failures.get()
+        if not failures:
             return result
-        start_count = int(start_health["empty_failures"]) if start_health else 0
+        get_utility = getattr(self._llm_manager, "get_utility_provider", None)
+        if get_utility is None:
+            return result
+        provider = get_utility()
+        failed_stages = failures.get(provider, 0)
+        if not failed_stages:
+            return result
+        health = self._structured_reasoning_health()
+        if not health:
+            return result
         return apply_structured_reasoning_degradation_note(
             result,
-            failed_stages=int(end_health["empty_failures"]) - start_count,
-            provider=str(end_health["provider"]),
-            model=str(end_health["model"]),
+            failed_stages=failed_stages,
+            provider=str(health["provider"]),
+            model=str(health["model"]),
         )
 
     async def deep_research(
@@ -187,8 +199,16 @@ class PluggableResearchService(ProgressEmitterMixin):
         Returns:
             Dictionary with answer and metadata
         """
+        token = current_empty_failures.set({})
+        try:
+            return await self._deep_research_impl(query, previous_query)
+        finally:
+            current_empty_failures.reset(token)
+
+    async def _deep_research_impl(
+        self, query: str, previous_query: str | None
+    ) -> dict[str, Any]:
         logger.info(f"Starting deep research for query: '{query}'")
-        start_health = self._structured_reasoning_health()
 
         # Emit main start event
         await self._emit_event("main_start", f"Starting deep research: {query[:60]}...")
@@ -338,7 +358,6 @@ class PluggableResearchService(ProgressEmitterMixin):
                         "skipped_synthesis": True,
                     },
                 },
-                start_health,
             )
 
         # Pass pre-filtered chunks to synthesis (elbow detection done in exploration strategies)
@@ -487,7 +506,7 @@ class PluggableResearchService(ProgressEmitterMixin):
         )
 
         return self._attach_structured_reasoning_note(
-            {"answer": answer, "metadata": metadata}, start_health
+            {"answer": answer, "metadata": metadata}
         )
 
     async def _run_synthesis_maps(

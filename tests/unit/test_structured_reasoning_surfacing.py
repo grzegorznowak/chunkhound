@@ -4,10 +4,14 @@ import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
+from chunkhound.core.utils.structured_reasoning_diagnostics import (
+    current_empty_failures,
+    record_empty_failure,
+)
 from chunkhound.providers.llm.capability_cache import LLMCapabilityStore
 from chunkhound.providers.llm.openai_compatible_provider import OpenAICompatibleProvider
 from chunkhound.services.research.v1.pluggable_research_service import (
@@ -49,36 +53,30 @@ def test_failed_structured_stages_prepend_note_and_metadata_warning() -> None:
 
 
 def test_service_attaches_note_for_new_failures_only() -> None:
-    health = iter(
-        (
-            None,
-            {
-                "provider": "openrouter",
-                "model": "m",
-                "capability": "rejected",
-                "empty_failures": 3,
-                "last_empty_ts": 1.0,
-            },
-        )
-    )
-    provider = SimpleNamespace(get_structured_reasoning_health=lambda: next(health))
+    provider = Mock()
+    provider.get_structured_reasoning_health.return_value = {
+        "provider": "openrouter",
+        "model": "m",
+        "capability": "rejected",
+        "empty_failures": 3,
+        "last_empty_ts": 1.0,
+    }
     service = PluggableResearchService.__new__(PluggableResearchService)
     service._llm_manager = SimpleNamespace(get_utility_provider=lambda: provider)
 
-    start_health = service._structured_reasoning_health()
-    assert start_health is None
-    result = service._attach_structured_reasoning_note(
-        {"answer": "a", "metadata": {}}, start_health
-    )
-    assert "> **Note:** 3 structured stage(s) failed" in result["answer"]
-
-    no_health_provider = SimpleNamespace(get_structured_reasoning_health=lambda: None)
-    service._llm_manager = SimpleNamespace(
-        get_utility_provider=lambda: no_health_provider
-    )
+    # Historical health does not attach a note to a fresh request.
     unchanged = {"answer": "a", "metadata": {}}
-    assert service._attach_structured_reasoning_note(unchanged, None) is unchanged
-    assert unchanged == {"answer": "a", "metadata": {}}
+    assert service._attach_structured_reasoning_note(unchanged) is unchanged
+    token = current_empty_failures.set({})
+    try:
+        for _ in range(3):
+            record_empty_failure(provider)
+        result = service._attach_structured_reasoning_note(
+            {"answer": "a", "metadata": {}}
+        )
+        assert "> **Note:** 3 structured stage(s) failed" in result["answer"]
+    finally:
+        current_empty_failures.reset(token)
 
 
 @pytest.mark.asyncio
@@ -179,8 +177,13 @@ async def test_overlapping_research_warns_only_for_its_own_failed_stage(
 
 def test_service_without_provider_health_does_not_attach_note() -> None:
     service = PluggableResearchService.__new__(PluggableResearchService)
-    service._llm_manager = SimpleNamespace(get_utility_provider=object)
+    provider = object()
+    service._llm_manager = SimpleNamespace(get_utility_provider=lambda: provider)
     unchanged = {"answer": "a", "metadata": {}}
 
-    assert service._attach_structured_reasoning_note(unchanged, None) is unchanged
-    assert unchanged == {"answer": "a", "metadata": {}}
+    token = current_empty_failures.set({provider: 1})
+    try:
+        assert service._attach_structured_reasoning_note(unchanged) is unchanged
+        assert unchanged == {"answer": "a", "metadata": {}}
+    finally:
+        current_empty_failures.reset(token)
