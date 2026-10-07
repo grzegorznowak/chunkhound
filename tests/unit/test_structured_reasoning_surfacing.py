@@ -11,6 +11,7 @@ import pytest
 from chunkhound.core.utils.structured_reasoning_diagnostics import (
     current_empty_failures,
     record_empty_failure,
+    structured_reasoning_failure_key,
 )
 from chunkhound.providers.llm.capability_cache import LLMCapabilityStore
 from chunkhound.providers.llm.openai_compatible_provider import OpenAICompatibleProvider
@@ -83,7 +84,7 @@ def test_service_attaches_note_for_new_failures_only() -> None:
 async def test_research_failure_restores_request_diagnostics() -> None:
     service = PluggableResearchService.__new__(PluggableResearchService)
     service._emit_event = AsyncMock(side_effect=RuntimeError("start failed"))
-    previous: dict[object, int] = {}
+    previous: dict[str, int] = {}
     token = current_empty_failures.set(previous)
     try:
         with pytest.raises(RuntimeError, match="start failed"):
@@ -195,7 +196,7 @@ def test_service_without_provider_health_does_not_attach_note() -> None:
     service._llm_manager = SimpleNamespace(get_utility_provider=lambda: provider)
     unchanged = {"answer": "a", "metadata": {}}
 
-    token = current_empty_failures.set({provider: 1})
+    token = current_empty_failures.set({structured_reasoning_failure_key(provider): 1})
     try:
         assert service._attach_structured_reasoning_note(unchanged) is unchanged
         assert unchanged == {"answer": "a", "metadata": {}}

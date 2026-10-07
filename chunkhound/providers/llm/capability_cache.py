@@ -18,16 +18,30 @@ _CACHE_FILENAME = "llm-capabilities.json"
 _FORMAT_VERSION = 1
 _ACCEPTED_TTL_SECONDS = 30 * 24 * 60 * 60
 _REJECTED_TTL_SECONDS = 24 * 60 * 60
+_MAX_CACHE_ENTRIES = 256
 CapabilityState = Literal["unknown", "accepted", "rejected"]
+UNKNOWN: CapabilityState = "unknown"
+ACCEPTED: CapabilityState = "accepted"
+REJECTED: CapabilityState = "rejected"
+
+
+def capability_key(provider: str, model: str) -> str:
+    """Return the stable capability cache key for a provider/model pair."""
+    return f"{provider}:{model}"
 
 
 def state_ttl_seconds(state: CapabilityState) -> float:
     """Return the lease duration for a persisted capability decision."""
-    if state == "accepted":
+    if state == ACCEPTED:
         return _ACCEPTED_TTL_SECONDS
-    if state == "rejected":
+    if state == REJECTED:
         return _REJECTED_TTL_SECONDS
     raise ValueError("Unknown capabilities do not have a lease")
+
+
+def deadline_for(state: CapabilityState, timestamp: float) -> float:
+    """Return the absolute lease deadline for a decision made at ``timestamp``."""
+    return timestamp + state_ttl_seconds(state)
 
 
 def _read_decision(entry: object) -> tuple[CapabilityState, float] | None:
@@ -48,13 +62,13 @@ def _read_decision(entry: object) -> tuple[CapabilityState, float] | None:
     ):
         return None
 
-    ttl = _ACCEPTED_TTL_SECONDS if accepted else _REJECTED_TTL_SECONDS
+    state: CapabilityState = ACCEPTED if accepted else REJECTED
     try:
         if not math.isfinite(timestamp):
             return None
-        if time.time() - timestamp >= ttl:
+        if time.time() - timestamp >= state_ttl_seconds(state):
             return None
-        return ("accepted" if accepted else "rejected", timestamp + ttl)
+        return (state, deadline_for(state, timestamp))
     except OverflowError:
         # Timestamps too extreme for float arithmetic cannot be trusted.
         return None
@@ -75,6 +89,35 @@ def _is_newer_format_entry(entry: object) -> bool:
         and not isinstance(format_version, bool)
         and format_version > _FORMAT_VERSION
     )
+
+
+def _entry_timestamp(entry: object) -> float:
+    """Return an entry's timestamp, or -inf when it cannot be trusted."""
+    if isinstance(entry, dict):
+        timestamp = entry.get("ts")
+        if (
+            isinstance(timestamp, (int, float))
+            and not isinstance(timestamp, bool)
+            and math.isfinite(timestamp)
+        ):
+            return float(timestamp)
+    return float("-inf")
+
+
+def _prune_to_capacity(payload: dict[str, Any]) -> None:
+    """Evict the oldest entries when the cache exceeds its entry cap.
+
+    A newer-format entry is kept by the live-entry filter even though this
+    version cannot read its lease, so a v1 writer never deletes a newer
+    writer's data. The cap may still evict the oldest such row, and a lost row
+    only costs one re-probe.
+    """
+    overflow = len(payload) - _MAX_CACHE_ENTRIES
+    if overflow <= 0:
+        return
+    oldest = sorted(payload, key=lambda key: _entry_timestamp(payload[key]))[:overflow]
+    for key in oldest:
+        del payload[key]
 
 
 def _default_cache_path() -> Path:
@@ -102,8 +145,8 @@ class LLMCapabilityStore:
         self, provider: str, model: str
     ) -> tuple[CapabilityState, float | None]:
         """Return a live decision and its persisted deadline without writing."""
-        decision = _read_decision(self._read().get(f"{provider}:{model}"))
-        return decision if decision is not None else ("unknown", None)
+        decision = _read_decision(self._read().get(capability_key(provider, model)))
+        return decision if decision is not None else (UNKNOWN, None)
 
     def get(self, provider: str, model: str) -> CapabilityState:
         """Return a live decision, or unknown when no live lease exists."""
@@ -111,22 +154,23 @@ class LLMCapabilityStore:
 
     def set(self, provider: str, model: str, state: CapabilityState) -> float:
         """Persist a capability decision and return its deadline."""
-        if state not in {"accepted", "rejected"}:
+        if state not in {ACCEPTED, REJECTED}:
             raise ValueError("Capability state must be 'accepted' or 'rejected'")
 
         timestamp = time.time()
-        deadline = timestamp + state_ttl_seconds(state)
+        deadline = deadline_for(state, timestamp)
         try:
             payload = {
                 key: entry
                 for key, entry in self._read().items()
                 if _is_live_entry(entry) or _is_newer_format_entry(entry)
             }
-            payload[f"{provider}:{model}"] = {
-                "accepted": state == "accepted",
+            payload[capability_key(provider, model)] = {
+                "accepted": state == ACCEPTED,
                 "ts": timestamp,
                 "format_version": _FORMAT_VERSION,
             }
+            _prune_to_capacity(payload)
             self._path.parent.mkdir(parents=True, exist_ok=True)
             temporary_path = self._path.with_name(
                 f"{self._path.name}.{os.getpid()}.{time.time_ns()}.tmp"

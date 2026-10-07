@@ -21,7 +21,10 @@ from loguru import logger
 from chunkhound.core import analytics as ch_analytics
 from chunkhound.core.config.llm_config import DEFAULT_LLM_TIMEOUT
 from chunkhound.core.utils.openai_utils import is_official_openai_endpoint
-from chunkhound.core.utils.structured_reasoning_diagnostics import record_empty_failure
+from chunkhound.core.utils.structured_reasoning_diagnostics import (
+    record_empty_failure,
+    structured_reasoning_failure_key,
+)
 from chunkhound.core.utils.token_utils import estimate_tokens_llm
 from chunkhound.interfaces.llm_provider import (
     LLMProvider,
@@ -31,9 +34,12 @@ from chunkhound.interfaces.llm_provider import (
     OutputLimitMetadata,
 )
 from chunkhound.providers.llm.capability_cache import (
+    ACCEPTED,
+    REJECTED,
+    UNKNOWN,
     CapabilityState,
     LLMCapabilityStore,
-    state_ttl_seconds,
+    deadline_for,
 )
 from chunkhound.utils.json_extraction import (
     build_schema_system_instruction,
@@ -48,6 +54,14 @@ except ImportError:
     AsyncOpenAI = None  # type: ignore
     OPENAI_AVAILABLE = False
     logger.warning("OpenAI not available - install with: uv pip install openai")
+
+
+# Process-wide latch so a provider/model warns about rejected-capability empty
+# content once per process rather than once per provider instance.
+_EMPTY_STRUCTURED_WARNING_KEY: set[str] = set()
+# Report only empty failures observed within this window so a single historical
+# failure cannot keep the health signal alive forever.
+_EMPTY_STRUCTURED_HEALTH_WINDOW_SECONDS = 60 * 60
 
 
 class OpenAICompatibleProvider(LLMProvider):
@@ -135,16 +149,15 @@ class OpenAICompatibleProvider(LLMProvider):
             structured_reasoning_disable_extra_body
         )
         self._capability_store = capability_store or LLMCapabilityStore()
-        self._structured_reasoning_capability: CapabilityState = "unknown"
+        self._structured_reasoning_capability: CapabilityState = UNKNOWN
         self._structured_reasoning_capability_deadline: float | None = None
         if self._structured_reasoning_disable_extra_body is not None:
             (
                 self._structured_reasoning_capability,
                 self._structured_reasoning_capability_deadline,
             ) = self._capability_store.get_with_expiry(self.name, self._model)
-        self._structured_reasoning_empty_failures = 0
+        self._structured_reasoning_empty_failure_times: list[float] = []
         self._structured_reasoning_last_empty_ts: float | None = None
-        self._structured_reasoning_empty_warned = False
         self._structured_reasoning_capability_lock: asyncio.Lock | None = None
         self._structured_reasoning_capability_loop: asyncio.AbstractEventLoop | None = (
             None
@@ -240,7 +253,7 @@ class OpenAICompatibleProvider(LLMProvider):
             kwargs["response_format"] = response_format
             if (
                 self._structured_reasoning_disable_extra_body is not None
-                and self._structured_reasoning_capability != "rejected"
+                and self._structured_reasoning_capability != REJECTED
             ):
                 kwargs["extra_body"] = copy.deepcopy(
                     self._structured_reasoning_disable_extra_body
@@ -402,14 +415,14 @@ class OpenAICompatibleProvider(LLMProvider):
             return await self._create_chat_completion(**kwargs)
 
         state: CapabilityState = self._structured_reasoning_capability
-        kwargs = self._set_structured_payload(kwargs, state != "rejected")
-        if state == "unknown":
+        kwargs = self._set_structured_payload(kwargs, state != REJECTED)
+        if state == UNKNOWN:
             async with self._capability_lock():
                 self._expire_capability_if_due()
                 state = self._structured_reasoning_capability
-                if state == "unknown":
+                if state == UNKNOWN:
                     return await self._probe_structured_reasoning_payload(kwargs)
-                kwargs = self._set_structured_payload(kwargs, state == "accepted")
+                kwargs = self._set_structured_payload(kwargs, state == ACCEPTED)
             return await self._send_flagged(kwargs)
 
         return await self._send_flagged(kwargs)
@@ -430,7 +443,7 @@ class OpenAICompatibleProvider(LLMProvider):
                 raise
             return await self._replay_without_payload(kwargs)
 
-        self._set_structured_reasoning_capability("accepted")
+        self._set_structured_reasoning_capability(ACCEPTED)
         return response
 
     async def _replay_without_payload(self, kwargs: dict[str, Any]) -> Any:
@@ -438,7 +451,7 @@ class OpenAICompatibleProvider(LLMProvider):
         response = await self._create_chat_completion(
             **self._set_structured_payload(kwargs, False)
         )
-        self._set_structured_reasoning_capability("rejected")
+        self._set_structured_reasoning_capability(REJECTED)
         return response
 
     def _set_structured_payload(
@@ -462,13 +475,13 @@ class OpenAICompatibleProvider(LLMProvider):
         """Reset expired in-memory capability decisions without writing."""
         if (
             self._structured_reasoning_disable_extra_body is None
-            or self._structured_reasoning_capability == "unknown"
+            or self._structured_reasoning_capability == UNKNOWN
         ):
             return
         deadline = self._structured_reasoning_capability_deadline
         if deadline is None or time.time() < deadline:
             return
-        self._structured_reasoning_capability = "unknown"
+        self._structured_reasoning_capability = UNKNOWN
         self._structured_reasoning_capability_deadline = None
 
     def _set_structured_reasoning_capability(self, state: CapabilityState) -> None:
@@ -478,13 +491,13 @@ class OpenAICompatibleProvider(LLMProvider):
         try:
             deadline = self._capability_store.set(self.name, self._model, state)
             if deadline is None:
-                deadline = time.time() + state_ttl_seconds(state)
+                deadline = deadline_for(state, time.time())
         except OSError as error:
             logger.warning(
                 f"Failed to persist {self.name} structured reasoning "
                 f"capability: {error}"
             )
-            deadline = time.time() + state_ttl_seconds(state)
+            deadline = deadline_for(state, time.time())
         self._structured_reasoning_capability_deadline = deadline
 
     def _capability_lock(self) -> asyncio.Lock:
@@ -500,27 +513,44 @@ class OpenAICompatibleProvider(LLMProvider):
 
     def _record_empty_structured_content(self) -> None:
         """Count an empty structured response only under a rejected capability."""
-        if self._structured_reasoning_capability != "rejected":
+        if self._structured_reasoning_capability != REJECTED:
             return
-        self._structured_reasoning_empty_failures += 1
+        now = time.time()
+        self._structured_reasoning_empty_failure_times.append(now)
+        self._structured_reasoning_last_empty_ts = now
+        self._prune_empty_failure_times(now)
         record_empty_failure(self)
-        self._structured_reasoning_last_empty_ts = time.time()
-        if not self._structured_reasoning_empty_warned:
-            self._structured_reasoning_empty_warned = True
+        warning_key = structured_reasoning_failure_key(self)
+        if warning_key not in _EMPTY_STRUCTURED_WARNING_KEY:
+            _EMPTY_STRUCTURED_WARNING_KEY.add(warning_key)
             logger.warning(
                 f"{self.name}:{self._model} returned empty structured content "
                 "while reasoning-disable is known-rejected; results may be incomplete."
             )
 
+    def _prune_empty_failure_times(self, now: float) -> None:
+        cutoff = now - _EMPTY_STRUCTURED_HEALTH_WINDOW_SECONDS
+        self._structured_reasoning_empty_failure_times = [
+            observed
+            for observed in self._structured_reasoning_empty_failure_times
+            if observed >= cutoff
+        ]
+
     def get_structured_reasoning_health(self) -> dict[str, Any] | None:
-        """Read-only health for empty structured failures under rejection."""
-        if self._structured_reasoning_empty_failures == 0:
+        """Read-only health for recent empty structured failures under rejection."""
+        cutoff = time.time() - _EMPTY_STRUCTURED_HEALTH_WINDOW_SECONDS
+        empty_failures = sum(
+            1
+            for observed in self._structured_reasoning_empty_failure_times
+            if observed >= cutoff
+        )
+        if empty_failures == 0:
             return None
         return {
             "provider": self.name,
             "model": self._model,
             "capability": self._structured_reasoning_capability,
-            "empty_failures": self._structured_reasoning_empty_failures,
+            "empty_failures": empty_failures,
             "last_empty_ts": self._structured_reasoning_last_empty_ts,
         }
 
@@ -646,7 +676,7 @@ class OpenAICompatibleProvider(LLMProvider):
                 )
                 if (
                     self._structured_reasoning_disable_extra_body is not None
-                    and self._structured_reasoning_capability == "rejected"
+                    and self._structured_reasoning_capability == REJECTED
                 ):
                     raise RuntimeError(
                         f"{diagnostic}, capability=rejected). "

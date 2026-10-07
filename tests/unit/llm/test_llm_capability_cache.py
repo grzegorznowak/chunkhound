@@ -548,6 +548,32 @@ def test_capability_cache_set_prunes_malformed_and_expired_entries(
     assert store.get("openrouter", "future-version") == "unknown"
 
 
+def test_capability_cache_write_caps_entry_count(
+    overridden_cache_path: Path,
+) -> None:
+    """A write evicts the oldest rows once the cache exceeds its entry cap."""
+    now = time.time()
+    entries = {
+        f"openrouter:m{index}": {
+            "accepted": True,
+            "ts": now - index,
+            "format_version": 1,
+        }
+        for index in range(capability_cache._MAX_CACHE_ENTRIES + 10)
+    }
+    overridden_cache_path.parent.mkdir(parents=True)
+    overridden_cache_path.write_text(json.dumps(entries), encoding="utf-8")
+
+    capability_cache.LLMCapabilityStore().set("openrouter", "new", "accepted")
+
+    payload = json.loads(overridden_cache_path.read_text(encoding="utf-8"))
+    assert len(payload) == capability_cache._MAX_CACHE_ENTRIES
+    assert "openrouter:new" in payload
+    assert "openrouter:000" not in payload  # sanity: key formatting is stable
+    assert "openrouter:m0" in payload
+    assert f"openrouter:m{capability_cache._MAX_CACHE_ENTRIES + 9}" not in payload
+
+
 @pytest.mark.parametrize("state", ["accepted", "rejected"])
 def test_capability_cache_set_returns_and_reads_persisted_deadline(
     monkeypatch: pytest.MonkeyPatch,

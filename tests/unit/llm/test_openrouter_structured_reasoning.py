@@ -14,7 +14,7 @@ import httpx
 import pytest
 from openai import APIStatusError, APITimeoutError
 
-from chunkhound.providers.llm import capability_cache
+from chunkhound.providers.llm import capability_cache, openai_compatible_provider
 from chunkhound.providers.llm.capability_cache import LLMCapabilityStore
 from chunkhound.providers.llm.openai_compatible_provider import OpenAICompatibleProvider
 from tests.fixtures.openai_compatible_server import (
@@ -29,6 +29,12 @@ SCHEMA = {
     "required": ["answer"],
     "additionalProperties": False,
 }
+
+
+@pytest.fixture(autouse=True)
+def _reset_process_wide_warning_latch() -> None:
+    """Keep the process-wide empty-content warning latch test-isolated."""
+    openai_compatible_provider._EMPTY_STRUCTURED_WARNING_KEY.clear()
 
 
 class FakeCapabilityStore:
@@ -933,3 +939,44 @@ async def test_rejected_empty_structured_content_warns_once(
 
     warning.assert_called_once()
     assert provider.get_structured_reasoning_health()["empty_failures"] == 2
+
+
+@pytest.mark.asyncio
+async def test_rejected_empty_structured_warning_is_process_wide(
+    mock_completion: AsyncMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """C15: warn once per provider/model per process, not per provider instance."""
+    warning = Mock()
+    monkeypatch.setattr(
+        "chunkhound.providers.llm.openai_compatible_provider.logger.warning", warning
+    )
+    mock_completion.return_value = _response(content=None)
+
+    for _ in range(2):
+        provider = _provider(FakeCapabilityStore("rejected"))
+        with pytest.raises(RuntimeError, match="returned empty response"):
+            await provider.complete_structured("probe", SCHEMA)
+
+    warning.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_structured_reasoning_health_decays_after_window(
+    mock_completion: AsyncMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A long-past empty failure no longer reports as active health."""
+    mock_completion.return_value = _response(content=None)
+    provider = _provider(FakeCapabilityStore("rejected"))
+
+    with pytest.raises(RuntimeError, match="returned empty response"):
+        await provider.complete_structured("probe", SCHEMA)
+    assert provider.get_structured_reasoning_health() is not None
+
+    future = (
+        time.time()
+        + openai_compatible_provider._EMPTY_STRUCTURED_HEALTH_WINDOW_SECONDS
+        + 1
+    )
+    monkeypatch.setattr(openai_compatible_provider.time, "time", lambda: future)
+
+    assert provider.get_structured_reasoning_health() is None

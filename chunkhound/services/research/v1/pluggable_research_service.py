@@ -19,6 +19,7 @@ from loguru import logger
 
 from chunkhound.core.utils.structured_reasoning_diagnostics import (
     current_empty_failures,
+    structured_reasoning_failure_key,
 )
 from chunkhound.database_factory import DatabaseServices
 from chunkhound.embeddings import EmbeddingManager
@@ -167,7 +168,7 @@ class PluggableResearchService(ProgressEmitterMixin):
         if get_utility is None:
             return result
         provider = get_utility()
-        failed_stages = failures.get(provider, 0)
+        failed_stages = failures.get(structured_reasoning_failure_key(provider), 0)
         if not failed_stages:
             return result
         health = self._structured_reasoning_health()
