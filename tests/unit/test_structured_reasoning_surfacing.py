@@ -80,6 +80,20 @@ def test_service_attaches_note_for_new_failures_only() -> None:
 
 
 @pytest.mark.asyncio
+async def test_research_failure_restores_request_diagnostics() -> None:
+    service = PluggableResearchService.__new__(PluggableResearchService)
+    service._emit_event = AsyncMock(side_effect=RuntimeError("start failed"))
+    previous: dict[object, int] = {}
+    token = current_empty_failures.set(previous)
+    try:
+        with pytest.raises(RuntimeError, match="start failed"):
+            await service.deep_research("broken request")
+        assert current_empty_failures.get() is previous
+    finally:
+        current_empty_failures.reset(token)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("warning_surface", ["answer", "metadata"])
 async def test_overlapping_research_warns_only_for_its_own_failed_stage(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, warning_surface: str

@@ -20,8 +20,8 @@ from loguru import logger
 
 from chunkhound.core import analytics as ch_analytics
 from chunkhound.core.config.llm_config import DEFAULT_LLM_TIMEOUT
-from chunkhound.core.utils.structured_reasoning_diagnostics import record_empty_failure
 from chunkhound.core.utils.openai_utils import is_official_openai_endpoint
+from chunkhound.core.utils.structured_reasoning_diagnostics import record_empty_failure
 from chunkhound.core.utils.token_utils import estimate_tokens_llm
 from chunkhound.interfaces.llm_provider import (
     LLMProvider,
