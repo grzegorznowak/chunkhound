@@ -5,12 +5,13 @@ from __future__ import annotations
 import json
 import math
 import os
-import sys
 import time
 from pathlib import Path
 from typing import Any, Literal, TypeGuard
 
 from loguru import logger
+
+from chunkhound.core.utils.cache_paths import platform_cache_root
 
 _CACHE_ENV = "CHUNKHOUND_LLM_CAPABILITY_CACHE"
 _CACHE_FILENAME = "llm-capabilities.json"
@@ -82,21 +83,7 @@ def _default_cache_path() -> Path:
     if override:
         return Path(override).expanduser()
 
-    if sys.platform == "win32":
-        local_appdata = os.environ.get("LOCALAPPDATA")
-        cache_dir = (
-            Path(local_appdata) / "ChunkHound"
-            if local_appdata
-            else Path.home() / "AppData" / "Local" / "ChunkHound"
-        )
-    else:
-        cache_root = os.environ.get("XDG_CACHE_HOME")
-        cache_dir = (
-            Path(cache_root) / "chunkhound"
-            if cache_root
-            else Path.home() / ".cache" / "chunkhound"
-        )
-    return cache_dir / _CACHE_FILENAME
+    return platform_cache_root() / _CACHE_FILENAME
 
 
 class LLMCapabilityStore:
