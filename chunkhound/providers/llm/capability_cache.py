@@ -11,7 +11,7 @@ from typing import Any, Literal, TypeGuard
 
 from loguru import logger
 
-from chunkhound.core.utils.cache_paths import platform_cache_root
+from chunkhound.utils.cache_paths import platform_cache_root
 
 _CACHE_ENV = "CHUNKHOUND_LLM_CAPABILITY_CACHE"
 _CACHE_FILENAME = "llm-capabilities.json"

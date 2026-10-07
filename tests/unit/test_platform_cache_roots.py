@@ -13,8 +13,9 @@ from chunkhound.watchman_runtime.loader import _default_runtime_cache_dir
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
 # hatch_build.py imports the watchman loader in the isolated build environment to
-# compute wheel tags. That environment installs only build-system requirements, so
-# the loader's import graph must not reach runtime-only parser dependencies.
+# hydrate the runtime and compute wheel tags. That environment installs only
+# build-system requirements, so the loader's import graph -- including the cache
+# root it resolves during hydration -- must not reach runtime-only parser deps.
 _IMPORT_WITHOUT_PARSER_DEPS = """
 import importlib.abc
 import sys
@@ -30,14 +31,16 @@ class _BlockTreeSitterLanguagePack(importlib.abc.MetaPathFinder):
 
 
 sys.meta_path.insert(0, _BlockTreeSitterLanguagePack())
-from chunkhound.watchman_runtime.loader import resolve_packaged_watchman_runtime
+from chunkhound.watchman_runtime.loader import _default_runtime_cache_dir
 
+# The build hydrates the runtime, which resolves this cache dir.
+_default_runtime_cache_dir()
 print("watchman-loader-import-ok")
 """
 
 
-def test_watchman_loader_import_survives_missing_parser_dependencies() -> None:
-    """The build-time loader import must not pull in runtime-only parser deps."""
+def test_watchman_loader_build_path_survives_missing_parser_dependencies() -> None:
+    """The build-time loader path must not pull in runtime-only parser deps."""
     environment = dict(os.environ)
     environment["PYTHONPATH"] = os.pathsep.join(
         [str(_REPO_ROOT), environment.get("PYTHONPATH", "")]

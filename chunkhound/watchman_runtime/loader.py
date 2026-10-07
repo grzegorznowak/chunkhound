@@ -26,6 +26,11 @@ from platform import machine as current_machine
 from platform import system as current_system
 from typing import Literal, cast
 
+# Kept in chunkhound.utils (not chunkhound.core) so this module stays importable in
+# the isolated build environment, where chunkhound.core's package __init__ (and its
+# runtime-only parser dependencies) are unavailable.
+from chunkhound.utils.cache_paths import platform_cache_root
+
 if os.name == "nt":
     import msvcrt
 else:
@@ -790,11 +795,6 @@ def _default_runtime_cache_dir() -> Path:
     override = os.environ.get(_RUNTIME_CACHE_DIR_ENV)
     if override:
         return Path(override).expanduser()
-
-    # Imported lazily: hatch_build.py imports this module in the isolated build
-    # environment, where chunkhound.core's package __init__ (and its runtime-only
-    # parser dependencies) are unavailable.
-    from chunkhound.core.utils.cache_paths import platform_cache_root
 
     return platform_cache_root() / "watchman-runtime"
 
